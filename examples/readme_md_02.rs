@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use ruin_reactivity::{cell, effect, thunk};
-use ruin_runtime::{clear_interval, main, set_interval, set_timeout};
+use adaptite::{cell, effect, thunk};
+use runite::{clear_interval, main, set_interval, set_timeout};
 
 #[main]
 fn main() {

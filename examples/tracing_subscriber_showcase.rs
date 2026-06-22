@@ -1,13 +1,13 @@
-//! Example tracing setup for RUIN runtime + reactivity.
+//! Example tracing setup for runite runtime + reactivity.
 //!
 //! Try:
 //!
-//! - `cargo run -p ruin_reactivity --example tracing_subscriber_showcase`
-//! - `RUST_LOG=info,ruin_runtime::runtime=debug,ruin_reactivity::graph=debug cargo run -p ruin_reactivity --example tracing_subscriber_showcase`
-//! - `RUST_LOG=info,ruin_runtime::scheduler=trace,ruin_reactivity::event=trace,ruin_reactivity::effect=debug cargo run -p ruin_reactivity --example tracing_subscriber_showcase`
+//! - `cargo run -p adaptite --example tracing_subscriber_showcase`
+//! - `RUST_LOG=info,runite::runtime=debug,adaptite::graph=debug cargo run -p adaptite --example tracing_subscriber_showcase`
+//! - `RUST_LOG=info,runite::scheduler=trace,adaptite::event=trace,adaptite::effect=debug cargo run -p adaptite --example tracing_subscriber_showcase`
 
-use ruin_reactivity::{cell, effect, event, on, thunk};
-use ruin_runtime::time::sleep;
+use adaptite::{cell, effect, event, on, thunk};
+use runite::time::sleep;
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -17,11 +17,11 @@ fn install_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
             "info,\
-             ruin_runtime::runtime=debug,\
-             ruin_runtime::scheduler=debug,\
-             ruin_reactivity::graph=debug,\
-             ruin_reactivity::effect=debug,\
-             ruin_reactivity::event=debug",
+             runite::runtime=debug,\
+             runite::scheduler=debug,\
+             adaptite::graph=debug,\
+             adaptite::effect=debug,\
+             adaptite::event=debug",
         )
     });
 
@@ -37,7 +37,7 @@ fn install_tracing() {
         .try_init();
 }
 
-#[ruin_runtime::async_main]
+#[runite::main]
 async fn main() {
     install_tracing();
 
@@ -93,7 +93,7 @@ async fn main() {
 
     tracing::info!(
         event = "showcase_done",
-        hint = "see ruin_runtime::* and ruin_reactivity::* targets in the filter",
+        hint = "see runite::* and adaptite::* targets in the filter",
         "example body completed; awaiting once so scheduled microtasks can flush"
     );
 

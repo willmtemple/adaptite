@@ -1,7 +1,7 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use ruin_reactivity::event;
-use ruin_runtime::{main, queue_future, set_interval, time::sleep};
+use adaptite::event;
+use runite::{main, queue_future, set_interval, time::sleep};
 
 #[main]
 fn main() {

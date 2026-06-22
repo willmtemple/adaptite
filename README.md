@@ -1,8 +1,8 @@
-# RUIN Reactivity - Fine-Grained Reactor
+# adaptite
 
-Automatic thread-stack-based reactivity for RUIN-apps.
+Automatic thread-stack-based reactivity for runite programs.
 
-RUIN Reactivity provides an implementation of fine-grained reactivity primitives
+Adaptite provides an implementation of fine-grained reactivity primitives
 for dependency tracking and incremental computation. Those primitives are:
 
 - `Cell<T>`: a tracked-state value cell, primitively observable (sometimes
@@ -15,10 +15,10 @@ for dependency tracking and incremental computation. Those primitives are:
 - `Event<T>`: a push-style source of events of type `T`. Supports subscription
   and cancellation of interest in events.
 
-RUIN reactivity requires the RUIN runtime to function, and cannot be used on
-threads not managed by the RUIN runtime.
+Adaptite requires the runite runtime to function, and cannot be used on
+threads not managed by the runite runtime.
 
-RUIN reactivity does not function across thread boundaries. It tracks
+Adaptite does not function across thread boundaries. It tracks
 dependencies between entities on the same thread only.
 
 ## Examples
@@ -28,8 +28,8 @@ dependencies between entities on the same thread only.
 ```rs
 use std::time::Duration;
 
-use ruin_reactivity::{cell, effect};
-use ruin_runtime::{main, set_timeout};
+use adaptite::{cell, effect};
+use runite::{main, set_timeout};
 
 #[main]
 fn main() {
@@ -64,8 +64,8 @@ fn main() {
 ```rs
 use std::time::Duration;
 
-use ruin_reactivity::{cell, effect, thunk};
-use ruin_runtime::{clear_interval, main, set_interval, set_timeout};
+use adaptite::{cell, effect, thunk};
+use runite::{clear_interval, main, set_interval, set_timeout};
 
 #[main]
 fn main() {
@@ -118,8 +118,8 @@ fn main() {
 ```rs
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use ruin_reactivity::event;
-use ruin_runtime::{main, queue_future, set_interval, time::sleep};
+use adaptite::event;
+use runite::{main, queue_future, set_interval, time::sleep};
 
 #[main]
 fn main() {
@@ -149,4 +149,13 @@ fn main() {
 
 ## License
 
-Licensed under the [MIT License](../../LICENSE.txt).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](./LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in this crate by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.

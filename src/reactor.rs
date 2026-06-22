@@ -14,8 +14,9 @@ use crate::{NodeId, trace_targets};
 
 type Job = Box<dyn FnOnce() + 'static>;
 
-#[thread_local]
-static CURRENT_REACTOR: RefCell<Weak<ReactorInner>> = const { RefCell::new(Weak::new()) };
+thread_local! {
+    static CURRENT_REACTOR: RefCell<Weak<ReactorInner>> = const { RefCell::new(Weak::new()) };
+}
 
 /// Returns the current thread's default reactor.
 ///
@@ -87,7 +88,7 @@ impl Reactor {
 
     /// Returns the current thread's default reactor.
     pub fn current() -> Self {
-        if let Some(inner) = CURRENT_REACTOR.borrow().upgrade() {
+        if let Some(inner) = CURRENT_REACTOR.with(|r| r.borrow().upgrade()) {
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::GRAPH,
@@ -98,7 +99,7 @@ impl Reactor {
         }
 
         let reactor = Self::new();
-        *CURRENT_REACTOR.borrow_mut() = Rc::downgrade(&reactor.inner);
+        CURRENT_REACTOR.replace(Rc::downgrade(&reactor.inner));
         tracing::debug!(
             target: trace_targets::GRAPH,
             event = "current_reactor_install",

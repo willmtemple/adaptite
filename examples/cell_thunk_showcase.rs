@@ -1,4 +1,4 @@
-use ruin_reactivity::{cell, thunk};
+use adaptite::{cell, thunk};
 use std::cell::Cell as Counter;
 use std::fmt;
 use std::rc::Rc;
@@ -39,7 +39,7 @@ fn unix_timestamp_millis() -> String {
 fn main() {
     START.get_or_init(Instant::now);
 
-    let first = cell(String::from("Ruin"));
+    let first = cell(String::from("Adaptite"));
     let visits = cell(1usize);
     let greeting_compute = Rc::new(Counter::new(0usize));
     let summary_compute = Rc::new(Counter::new(0usize));
@@ -91,7 +91,7 @@ fn main() {
 
     log_event!(11, "[main] set first to the same value");
     assert!(
-        first.set(String::from("Ruin")).is_none(),
+        first.set(String::from("Adaptite")).is_none(),
         "same-value set should be suppressed",
     );
 

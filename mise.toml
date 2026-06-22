@@ -1,0 +1,71 @@
+# Reproducible toolchain.
+# Install everything with `mise install`, then use `mise run <task>`.
+#
+# Reproducibility model: the version specs below are intentionally loose
+# (track stable). Exact resolved versions + checksums are pinned in `mise.lock`
+# (committed), so `mise install` is fully reproducible. To intentionally update
+# the toolchain, run `mise upgrade` (bumps within the spec) followed by
+# `mise lock`, then commit the refreshed `mise.lock`.
+
+[settings]
+# Pin exact versions + checksums in mise.lock instead of hard-coding them here.
+lockfile = true
+
+[tools]
+# Track stable Rust 1.x; `mise.lock` pins the exact patch release. adaptite is
+# stable-Rust clean; edition 2024 requires >= 1.85. Components are declared
+# explicitly so a fresh `mise install` (e.g. CI) gets rustfmt + clippy and the
+# llvm-tools that cargo-llvm-cov needs — mise's rust backend installs a minimal
+# profile otherwise.
+rust = { version = "1", components = "rustfmt,clippy,llvm-tools" }
+
+# Agent Cop static-analysis tool, installed from GitHub release binaries; the
+# exact release is pinned in `mise.lock`. https://github.com/KrzysztofCwalina/cop
+"github:KrzysztofCwalina/cop" = { version = "latest", exe = "cop" }
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build --workspace --all-targets"
+
+[tasks.test]
+description = "Run all tests including doctests"
+run = "cargo test --workspace --all-features"
+
+[tasks.fmt]
+description = "Check formatting"
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+description = "Run clippy with warnings denied"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.doc]
+description = "Build documentation"
+run = "cargo doc --workspace --all-features --no-deps"
+
+[tasks.bench]
+description = "Run criterion benchmarks (runtime + I/O)"
+run = "cargo bench --workspace --all-features"
+
+[tasks.coverage]
+description = "Generate an HTML + lcov coverage report with cargo-llvm-cov"
+run = [
+  "cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info",
+  "cargo llvm-cov report --html",
+]
+
+[tasks.coverage-ci]
+description = "Emit lcov coverage for CI consumption"
+run = "cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info"
+
+[tasks.cop]
+description = "Run Agent Cop static-analysis checks"
+run = "cop cop-checks/main.cop -t ."
+
+[tasks.cop-verify]
+description = "Verify cop rule files compile"
+run = "cop verify cop-checks/"
+
+[tasks.check]
+description = "Run the full local gate (fmt, lint, test, cop)"
+depends = ["fmt", "lint", "test", "cop"]
