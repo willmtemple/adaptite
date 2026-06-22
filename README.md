@@ -1,0 +1,152 @@
+# RUIN Reactivity - Fine-Grained Reactor
+
+Automatic thread-stack-based reactivity for RUIN-apps.
+
+RUIN Reactivity provides an implementation of fine-grained reactivity primitives
+for dependency tracking and incremental computation. Those primitives are:
+
+- `Cell<T>`: a tracked-state value cell, primitively observable (sometimes
+  called a "signal" in other reactor implementations).
+- `effect`: a primitive observer that runs once, observes its dependencies, and
+  runs again whenever its dependencies change.
+- `Thunk<T>`: a tracked-state recomputable value defined by a closure.
+  Invalidated if any of its dependencies change. A `Thunk` is both an observer
+  and an observable.
+- `Event<T>`: a push-style source of events of type `T`. Supports subscription
+  and cancellation of interest in events.
+
+RUIN reactivity requires the RUIN runtime to function, and cannot be used on
+threads not managed by the RUIN runtime.
+
+RUIN reactivity does not function across thread boundaries. It tracks
+dependencies between entities on the same thread only.
+
+## Examples
+
+### Observe a cell using an effect
+
+```rs
+use std::time::Duration;
+
+use ruin_reactivity::{cell, effect};
+use ruin_runtime::{main, set_timeout};
+
+#[main]
+fn main() {
+    // Creates an observable value. Calling `.get` from within an observer will create a dependency, and calling `.set`
+    // will trigger updates to any dependent observers.
+    let v = cell(5);
+
+    // Creates an observer that prints the value of `v` whenever it changes.
+    // Calling `.leak()` on the effect handle allows it to run for the lifetime of the program without automatically
+    // disposing when dropped.
+    effect({
+        let v = v.clone();
+        move || {
+            println!("v is: {}", v.get());
+        }
+    })
+    .leak();
+
+    // Queue a future to wait 5 seconds and then update `v`. This will trigger
+    // the effect to run again and print the new value.
+    set_timeout(Duration::from_secs(5), {
+        let v = v.clone();
+        move || {
+            v.set(v.get() + 20);
+        }
+    });
+}
+```
+
+### Observe a thunk using an effect
+
+```rs
+use std::time::Duration;
+
+use ruin_reactivity::{cell, effect, thunk};
+use ruin_runtime::{clear_interval, main, set_interval, set_timeout};
+
+#[main]
+fn main() {
+    // Two primitive observable values.
+    let x = cell(5);
+    let y = cell(10);
+
+    // A derived observable value that depends on `x` and `y`. The closure will only run when `x` or `y` change, and the
+    // result will be cached until then.
+    let z = thunk({
+        let x = x.clone();
+        let y = y.clone();
+        move || {
+            println!("calculating z...");
+            x.get() + y.get()
+        }
+    });
+
+    // The effect observes `z`, so it will run whenever `z` changes. Because `z` depends on `x` and `y`, the effect will
+    // run whenever `x` or `y` change.
+    effect({
+        let z = z.clone();
+        move || {
+            println!("z is: {}", z.get());
+        }
+    })
+    .leak();
+
+    // Update `x` and `y` every second. This will trigger the effect to run and print the new value of `z`.
+    let interval = set_interval(Duration::from_secs(1), {
+        let x = x.clone();
+        let y = y.clone();
+        move || {
+            x.update(|value| *value += 1);
+            y.update(|value| *value += 2);
+        }
+    });
+
+    // After 10 seconds, clear the interval to stop updating `x` and `y`. Once the interval is cleared, the queue will
+    // empty and the program will exit since there are no more pending tasks.
+    set_timeout(Duration::from_secs(10), move || {
+        println!("clearing interval...");
+        clear_interval(&interval);
+    });
+}
+```
+
+### Use an event to handle intra-thread messaging
+
+```rs
+use std::{cell::Cell, rc::Rc, time::Duration};
+
+use ruin_reactivity::event;
+use ruin_runtime::{main, queue_future, set_interval, time::sleep};
+
+#[main]
+fn main() {
+    let my_event = event::<String>();
+
+    my_event.subscribe(|message| {
+        println!("got event with message: {message}");
+    });
+
+    // Emit an event every 250ms with an incrementing count.
+    let interval = set_interval(Duration::from_millis(250), {
+        let counter = Rc::new(Cell::new(0));
+        move || {
+            let count = counter.get();
+            my_event.emit(format!("the count is {}", count));
+            counter.set(count + 1);
+        }
+    });
+
+    // After 5 seconds, clear the interval to stop emitting events.
+    queue_future(async move {
+        sleep(Duration::from_secs(5)).await;
+        interval.clear();
+    });
+}
+```
+
+## License
+
+Licensed under the [MIT License](../../LICENSE.txt).

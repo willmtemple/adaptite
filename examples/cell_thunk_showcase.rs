@@ -1,0 +1,113 @@
+use ruin_reactivity::{cell, thunk};
+use std::cell::Cell as Counter;
+use std::fmt;
+use std::rc::Rc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+static START: OnceLock<Instant> = OnceLock::new();
+static ACTUAL_ORDER: AtomicUsize = AtomicUsize::new(1);
+
+macro_rules! log_event {
+    ($expected:expr, $($arg:tt)*) => {{
+        log_event_impl($expected, format_args!($($arg)*));
+    }};
+}
+
+fn log_event_impl(expected: usize, message: fmt::Arguments<'_>) {
+    let actual = ACTUAL_ORDER.fetch_add(1, Ordering::SeqCst);
+    let elapsed = START
+        .get()
+        .expect("showcase start time should be initialized")
+        .elapsed()
+        .as_millis();
+    println!(
+        "[actual {actual:02} | expected {expected:02} | +{elapsed:04}ms | ts {}] {message}",
+        unix_timestamp_millis(),
+    );
+}
+
+fn unix_timestamp_millis() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after the Unix epoch");
+    format!("{}.{:03}", now.as_secs(), now.subsec_millis())
+}
+
+#[runite::main]
+fn main() {
+    START.get_or_init(Instant::now);
+
+    let first = cell(String::from("Ruin"));
+    let visits = cell(1usize);
+    let greeting_compute = Rc::new(Counter::new(0usize));
+    let summary_compute = Rc::new(Counter::new(0usize));
+
+    let greeting = thunk({
+        let first = first.clone();
+        let greeting_compute = Rc::clone(&greeting_compute);
+        move || {
+            let expected = match greeting_compute.get() {
+                0 => 3,
+                _ => 18,
+            };
+            greeting_compute.set(greeting_compute.get() + 1);
+            log_event!(expected, "[compute] greeting thunk recomputes");
+            format!("Hello, {}!", first.get())
+        }
+    });
+
+    let summary = thunk({
+        let greeting = greeting.clone();
+        let visits = visits.clone();
+        let summary_compute = Rc::clone(&summary_compute);
+        move || {
+            let expected = match summary_compute.get() {
+                0 => 2,
+                1 => 9,
+                2 => 17,
+                _ => 22,
+            };
+            summary_compute.set(summary_compute.get() + 1);
+            log_event!(expected, "[compute] summary thunk recomputes");
+            format!("{} Visits: {}", greeting.get(), visits.get())
+        }
+    });
+
+    log_event!(1, "[main] read summary for the first time");
+    log_event!(4, "[main] summary = {}", summary.get());
+
+    log_event!(5, "[main] read summary again (should hit caches)");
+    log_event!(6, "[main] summary = {}", summary.get());
+
+    log_event!(7, "[main] set visits to 2");
+    visits
+        .set(2)
+        .expect("visit count should report the previous value");
+
+    log_event!(8, "[main] read summary after visits change");
+    log_event!(10, "[main] summary = {}", summary.get());
+
+    log_event!(11, "[main] set first to the same value");
+    assert!(
+        first.set(String::from("Ruin")).is_none(),
+        "same-value set should be suppressed",
+    );
+
+    log_event!(12, "[main] read summary after unchanged write");
+    log_event!(13, "[main] summary = {}", summary.get());
+
+    log_event!(14, "[main] replace first with `Reactive`");
+    let old = first.replace(String::from("Reactive"));
+    log_event!(15, "[main] replace returned old value `{old}`");
+
+    log_event!(16, "[main] read summary after name change");
+    log_event!(19, "[main] summary = {}", summary.get());
+
+    log_event!(20, "[main] update visits in place");
+    visits.update(|count| *count += 1);
+
+    log_event!(21, "[main] read summary after update()");
+    log_event!(23, "[main] summary = {}", summary.get());
+}
