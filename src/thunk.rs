@@ -2,28 +2,33 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
 
-use crate::reactor::ObserverHook;
+use crate::reactor::{Mark, ObserverHook, State};
 use crate::{NodeId, Reactor, current, trace_targets};
 
 type ComputeFn<T> = dyn Fn() -> T + 'static;
+type ComputePrevFn<T> = dyn Fn(Option<&T>) -> T + 'static;
 type EqualsFn<T> = dyn Fn(&T, &T) -> bool + 'static;
 
 /// Creates a [`Thunk`] in the current thread's default reactor.
+#[track_caller]
 pub fn thunk<T: 'static>(compute: impl Fn() -> T + 'static) -> Thunk<T> {
     current().thunk(compute)
 }
 
 /// Creates a [`Thunk`] associated with `reactor`.
+#[track_caller]
 pub fn thunk_in<T: 'static>(reactor: &Reactor, compute: impl Fn() -> T + 'static) -> Thunk<T> {
     reactor.thunk(compute)
 }
 
 /// Creates an equality-aware memo in the current thread's default reactor.
+#[track_caller]
 pub fn memo<T: PartialEq + 'static>(compute: impl Fn() -> T + 'static) -> Memo<T> {
     current().memo(compute)
 }
 
 /// Creates an equality-aware memo associated with `reactor`.
+#[track_caller]
 pub fn memo_in<T: PartialEq + 'static>(
     reactor: &Reactor,
     compute: impl Fn() -> T + 'static,
@@ -32,6 +37,7 @@ pub fn memo_in<T: PartialEq + 'static>(
 }
 
 /// Creates a comparator-aware memo in the current thread's default reactor.
+#[track_caller]
 pub fn memo_by<T: 'static>(
     equals: impl Fn(&T, &T) -> bool + 'static,
     compute: impl Fn() -> T + 'static,
@@ -40,12 +46,36 @@ pub fn memo_by<T: 'static>(
 }
 
 /// Creates a comparator-aware memo associated with `reactor`.
+#[track_caller]
 pub fn memo_by_in<T: 'static>(
     reactor: &Reactor,
     equals: impl Fn(&T, &T) -> bool + 'static,
     compute: impl Fn() -> T + 'static,
 ) -> Memo<T> {
     reactor.memo_by(equals, compute)
+}
+
+/// Creates an equality-aware memo whose compute closure receives the memo's previous value, in
+/// the current thread's default reactor.
+///
+/// The previous value is `None` on the first computation. This is the supported way to express
+/// reduction-style computations ("fold the new inputs into the last result") without creating a
+/// dependency cycle.
+#[track_caller]
+pub fn memo_with_prev<T: PartialEq + 'static>(
+    compute: impl Fn(Option<&T>) -> T + 'static,
+) -> Memo<T> {
+    current().memo_with_prev(compute)
+}
+
+/// Creates an equality-aware memo whose compute closure receives the memo's previous value,
+/// associated with `reactor`.
+#[track_caller]
+pub fn memo_with_prev_in<T: PartialEq + 'static>(
+    reactor: &Reactor,
+    compute: impl Fn(Option<&T>) -> T + 'static,
+) -> Memo<T> {
+    reactor.memo_with_prev(compute)
 }
 
 /// Lazy computed node in the reactive graph.
@@ -62,26 +92,51 @@ pub struct Memo<T> {
 
 impl Reactor {
     /// Creates a lazy computed thunk associated with this reactor.
+    #[track_caller]
     pub fn thunk<T: 'static>(&self, compute: impl Fn() -> T + 'static) -> Thunk<T> {
         Thunk::new(self.clone(), compute)
     }
 
     /// Creates an equality-aware memo associated with this reactor.
+    #[track_caller]
     pub fn memo<T: PartialEq + 'static>(&self, compute: impl Fn() -> T + 'static) -> Memo<T> {
         self.memo_by(|left, right| left == right, compute)
     }
 
     /// Creates a comparator-aware memo associated with this reactor.
+    #[track_caller]
     pub fn memo_by<T: 'static>(
         &self,
         equals: impl Fn(&T, &T) -> bool + 'static,
         compute: impl Fn() -> T + 'static,
+    ) -> Memo<T> {
+        Memo::new(self.clone(), equals, move |_| compute())
+    }
+
+    /// Creates an equality-aware memo whose compute closure receives the memo's previous value
+    /// (`None` on the first computation), associated with this reactor.
+    #[track_caller]
+    pub fn memo_with_prev<T: PartialEq + 'static>(
+        &self,
+        compute: impl Fn(Option<&T>) -> T + 'static,
+    ) -> Memo<T> {
+        self.memo_by_with_prev(|left, right| left == right, compute)
+    }
+
+    /// Creates a comparator-aware memo whose compute closure receives the memo's previous value
+    /// (`None` on the first computation), associated with this reactor.
+    #[track_caller]
+    pub fn memo_by_with_prev<T: 'static>(
+        &self,
+        equals: impl Fn(&T, &T) -> bool + 'static,
+        compute: impl Fn(Option<&T>) -> T + 'static,
     ) -> Memo<T> {
         Memo::new(self.clone(), equals, compute)
     }
 }
 
 impl<T: 'static> Thunk<T> {
+    #[track_caller]
     fn new(reactor: Reactor, compute: impl Fn() -> T + 'static) -> Self {
         let id = reactor.allocate_node();
         let inner = Rc::new(ThunkInner {
@@ -89,7 +144,7 @@ impl<T: 'static> Thunk<T> {
             id,
             compute: Box::new(compute),
             value: RefCell::new(None),
-            dirty: Cell::new(true),
+            state: Cell::new(State::Dirty),
         });
 
         let observer: Rc<dyn ObserverHook> = inner.clone();
@@ -112,8 +167,9 @@ impl<T: 'static> Thunk<T> {
             node_id = self.inner.id.0,
             "reading thunk value"
         );
+        self.inner.reactor.assert_no_cycle(self.inner.id);
+        self.inner.refresh();
         self.inner.reactor.observe(self.inner.id);
-        self.inner.ensure_value();
         let value = self.inner.value.borrow();
         f(value
             .as_ref()
@@ -129,10 +185,11 @@ impl<T: Clone + 'static> Thunk<T> {
 }
 
 impl<T: 'static> Memo<T> {
+    #[track_caller]
     fn new(
         reactor: Reactor,
         equals: impl Fn(&T, &T) -> bool + 'static,
-        compute: impl Fn() -> T + 'static,
+        compute: impl Fn(Option<&T>) -> T + 'static,
     ) -> Self {
         let id = reactor.allocate_node();
         let inner = Rc::new(MemoInner {
@@ -141,7 +198,7 @@ impl<T: 'static> Memo<T> {
             compute: Box::new(compute),
             equals: Box::new(equals),
             value: RefCell::new(None),
-            dirty: Cell::new(true),
+            state: Cell::new(State::Dirty),
         });
 
         let observer: Rc<dyn ObserverHook> = inner.clone();
@@ -164,8 +221,9 @@ impl<T: 'static> Memo<T> {
             node_id = self.inner.id.0,
             "reading memo value"
         );
+        self.inner.reactor.assert_no_cycle(self.inner.id);
+        self.inner.refresh();
         self.inner.reactor.observe(self.inner.id);
-        self.inner.ensure_value();
         let value = self.inner.value.borrow();
         f(value
             .as_ref()
@@ -180,20 +238,44 @@ impl<T: Clone + 'static> Memo<T> {
     }
 }
 
+/// Shared marking behavior for computed nodes: record the strongest staleness seen, and when the
+/// node first leaves the clean state, tell downstream observers to verify their inputs.
+fn mark_computed(reactor: &Reactor, id: NodeId, state: &Cell<State>, mark: Mark) {
+    let target = State::from(mark);
+    let previous = state.get();
+    if previous >= target {
+        return;
+    }
+    state.set(target);
+    if previous == State::Clean {
+        reactor.mark_dependents(id, Mark::Check);
+    }
+}
+
 struct ThunkInner<T> {
     reactor: Reactor,
     id: NodeId,
     compute: Box<ComputeFn<T>>,
     value: RefCell<Option<T>>,
-    dirty: Cell<bool>,
+    state: Cell<State>,
 }
 
 impl<T> ThunkInner<T> {
-    fn ensure_value(&self) {
-        if !self.dirty.get() {
-            return;
+    fn refresh(&self) {
+        match self.state.get() {
+            State::Clean => {}
+            State::Check => {
+                if self.reactor.dependencies_changed(self.id) {
+                    self.recompute();
+                } else {
+                    self.state.set(State::Clean);
+                }
+            }
+            State::Dirty => self.recompute(),
         }
+    }
 
+    fn recompute(&self) {
         let _span = tracing::debug_span!(
             target: trace_targets::THUNK,
             "thunk.recompute",
@@ -202,42 +284,61 @@ impl<T> ThunkInner<T> {
         .entered();
         let next = self.reactor.run_in_context(self.id, || (self.compute)());
         *self.value.borrow_mut() = Some(next);
-        self.dirty.set(false);
+        // A thunk has no equality comparator, so every recomputation counts as a change.
+        self.reactor.bump_version(self.id);
+        self.state.set(State::Clean);
     }
 }
 
 struct MemoInner<T> {
     reactor: Reactor,
     id: NodeId,
-    compute: Box<ComputeFn<T>>,
+    compute: Box<ComputePrevFn<T>>,
     equals: Box<EqualsFn<T>>,
     value: RefCell<Option<T>>,
-    dirty: Cell<bool>,
+    state: Cell<State>,
 }
 
 impl<T> MemoInner<T> {
-    fn ensure_value(&self) {
-        if !self.dirty.get() {
-            return;
+    fn refresh(&self) {
+        match self.state.get() {
+            State::Clean => {}
+            State::Check => {
+                if self.reactor.dependencies_changed(self.id) {
+                    self.recompute();
+                } else {
+                    self.state.set(State::Clean);
+                }
+            }
+            State::Dirty => {
+                self.recompute();
+            }
         }
-        let _ = self.recompute();
     }
 
-    fn recompute(&self) -> bool {
+    fn recompute(&self) {
         let _span = tracing::debug_span!(
             target: trace_targets::MEMO,
             "memo.recompute",
             node_id = self.id.0
         )
         .entered();
-        let next = self.reactor.run_in_context(self.id, || (self.compute)());
+        let next = {
+            let previous = self.value.borrow();
+            self.reactor
+                .run_in_context(self.id, || (self.compute)(previous.as_ref()))
+        };
         let mut value = self.value.borrow_mut();
         let changed = match value.as_ref() {
             Some(current) => !(self.equals)(current, &next),
             None => true,
         };
         *value = Some(next);
-        self.dirty.set(false);
+        drop(value);
+        if changed {
+            self.reactor.bump_version(self.id);
+        }
+        self.state.set(State::Clean);
         tracing::debug!(
             target: trace_targets::MEMO,
             event = "memo_recompute",
@@ -245,27 +346,24 @@ impl<T> MemoInner<T> {
             changed,
             "recomputed memo"
         );
-        changed
     }
 }
 
 impl<T: 'static> ObserverHook for ThunkInner<T> {
-    fn notify(&self) {
-        let already_dirty = self.dirty.replace(true);
+    fn mark(&self, mark: Mark) {
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::THUNK,
-            event = "invalidate_thunk",
+            event = "mark_thunk",
             node_id = self.id.0,
-            already_dirty,
-            "invalidating thunk"
+            ?mark,
+            "marking thunk stale"
         );
-        if already_dirty {
-            return;
-        }
+        mark_computed(&self.reactor, self.id, &self.state, mark);
+    }
 
-        let _ = self.value.borrow_mut().take();
-        self.reactor.trigger(self.id);
+    fn refresh(&self) {
+        ThunkInner::refresh(self);
     }
 }
 
@@ -277,34 +375,20 @@ impl<T> Drop for ThunkInner<T> {
 }
 
 impl<T: 'static> ObserverHook for MemoInner<T> {
-    fn notify(&self) {
-        if self.value.borrow().is_none() {
-            self.dirty.set(true);
-            #[cfg(debug_assertions)]
-            tracing::trace!(
-                target: trace_targets::MEMO,
-                event = "invalidate_memo",
-                node_id = self.id.0,
-                eagerly_recomputed = false,
-                "marked uninitialized memo dirty"
-            );
-            return;
-        }
-
-        self.dirty.set(true);
-        let changed = self.recompute();
+    fn mark(&self, mark: Mark) {
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::MEMO,
-            event = "invalidate_memo",
+            event = "mark_memo",
             node_id = self.id.0,
-            eagerly_recomputed = true,
-            changed,
-            "invalidated memo"
+            ?mark,
+            "marking memo stale"
         );
-        if changed {
-            self.reactor.trigger(self.id);
-        }
+        mark_computed(&self.reactor, self.id, &self.state, mark);
+    }
+
+    fn refresh(&self) {
+        MemoInner::refresh(self);
     }
 }
 
@@ -324,7 +408,10 @@ mod tests {
     use runite::{queue_macrotask, run};
 
     use super::Thunk;
-    use crate::{EffectHandle, Memo, Reactor, Signal, memo_by_in, memo_in, signal_in, thunk_in};
+    use crate::{
+        EffectHandle, Memo, Reactor, Signal, memo_by_in, memo_in, memo_with_prev_in, signal_in,
+        thunk_in,
+    };
 
     #[test]
     fn thunk_caches_until_invalidated() {
@@ -392,6 +479,101 @@ mod tests {
     }
 
     #[test]
+    fn diamond_memos_do_not_glitch_or_recompute_redundantly() {
+        let reactor = Reactor::new();
+        let source = signal_in(&reactor, 1i64);
+        let sum_computes = Rc::new(Counter::new(0usize));
+
+        // Diamond: source -> (left, right) -> sum.
+        let left = memo_in(&reactor, {
+            let source = source.clone();
+            move || source.get() * 10
+        });
+        let right = memo_in(&reactor, {
+            let source = source.clone();
+            move || source.get() * 100
+        });
+        let sum = memo_in(&reactor, {
+            let left = left.clone();
+            let right = right.clone();
+            let sum_computes = Rc::clone(&sum_computes);
+            move || {
+                sum_computes.set(sum_computes.get() + 1);
+                left.get() + right.get()
+            }
+        });
+
+        assert_eq!(sum.get(), 110);
+        assert_eq!(sum_computes.get(), 1);
+
+        // With eager invalidation this produced a transient glitch value (fresh right + stale
+        // left) and computed sum twice. Lazy verification must compute it exactly once, from
+        // consistent inputs.
+        source.set(2);
+        assert_eq!(sum.get(), 220);
+        assert_eq!(sum_computes.get(), 2);
+    }
+
+    #[test]
+    fn unchanged_memo_suppresses_downstream_recomputation() {
+        let reactor = Reactor::new();
+        let source = signal_in(&reactor, 1usize);
+        let downstream_computes = Rc::new(Counter::new(0usize));
+
+        let parity = memo_in(&reactor, {
+            let source = source.clone();
+            move || source.get() % 2
+        });
+        let label = memo_in(&reactor, {
+            let parity = parity.clone();
+            let downstream_computes = Rc::clone(&downstream_computes);
+            move || {
+                downstream_computes.set(downstream_computes.get() + 1);
+                format!("parity: {}", parity.get())
+            }
+        });
+
+        assert_eq!(label.get(), "parity: 1");
+        assert_eq!(downstream_computes.get(), 1);
+
+        // 1 -> 3 keeps parity at 1: the memo recomputes but reports no change, so the
+        // downstream memo must not recompute.
+        source.set(3);
+        assert_eq!(label.get(), "parity: 1");
+        assert_eq!(downstream_computes.get(), 1);
+
+        source.set(4);
+        assert_eq!(label.get(), "parity: 0");
+        assert_eq!(downstream_computes.get(), 2);
+    }
+
+    #[test]
+    fn memo_with_prev_receives_previous_value() {
+        let reactor = Reactor::new();
+        let source = signal_in(&reactor, 5i64);
+
+        // A running maximum: reads its own previous value without a dependency cycle.
+        let max_seen = memo_with_prev_in(&reactor, {
+            let source = source.clone();
+            move |previous: Option<&i64>| {
+                let current = source.get();
+                match previous {
+                    Some(&best) if best >= current => best,
+                    _ => current,
+                }
+            }
+        });
+
+        assert_eq!(max_seen.get(), 5);
+        source.set(9);
+        assert_eq!(max_seen.get(), 9);
+        source.set(3);
+        assert_eq!(max_seen.get(), 9);
+        source.set(12);
+        assert_eq!(max_seen.get(), 12);
+    }
+
+    #[test]
     fn cycle_detection_reports_two_thunks_reading_each_other() {
         let reactor = Reactor::new();
         let left_slot = Rc::new(RefCell::new(None::<Thunk<i32>>));
@@ -435,6 +617,10 @@ mod tests {
         assert!(
             error.contains("reactive cycle detected"),
             "panic should indicate cycle detected"
+        );
+        assert!(
+            error.contains("created at") && error.contains("thunk.rs"),
+            "panic should name the source locations of the nodes in the cycle, got: {error}"
         );
     }
 

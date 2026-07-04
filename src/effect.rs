@@ -2,18 +2,25 @@ use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak};
 use core::cell::{Cell, RefCell};
 
-use crate::reactor::ObserverHook;
+use crate::reactor::{Mark, ObserverHook, State};
 use crate::{NodeId, Reactor, current, trace_targets};
+
+/// Maximum number of times a single effect may run within one job flush before the reactor
+/// assumes it is caught in a divergent feedback loop (debug builds only).
+#[cfg(debug_assertions)]
+const MAX_RUNS_PER_FLUSH: u32 = 100;
 
 /// Creates an effect in the current thread's default reactor.
 ///
 /// The effect is scheduled immediately and then re-scheduled whenever one of its dependencies
 /// changes.
+#[track_caller]
 pub fn effect(f: impl Fn() + 'static) -> EffectHandle {
     current().effect(f)
 }
 
 /// Creates an effect associated with `reactor`.
+#[track_caller]
 pub fn effect_in(reactor: &Reactor, f: impl Fn() + 'static) -> EffectHandle {
     reactor.effect(f)
 }
@@ -30,21 +37,28 @@ impl Reactor {
     ///
     /// The effect is scheduled immediately and then re-scheduled whenever one of its dependencies
     /// changes.
+    #[track_caller]
     pub fn effect(&self, f: impl Fn() + 'static) -> EffectHandle {
         EffectHandle::new(self.clone(), f)
     }
 }
 
 impl EffectHandle {
+    #[track_caller]
     fn new(reactor: Reactor, effect: impl Fn() + 'static) -> Self {
         let id = reactor.allocate_node();
         let inner = Rc::new(EffectInner {
             reactor: reactor.clone(),
             id,
             effect: Box::new(effect),
+            state: Cell::new(State::Dirty),
             scheduled: Cell::new(false),
             disposed: Cell::new(false),
             self_ref: RefCell::new(Weak::new()),
+            #[cfg(debug_assertions)]
+            last_flush_epoch: Cell::new(u64::MAX),
+            #[cfg(debug_assertions)]
+            runs_this_flush: Cell::new(0),
         });
         *inner.self_ref.borrow_mut() = Rc::downgrade(&inner);
         tracing::debug!(
@@ -83,9 +97,14 @@ struct EffectInner {
     reactor: Reactor,
     id: NodeId,
     effect: Box<dyn Fn() + 'static>,
+    state: Cell<State>,
     scheduled: Cell<bool>,
     disposed: Cell<bool>,
     self_ref: RefCell<Weak<EffectInner>>,
+    #[cfg(debug_assertions)]
+    last_flush_epoch: Cell<u64>,
+    #[cfg(debug_assertions)]
+    runs_this_flush: Cell<u32>,
 }
 
 impl EffectInner {
@@ -118,20 +137,79 @@ impl EffectInner {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            if inner.disposed.get() {
-                inner.scheduled.set(false);
-                return;
-            }
-
-            inner.scheduled.set(false);
-            let _span = tracing::debug_span!(
-                target: trace_targets::EFFECT,
-                "effect.run",
-                node_id = inner.id.0
-            )
-            .entered();
-            inner.reactor.run_in_context(inner.id, || (inner.effect)());
+            inner.run_scheduled();
         });
+    }
+
+    fn run_scheduled(self: &Rc<Self>) {
+        if self.disposed.get() {
+            self.scheduled.set(false);
+            return;
+        }
+
+        self.scheduled.set(false);
+        let state = self.state.get();
+        self.state.set(State::Clean);
+
+        // A Check mark means only computed dependencies may have changed; verify them so that
+        // equality-suppressed memo updates do not rerun the effect.
+        let should_run = match state {
+            State::Dirty => true,
+            State::Check => self.reactor.dependencies_changed(self.id),
+            State::Clean => false,
+        };
+        if !should_run {
+            #[cfg(debug_assertions)]
+            tracing::trace!(
+                target: trace_targets::EFFECT,
+                event = "skip_effect",
+                node_id = self.id.0,
+                "skipping effect run; no dependency actually changed"
+            );
+            return;
+        }
+
+        #[cfg(debug_assertions)]
+        self.check_divergence();
+
+        let _span = tracing::debug_span!(
+            target: trace_targets::EFFECT,
+            "effect.run",
+            node_id = self.id.0
+        )
+        .entered();
+        self.reactor.run_in_context(self.id, || (self.effect)());
+    }
+
+    /// Panics when this effect keeps re-running within a single flush, which indicates a
+    /// divergent feedback loop: the effect writes state it (transitively) depends on with a
+    /// value that never converges.
+    ///
+    /// Convergent feedback (for example clamping, where the rewritten value is suppressed by the
+    /// signal's equality check on the next round) is legal and settles well below this limit.
+    #[cfg(debug_assertions)]
+    fn check_divergence(&self) {
+        let epoch = self.reactor.flush_epoch();
+        if self.last_flush_epoch.get() != epoch {
+            self.last_flush_epoch.set(epoch);
+            self.runs_this_flush.set(1);
+            return;
+        }
+
+        let runs = self.runs_this_flush.get().saturating_add(1);
+        self.runs_this_flush.set(runs);
+        if runs > MAX_RUNS_PER_FLUSH {
+            let origin = self
+                .reactor
+                .origin(self.id)
+                .map(|location| location.to_string())
+                .unwrap_or_else(|| "<unknown>".into());
+            panic!(
+                "adaptite: effect created at {origin} ran more than {MAX_RUNS_PER_FLUSH} times \
+                 in a single flush; this suggests a divergent reactive feedback loop (the effect \
+                 writes state it depends on without converging)"
+            );
+        }
     }
 
     fn dispose(&self) {
@@ -151,7 +229,11 @@ impl EffectInner {
 }
 
 impl ObserverHook for EffectInner {
-    fn notify(&self) {
+    fn mark(&self, mark: Mark) {
+        let target = State::from(mark);
+        if self.state.get() < target {
+            self.state.set(target);
+        }
         self.schedule();
     }
 }
@@ -257,5 +339,87 @@ mod tests {
 
         run();
         assert_eq!(&*seen.borrow(), &[0, 1]);
+    }
+
+    #[test]
+    fn convergent_feedback_loops_settle() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let handle_slot = Rc::new(RefCell::new(None::<EffectHandle>));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            let handle_slot = Rc::clone(&handle_slot);
+            move || {
+                let reactor = Reactor::new();
+                let value = signal_in(&reactor, 5i64);
+
+                // A clamp: the effect writes the signal it reads. The rewrite converges because
+                // the second run writes an equal value, which the signal suppresses.
+                let effect = reactor.effect({
+                    let value = value.clone();
+                    let seen = Rc::clone(&seen);
+                    move || {
+                        let current = value.get();
+                        seen.borrow_mut().push(current);
+                        if current > 10 {
+                            value.set(10);
+                        }
+                    }
+                });
+
+                value.set(25);
+                *handle_slot.borrow_mut() = Some(effect);
+            }
+        });
+
+        run();
+        assert_eq!(&*seen.borrow(), &[25, 10]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn divergent_feedback_loops_panic_instead_of_hanging() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let handle_slot = Rc::new(RefCell::new(None::<EffectHandle>));
+        let panic_message = Rc::new(RefCell::new(None::<String>));
+
+        queue_macrotask({
+            let handle_slot = Rc::clone(&handle_slot);
+            let panic_message = Rc::clone(&panic_message);
+            move || {
+                let reactor = Reactor::new();
+                let counter = signal_in(&reactor, 0u64);
+
+                // A counter increment: every run changes the value, so the loop never converges.
+                let effect = reactor.effect({
+                    let counter = counter.clone();
+                    move || {
+                        let next = counter.get() + 1;
+                        counter.set(next);
+                    }
+                });
+                *handle_slot.borrow_mut() = Some(effect);
+
+                let result = catch_unwind(AssertUnwindSafe(|| reactor.flush_now()));
+                let panic = result.expect_err("divergent loop should panic");
+                *panic_message.borrow_mut() = panic.downcast_ref::<String>().cloned();
+            }
+        });
+
+        run();
+
+        let message = panic_message.borrow();
+        let message = message
+            .as_ref()
+            .expect("panic payload should be a formatted string");
+        assert!(
+            message.contains("divergent reactive feedback loop"),
+            "panic should describe the divergence, got: {message}"
+        );
+        assert!(
+            message.contains("effect.rs"),
+            "panic should name the effect's creation site, got: {message}"
+        );
     }
 }

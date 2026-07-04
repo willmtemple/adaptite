@@ -4,11 +4,13 @@ use core::cell::RefCell;
 use crate::{NodeId, Reactor, current, trace_targets};
 
 /// Creates a [`Signal`] in the current thread's default reactor.
+#[track_caller]
 pub fn signal<T: 'static>(initial: T) -> Signal<T> {
     current().signal(initial)
 }
 
 /// Creates a [`Signal`] associated with `reactor`.
+#[track_caller]
 pub fn signal_in<T: 'static>(reactor: &Reactor, initial: T) -> Signal<T> {
     reactor.signal(initial)
 }
@@ -21,12 +23,14 @@ pub struct Signal<T> {
 
 impl Reactor {
     /// Creates a mutable source signal associated with this reactor.
+    #[track_caller]
     pub fn signal<T: 'static>(&self, initial: T) -> Signal<T> {
         Signal::new(self.clone(), initial)
     }
 }
 
 impl<T: 'static> Signal<T> {
+    #[track_caller]
     fn new(reactor: Reactor, initial: T) -> Self {
         let id = reactor.allocate_node();
         tracing::debug!(

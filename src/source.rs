@@ -3,11 +3,13 @@ use alloc::rc::Rc;
 use crate::{NodeId, Reactor, current, trace_targets};
 
 /// Creates a low-level reactive source node in the current reactor.
+#[track_caller]
 pub fn source() -> Source {
     current().source()
 }
 
 /// Creates a low-level reactive source node associated with `reactor`.
+#[track_caller]
 pub fn source_in(reactor: &Reactor) -> Source {
     reactor.source()
 }
@@ -23,12 +25,14 @@ pub struct Source {
 
 impl Reactor {
     /// Creates a low-level source node associated with this reactor.
+    #[track_caller]
     pub fn source(&self) -> Source {
         Source::new(self.clone())
     }
 }
 
 impl Source {
+    #[track_caller]
     fn new(reactor: Reactor) -> Self {
         let id = reactor.allocate_node();
         tracing::debug!(

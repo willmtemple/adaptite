@@ -29,4 +29,7 @@ pub use id::NodeId;
 pub use reactor::{ReactCycleError, Reactor, current};
 pub use signal::{Signal, signal, signal_in};
 pub use source::{Source, source, source_in};
-pub use thunk::{Memo, Thunk, memo, memo_by, memo_by_in, memo_in, thunk, thunk_in};
+pub use thunk::{
+    Memo, Thunk, memo, memo_by, memo_by_in, memo_in, memo_with_prev, memo_with_prev_in, thunk,
+    thunk_in,
+};

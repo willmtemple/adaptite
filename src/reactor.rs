@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::error::Error;
 use core::fmt;
+use core::panic::Location;
 
 use hashbrown::{HashMap, HashSet};
 
@@ -18,6 +19,13 @@ thread_local! {
     static CURRENT_REACTOR: RefCell<Weak<ReactorInner>> = const { RefCell::new(Weak::new()) };
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Pointer identity of the reactor whose computation is currently on top of the call stack.
+    /// Used to detect reads of one reactor's nodes from inside another reactor's computation.
+    static RUNNING_REACTOR: Cell<*const ()> = const { Cell::new(core::ptr::null()) };
+}
+
 /// Returns the current thread's default reactor.
 ///
 /// The first call on a thread creates a new reactor for that thread and caches it in thread-local
@@ -26,25 +34,66 @@ pub fn current() -> Reactor {
     Reactor::current()
 }
 
-#[allow(dead_code)]
+/// How stale an observer has become after an upstream write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Mark {
+    /// A transitive dependency may have changed; the observer must verify its direct
+    /// dependencies before recomputing.
+    Check,
+    /// A direct dependency definitely changed; the observer must recompute.
+    Dirty,
+}
+
+/// Staleness of a computed node or effect, ordered from freshest to stalest.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum State {
+    Clean,
+    Check,
+    Dirty,
+}
+
+impl From<Mark> for State {
+    fn from(mark: Mark) -> Self {
+        match mark {
+            Mark::Check => State::Check,
+            Mark::Dirty => State::Dirty,
+        }
+    }
+}
+
 pub(crate) trait ObserverHook {
-    fn notify(&self);
+    /// Records that this observer's inputs may have changed.
+    fn mark(&self, mark: Mark);
+
+    /// Brings a computed node up to date, recomputing if its inputs actually changed.
+    ///
+    /// The default implementation is a no-op; it is used by observers that are never read as
+    /// dependencies (effects).
+    fn refresh(&self) {}
 }
 
 /// Error type for cycles detected in the reactive graph. Contains the path of nodes that form the cycle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReactCycleError {
     cycle: Vec<NodeId>,
+    origins: Vec<Option<&'static Location<'static>>>,
 }
 
 impl ReactCycleError {
-    fn new(cycle: Vec<NodeId>) -> Self {
-        Self { cycle }
+    fn new(cycle: Vec<NodeId>, origins: Vec<Option<&'static Location<'static>>>) -> Self {
+        Self { cycle, origins }
     }
 
     /// Returns the cycle path that was detected.
     pub fn cycle(&self) -> &[NodeId] {
         &self.cycle
+    }
+
+    /// Returns the source locations where the nodes in the cycle path were created, in the same
+    /// order as [`cycle`](Self::cycle). An entry is `None` when the node has already been
+    /// disposed.
+    pub fn origins(&self) -> &[Option<&'static Location<'static>>] {
+        &self.origins
     }
 }
 
@@ -56,6 +105,9 @@ impl fmt::Display for ReactCycleError {
                 write!(f, " -> ")?;
             }
             write!(f, "{node}")?;
+            if let Some(origin) = self.origins.get(index).copied().flatten() {
+                write!(f, " (created at {origin})")?;
+            }
         }
         Ok(())
     }
@@ -124,9 +176,14 @@ impl Reactor {
         self.inner.stack.borrow_mut().push(observer);
         let inserted = self.inner.active_computations.borrow_mut().insert(observer);
         debug_assert!(inserted, "observer should not already be active");
+        #[cfg(debug_assertions)]
+        let previous_running =
+            RUNNING_REACTOR.with(|running| running.replace(Rc::as_ptr(&self.inner).cast::<()>()));
 
         struct Guard<'a> {
             inner: &'a ReactorInner,
+            #[cfg(debug_assertions)]
+            previous_running: *const (),
         }
 
         impl Drop for Guard<'_> {
@@ -137,16 +194,22 @@ impl Reactor {
                     let removed = self.inner.active_computations.borrow_mut().remove(&node);
                     debug_assert!(removed, "observer should have been active");
                 }
+                #[cfg(debug_assertions)]
+                RUNNING_REACTOR.with(|running| running.set(self.previous_running));
             }
         }
 
-        let _guard = Guard { inner: &self.inner };
+        let _guard = Guard {
+            inner: &self.inner,
+            #[cfg(debug_assertions)]
+            previous_running,
+        };
         f()
     }
 
-    /// Attempts to record a dependency on `observable` for the currently running observer, returning an
-    /// error if doing so would create a dependency cycle.
-    pub fn try_observe(&self, observable: NodeId) -> Result<(), ReactCycleError> {
+    /// Returns an error if reading `observable` right now would close a dependency cycle, i.e.
+    /// if `observable` is currently being computed further up the call stack.
+    pub(crate) fn cycle_check(&self, observable: NodeId) -> Result<(), ReactCycleError> {
         if self
             .inner
             .active_computations
@@ -160,6 +223,7 @@ impl Reactor {
                 .expect("active computation should appear in observer stack");
             let mut cycle = stack[start..].to_vec();
             cycle.push(observable);
+            let origins = cycle.iter().map(|node| self.origin(*node)).collect();
             tracing::debug!(
                 target: trace_targets::GRAPH,
                 event = "cycle_detected",
@@ -167,8 +231,26 @@ impl Reactor {
                 cycle_len = cycle.len(),
                 "reactive cycle detected"
             );
-            return Err(ReactCycleError::new(cycle));
+            return Err(ReactCycleError::new(cycle, origins));
         }
+        Ok(())
+    }
+
+    /// Panicking variant of [`cycle_check`](Self::cycle_check), used on read paths before
+    /// refreshing a computed node.
+    pub(crate) fn assert_no_cycle(&self, observable: NodeId) {
+        if let Err(e) = self.cycle_check(observable) {
+            panic!("{e}");
+        }
+    }
+
+    /// Attempts to record a dependency on `observable` for the currently running observer, returning an
+    /// error if doing so would create a dependency cycle.
+    pub fn try_observe(&self, observable: NodeId) -> Result<(), ReactCycleError> {
+        self.cycle_check(observable)?;
+
+        #[cfg(debug_assertions)]
+        self.assert_running_reactor();
 
         let current = self.inner.stack.borrow().last().copied();
         let Some(observer) = current else {
@@ -189,7 +271,7 @@ impl Reactor {
             .borrow_mut()
             .entry(observer)
             .or_default()
-            .insert(observable);
+            .insert(observable, self.version(observable));
         self.inner
             .dependents
             .borrow_mut()
@@ -206,12 +288,21 @@ impl Reactor {
     /// Panics if recording the dependency would create a cycle in the reactive graph.
     pub fn observe(&self, observable: NodeId) {
         if let Err(e) = self.try_observe(observable) {
-            panic!("reactive cycle detected: {e}");
+            panic!("{e}");
         }
     }
 
-    /// Notifies dependents of `observable`.
+    /// Notifies dependents of `observable` that its value changed.
+    ///
+    /// Direct dependents are marked dirty; transitive dependents are marked so that they verify
+    /// their inputs before recomputing.
     pub fn trigger(&self, observable: NodeId) {
+        self.bump_version(observable);
+        self.mark_dependents(observable, Mark::Dirty);
+    }
+
+    /// Marks every dependent of `observable` with `mark`.
+    pub(crate) fn mark_dependents(&self, observable: NodeId, mark: Mark) {
         let dependents = self
             .inner
             .dependents
@@ -223,10 +314,11 @@ impl Reactor {
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::GRAPH,
-            event = "trigger",
+            event = "mark_dependents",
             observable_id = observable.0,
             dependent_count = dependents.len(),
-            "triggering reactive dependents"
+            ?mark,
+            "marking reactive dependents"
         );
 
         for dependent in dependents {
@@ -238,11 +330,40 @@ impl Reactor {
                 .cloned()
                 .and_then(|weak| weak.upgrade());
             if let Some(hook) = hook {
-                hook.notify();
+                hook.mark(mark);
             } else {
                 self.inner.observers.borrow_mut().remove(&dependent);
             }
         }
+    }
+
+    /// Brings `node` up to date if it is a computed node that is currently registered.
+    pub(crate) fn refresh_node(&self, node: NodeId) {
+        let hook = self
+            .inner
+            .observers
+            .borrow()
+            .get(&node)
+            .cloned()
+            .and_then(|weak| weak.upgrade());
+        if let Some(hook) = hook {
+            hook.refresh();
+        }
+    }
+
+    /// Returns `true` if any of `observer`'s recorded dependencies has a different value than the
+    /// one observed during the observer's last run.
+    ///
+    /// Computed dependencies are refreshed before comparison, so unchanged memos suppress
+    /// downstream recomputation.
+    pub(crate) fn dependencies_changed(&self, observer: NodeId) -> bool {
+        for (dependency, seen_version) in self.dependencies_of(observer) {
+            self.refresh_node(dependency);
+            if self.version(dependency) != seen_version {
+                return true;
+            }
+        }
+        false
     }
 
     /// Disposes all graph bookkeeping for `node`.
@@ -273,6 +394,7 @@ impl Reactor {
         }
 
         self.inner.observers.borrow_mut().remove(&node);
+        self.inner.meta.borrow_mut().remove(&node);
     }
 
     /// Schedules a job to run in the reactor's microtask-backed job queue.
@@ -299,10 +421,18 @@ impl Reactor {
         Rc::clone(&self.inner).flush_jobs();
     }
 
+    #[track_caller]
     pub(crate) fn allocate_node(&self) -> NodeId {
         let raw = self.inner.next_node.get();
         self.inner.next_node.set(raw.wrapping_add(1));
         let id = NodeId::new(raw);
+        self.inner.meta.borrow_mut().insert(
+            id,
+            NodeMeta {
+                version: 0,
+                origin: Location::caller(),
+            },
+        );
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::GRAPH,
@@ -324,13 +454,65 @@ impl Reactor {
         self.inner.observers.borrow_mut().remove(&id);
     }
 
+    /// Increments the version of `node`, recording that its value changed.
+    pub(crate) fn bump_version(&self, node: NodeId) {
+        if let Some(meta) = self.inner.meta.borrow_mut().get_mut(&node) {
+            meta.version = meta.version.wrapping_add(1);
+        }
+    }
+
+    /// Returns the current version of `node`, or 0 if the node is unknown.
+    pub(crate) fn version(&self, node: NodeId) -> u64 {
+        self.inner
+            .meta
+            .borrow()
+            .get(&node)
+            .map(|meta| meta.version)
+            .unwrap_or(0)
+    }
+
+    /// Returns the source location at which `node` was created.
+    pub(crate) fn origin(&self, node: NodeId) -> Option<&'static Location<'static>> {
+        self.inner.meta.borrow().get(&node).map(|meta| meta.origin)
+    }
+
+    /// Returns the dependencies recorded during `observer`'s last run, with the version of each
+    /// dependency observed at that time.
+    pub(crate) fn dependencies_of(&self, observer: NodeId) -> Vec<(NodeId, u64)> {
+        self.inner
+            .dependencies
+            .borrow()
+            .get(&observer)
+            .map(|edges| edges.iter().map(|(id, version)| (*id, *version)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns the number of the currently running (or most recent) job flush.
+    pub(crate) fn flush_epoch(&self) -> u64 {
+        self.inner.flush_epoch.get()
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_running_reactor(&self) {
+        RUNNING_REACTOR.with(|running| {
+            let running = running.get();
+            if !running.is_null() && running != Rc::as_ptr(&self.inner).cast::<()>() {
+                panic!(
+                    "adaptite: a node belonging to one reactor was read inside a computation \
+                     running in a different reactor on the same thread; this dependency cannot \
+                     be tracked and the observer will not re-run when the node changes"
+                );
+            }
+        });
+    }
+
     fn clear_observer_dependencies(&self, observer: NodeId) {
         let observed = self
             .inner
             .dependencies
             .borrow_mut()
             .remove(&observer)
-            .map(|nodes| nodes.into_iter().collect::<Vec<_>>())
+            .map(|edges| edges.into_keys().collect::<Vec<_>>())
             .unwrap_or_default();
 
         for observable in observed {
@@ -359,21 +541,29 @@ impl fmt::Debug for Reactor {
     }
 }
 
+struct NodeMeta {
+    version: u64,
+    origin: &'static Location<'static>,
+}
+
 struct ReactorInner {
     next_node: Cell<u64>,
-    dependencies: RefCell<HashMap<NodeId, HashSet<NodeId>>>,
+    meta: RefCell<HashMap<NodeId, NodeMeta>>,
+    dependencies: RefCell<HashMap<NodeId, HashMap<NodeId, u64>>>,
     dependents: RefCell<HashMap<NodeId, HashSet<NodeId>>>,
     observers: RefCell<HashMap<NodeId, Weak<dyn ObserverHook>>>,
     stack: RefCell<Vec<NodeId>>,
     active_computations: RefCell<HashSet<NodeId>>,
     pending_jobs: RefCell<VecDeque<Job>>,
     flush_scheduled: Cell<bool>,
+    flush_epoch: Cell<u64>,
 }
 
 impl ReactorInner {
     fn new() -> Self {
         Self {
             next_node: Cell::new(1),
+            meta: RefCell::new(HashMap::new()),
             dependencies: RefCell::new(HashMap::new()),
             dependents: RefCell::new(HashMap::new()),
             observers: RefCell::new(HashMap::new()),
@@ -381,6 +571,7 @@ impl ReactorInner {
             active_computations: RefCell::new(HashSet::new()),
             pending_jobs: RefCell::new(VecDeque::new()),
             flush_scheduled: Cell::new(false),
+            flush_epoch: Cell::new(0),
         }
     }
 
@@ -408,8 +599,29 @@ impl ReactorInner {
             "reactor.flush_jobs"
         )
         .entered();
+        self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
+
+        // If a job panics, reset the flush flag and hand any remaining jobs to a fresh flush so
+        // one panicking effect cannot silently disable the reactor.
+        struct FlushGuard {
+            inner: Rc<ReactorInner>,
+        }
+
+        impl Drop for FlushGuard {
+            fn drop(&mut self) {
+                self.inner.flush_scheduled.set(false);
+                if !self.inner.pending_jobs.borrow().is_empty() {
+                    self.inner.ensure_flush_scheduled();
+                }
+            }
+        }
+
+        let guard = FlushGuard {
+            inner: Rc::clone(&self),
+        };
+
         loop {
-            let job = self.pending_jobs.borrow_mut().pop_front();
+            let job = guard.inner.pending_jobs.borrow_mut().pop_front();
             let Some(job) = job else {
                 break;
             };
@@ -417,15 +629,10 @@ impl ReactorInner {
             tracing::trace!(
                 target: trace_targets::GRAPH,
                 event = "run_job",
-                remaining_jobs = self.pending_jobs.borrow().len(),
+                remaining_jobs = guard.inner.pending_jobs.borrow().len(),
                 "running reactive scheduled job"
             );
             job();
-        }
-
-        self.flush_scheduled.set(false);
-        if !self.pending_jobs.borrow().is_empty() {
-            self.ensure_flush_scheduled();
         }
     }
 }
@@ -448,10 +655,11 @@ mod tests {
     }
 
     #[test]
-    fn observe_records_dependency_edges() {
+    fn observe_records_dependency_edges_with_versions() {
         let reactor = Reactor::new();
         let observer = reactor.allocate_node();
         let observable = reactor.allocate_node();
+        reactor.trigger(observable);
 
         reactor.run_in_context(observer, || {
             reactor
@@ -460,8 +668,8 @@ mod tests {
         });
 
         assert_eq!(
-            reactor.inner.dependencies.borrow().get(&observer),
-            Some(&[observable].into_iter().collect())
+            reactor.dependencies_of(observer),
+            vec![(observable, reactor.version(observable))]
         );
         assert_eq!(
             reactor.inner.dependents.borrow().get(&observable),
@@ -470,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn cycle_detection_panics_with_expected() {
+    fn cycle_detection_panics_with_path_and_origins() {
         let reactor = Reactor::new();
         let a = reactor.allocate_node();
         let b = reactor.allocate_node();
@@ -495,8 +703,10 @@ mod tests {
         );
 
         assert!(
-            cycle_error.contains("1 -> 2 -> 1"),
-            "panic should include cycle path"
+            cycle_error.contains("1 (created at")
+                && cycle_error.contains("-> 2 (created at")
+                && cycle_error.contains("reactor.rs"),
+            "panic should include the cycle path with node origins, got: {cycle_error}"
         );
     }
 
@@ -513,6 +723,33 @@ mod tests {
                     move || observed.set(1)
                 });
                 assert_eq!(observed.get(), 0);
+            }
+        });
+
+        run();
+
+        assert_eq!(observed.get(), 1);
+    }
+
+    #[test]
+    fn flush_recovers_after_a_panicking_job() {
+        let observed = Rc::new(Cell::new(0usize));
+
+        queue_macrotask({
+            let observed = Rc::clone(&observed);
+            move || {
+                let reactor = Reactor::new();
+                reactor.schedule(|| panic!("job panics"));
+                // Swallow the panic that propagates out of the microtask flush so the test can
+                // observe the reactor's recovery.
+                let result = catch_unwind(AssertUnwindSafe(|| reactor.flush_now()));
+                assert!(result.is_err(), "flush should propagate the job panic");
+
+                reactor.schedule({
+                    let observed = Rc::clone(&observed);
+                    move || observed.set(1)
+                });
+                reactor.flush_now();
             }
         });
 

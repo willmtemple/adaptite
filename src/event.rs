@@ -10,23 +10,27 @@ use crate::{NodeId, Reactor, current, trace_targets};
 type SubscriberFn<T> = dyn Fn(&T) + 'static;
 
 /// Creates an event in the current thread's default reactor.
+#[track_caller]
 pub fn event<T: 'static>() -> Event<T> {
     current().event()
 }
 
 /// Creates an event associated with `reactor`.
+#[track_caller]
 pub fn event_in<T: 'static>(reactor: &Reactor) -> Event<T> {
     reactor.event()
 }
 
 /// Creates a reactive draining subscription for `event` in the current reactor.
 #[must_use = "subscriptions created with `on` must be used to stay active"]
+#[track_caller]
 pub fn on<T: Clone + 'static>(event: &Event<T>, handler: impl Fn(&T) + 'static) -> Subscription {
     current().on(event, handler)
 }
 
 /// Creates a reactive draining subscription for `event` associated with `reactor`.
 #[must_use = "subscriptions created with `on_in` must be used to stay active"]
+#[track_caller]
 pub fn on_in<T: Clone + 'static>(
     reactor: &Reactor,
     event: &Event<T>,
@@ -49,12 +53,14 @@ pub struct Subscription {
 
 impl Reactor {
     /// Creates an event source associated with this reactor.
+    #[track_caller]
     pub fn event<T: 'static>(&self) -> Event<T> {
         Event::new(self.clone())
     }
 
     /// Creates a reactive draining subscription for `event`.
     #[must_use = "subscriptions created with `on` must be used to stay active"]
+    #[track_caller]
     pub fn on<T: Clone + 'static>(
         &self,
         event: &Event<T>,
@@ -96,6 +102,7 @@ impl Reactor {
 }
 
 impl<T: 'static> Event<T> {
+    #[track_caller]
     fn new(reactor: Reactor) -> Self {
         let id = reactor.allocate_node();
         tracing::debug!(
@@ -186,6 +193,7 @@ impl<T> Drop for EventInner<T> {
 }
 
 impl Subscription {
+    #[track_caller]
     fn new(cancel: impl Fn() + 'static) -> Self {
         Self {
             inner: Rc::new(SubscriptionInner {
