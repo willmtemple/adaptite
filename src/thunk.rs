@@ -181,6 +181,27 @@ pub fn memo_with_prev_in<T: PartialEq + 'static>(
     reactor.memo_with_prev(compute)
 }
 
+/// Creates a comparator-aware memo whose compute closure receives the memo's previous value, in
+/// the current thread's default reactor.
+#[track_caller]
+pub fn memo_by_with_prev<T: 'static>(
+    equals: impl Fn(&T, &T) -> bool + 'static,
+    compute: impl Fn(Option<&T>) -> T + 'static,
+) -> Memo<T> {
+    current().memo_by_with_prev(equals, compute)
+}
+
+/// Creates a comparator-aware memo whose compute closure receives the memo's previous value,
+/// associated with `reactor`.
+#[track_caller]
+pub fn memo_by_with_prev_in<T: 'static>(
+    reactor: &Reactor,
+    equals: impl Fn(&T, &T) -> bool + 'static,
+    compute: impl Fn(Option<&T>) -> T + 'static,
+) -> Memo<T> {
+    reactor.memo_by_with_prev(equals, compute)
+}
+
 /// Lazy computed node in the reactive graph.
 ///
 /// A thunk caches the result of its compute closure and recomputes on read after any of its
@@ -286,6 +307,12 @@ impl<T: 'static> Thunk<T> {
     }
 
     /// Runs `f` with a shared reference to the current computed value.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`crate::ReactCycleError`] message when this thunk's computation
+    /// (transitively) reads itself. A shared borrow of the cached value is held while `f`
+    /// runs, so invalidating this thunk *and reading it again* from inside `f` also panics.
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         #[cfg(debug_assertions)]
         tracing::trace!(
@@ -307,6 +334,10 @@ impl<T: 'static> Thunk<T> {
 impl<T: 'static> Thunk<T> {
     /// Runs `f` with a shared reference to the current computed value without recording a
     /// dependency. The thunk is still brought up to date before `f` runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`with`](Thunk::with).
     pub fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         self.inner.reactor.assert_no_cycle(self.inner.id);
         self.inner.refresh();
@@ -358,6 +389,13 @@ impl<T: 'static> Memo<T> {
     }
 
     /// Runs `f` with a shared reference to the current computed value.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`crate::ReactCycleError`] message when this memo's computation
+    /// (transitively) reads itself (use [`memo_with_prev`] for access to the previous value).
+    /// A shared borrow of the cached value is held while `f` runs, so invalidating this memo
+    /// *and reading it again* from inside `f` also panics.
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         #[cfg(debug_assertions)]
         tracing::trace!(
@@ -379,6 +417,10 @@ impl<T: 'static> Memo<T> {
 impl<T: 'static> Memo<T> {
     /// Runs `f` with a shared reference to the current computed value without recording a
     /// dependency. The memo is still brought up to date before `f` runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`with`](Memo::with).
     pub fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         self.inner.reactor.assert_no_cycle(self.inner.id);
         self.inner.refresh();
@@ -415,6 +457,22 @@ fn mark_computed(reactor: &Reactor, id: NodeId, state: &Cell<State>, mark: Mark)
     }
 }
 
+impl<T> core::fmt::Debug for Thunk<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Thunk")
+            .field("id", &self.inner.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> core::fmt::Debug for Memo<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Memo")
+            .field("id", &self.inner.id)
+            .finish_non_exhaustive()
+    }
+}
+
 struct ThunkInner<T> {
     reactor: Reactor,
     id: NodeId,
@@ -445,11 +503,19 @@ impl<T> ThunkInner<T> {
             node_id = self.id.0
         )
         .entered();
+        // Clear staleness before computing so a (discouraged) write from inside the compute to
+        // one of its own dependencies re-marks this node instead of being lost; restore the
+        // mark if the compute unwinds so the next read retries.
+        self.state.set(State::Clean);
+        let mut guard = crate::reactor::DirtyOnUnwind {
+            state: &self.state,
+            armed: true,
+        };
         let next = self.reactor.run_in_context(self.id, || (self.compute)());
+        guard.armed = false;
         *self.value.borrow_mut() = Some(next);
         // A thunk has no equality comparator, so every recomputation counts as a change.
         self.reactor.bump_version(self.id);
-        self.state.set(State::Clean);
     }
 }
 
@@ -486,22 +552,34 @@ impl<T> MemoInner<T> {
             node_id = self.id.0
         )
         .entered();
+        // Clear staleness before computing so a (discouraged) write from inside the compute to
+        // one of its own dependencies re-marks this node instead of being lost; restore the
+        // mark if the compute unwinds so the next read retries.
+        self.state.set(State::Clean);
+        let mut guard = crate::reactor::DirtyOnUnwind {
+            state: &self.state,
+            armed: true,
+        };
         let next = {
             let previous = self.value.borrow();
             self.reactor
                 .run_in_context(self.id, || (self.compute)(previous.as_ref()))
         };
-        let mut value = self.value.borrow_mut();
-        let changed = match value.as_ref() {
-            Some(current) => !(self.equals)(current, &next),
-            None => true,
+        guard.armed = false;
+        // Compare under a shared borrow (so a comparator that reads this memo cannot hit a
+        // borrow conflict) and without tracking (so a comparator's reads never become
+        // dependencies of whatever observer is currently running).
+        let changed = {
+            let value = self.value.borrow();
+            match value.as_ref() {
+                Some(current) => crate::untrack(|| !(self.equals)(current, &next)),
+                None => true,
+            }
         };
-        *value = Some(next);
-        drop(value);
+        *self.value.borrow_mut() = Some(next);
         if changed {
             self.reactor.bump_version(self.id);
         }
-        self.state.set(State::Clean);
         tracing::debug!(
             target: trace_targets::MEMO,
             event = "memo_recompute",
@@ -734,6 +812,73 @@ mod tests {
         assert_eq!(max_seen.get(), 9);
         source.set(12);
         assert_eq!(max_seen.get(), 12);
+    }
+
+    #[test]
+    fn cycles_discovered_through_verification_report_cycle_errors() {
+        let reactor = Reactor::new();
+        let flag = signal_in(&reactor, false);
+        let source = signal_in(&reactor, 1i32);
+        let v_slot = Rc::new(RefCell::new(None::<Thunk<i32>>));
+
+        // x reads v only when flag is set; v always reads x. The cycle exists only after the
+        // flip, and is then discovered through v's Check-state dependency verification (which
+        // re-enters x mid-compute) rather than through a direct read.
+        let x = thunk_in(&reactor, {
+            let flag = flag.clone();
+            let source = source.clone();
+            let v_slot = Rc::clone(&v_slot);
+            move || {
+                if flag.get() {
+                    v_slot.borrow().as_ref().expect("v should exist").get()
+                } else {
+                    source.get()
+                }
+            }
+        });
+        let v = thunk_in(&reactor, {
+            let x = x.clone();
+            move || x.get()
+        });
+        *v_slot.borrow_mut() = Some(v.clone());
+
+        assert_eq!(v.get(), 1);
+        flag.set(true); // x becomes dirty, v becomes check
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = x.get();
+        }))
+        .expect_err("verification-path cycle should panic");
+        let error = panic
+            .downcast_ref::<String>()
+            .expect("panic should be a formatted cycle error");
+        assert!(
+            error.contains("reactive cycle detected"),
+            "expected a cycle error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_write_from_inside_a_compute_re_marks_the_thunk() {
+        let reactor = Reactor::new();
+        let source = signal_in(&reactor, 0i32);
+
+        // An impure compute that writes its own dependency. The first read observes the
+        // pre-write value, but the self-inflicted invalidation must not be lost.
+        let clamped = thunk_in(&reactor, {
+            let source = source.clone();
+            move || {
+                let value = source.get();
+                if value < 10 {
+                    source.set(10);
+                }
+                value
+            }
+        });
+
+        assert_eq!(clamped.get(), 0);
+        assert_eq!(clamped.get(), 10, "the self-write must re-mark the thunk");
+        assert_eq!(clamped.get(), 10);
     }
 
     #[test]

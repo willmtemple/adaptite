@@ -93,6 +93,14 @@ impl Source {
     }
 }
 
+impl core::fmt::Debug for Source {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Source")
+            .field("id", &self.inner.id)
+            .finish()
+    }
+}
+
 struct SourceInner {
     reactor: Reactor,
     id: NodeId,

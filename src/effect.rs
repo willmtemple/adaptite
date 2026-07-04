@@ -136,6 +136,15 @@ impl EffectHandle {
     }
 }
 
+impl core::fmt::Debug for EffectHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EffectHandle")
+            .field("id", &self.inner.id)
+            .field("disposed", &self.inner.disposed.get())
+            .finish()
+    }
+}
+
 struct EffectInner {
     reactor: Reactor,
     id: NodeId,
@@ -200,9 +209,42 @@ impl EffectInner {
         // equality-suppressed memo updates do not rerun the effect.
         let should_run = match state {
             State::Dirty => true,
-            State::Check => self.reactor.dependencies_changed(self.id),
+            State::Check => {
+                // Verification runs upstream memo computations. If one of them unwinds, the
+                // memo stays stale, so its next upstream write will not re-propagate a mark —
+                // without recovery this effect would be silently stranded as Clean forever.
+                // Restore the mark and re-queue on unwind.
+                struct RecoverOnUnwind<'a> {
+                    inner: &'a EffectInner,
+                    armed: bool,
+                }
+
+                impl Drop for RecoverOnUnwind<'_> {
+                    fn drop(&mut self) {
+                        if self.armed && !self.inner.disposed.get() {
+                            self.inner.state.set(State::Dirty);
+                            self.inner.schedule();
+                        }
+                    }
+                }
+
+                let mut guard = RecoverOnUnwind {
+                    inner: self,
+                    armed: true,
+                };
+                let changed = self.reactor.dependencies_changed(self.id);
+                guard.armed = false;
+                changed
+            }
             State::Clean => false,
         };
+
+        // Verification runs user computations, which may have disposed this effect; do not
+        // reset the owner or run the body after disposal.
+        if self.disposed.get() {
+            return;
+        }
+
         if !should_run {
             #[cfg(debug_assertions)]
             tracing::trace!(
@@ -396,6 +438,116 @@ mod tests {
 
         run();
         assert_eq!(&*seen.borrow(), &[0, 1]);
+    }
+
+    #[test]
+    fn effect_recovers_after_a_panicking_dependency_verification() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use crate::memo_in;
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            move || {
+                let reactor = Reactor::new();
+                let source = signal_in(&reactor, 1i32);
+                let doubled = memo_in(&reactor, {
+                    let source = source.clone();
+                    move || {
+                        let value = source.get();
+                        assert!(value != 13, "unlucky number");
+                        value * 2
+                    }
+                });
+                let effect = reactor.effect({
+                    let doubled = doubled.clone();
+                    let seen = Rc::clone(&seen);
+                    move || seen.borrow_mut().push(doubled.get())
+                });
+
+                reactor.flush_now();
+                assert_eq!(&*seen.borrow(), &[2]);
+
+                // The memo panics while the effect *verifies* its dependencies. Without
+                // recovery, the effect would be left clean and never re-scheduled, because the
+                // still-dirty memo no longer propagates marks.
+                source.set(13);
+                let result = catch_unwind(AssertUnwindSafe(|| reactor.flush_now()));
+                assert!(result.is_err(), "verification should propagate the panic");
+
+                source.set(7);
+                reactor.flush_now();
+                assert_eq!(&*seen.borrow(), &[2, 14], "the effect must recover");
+
+                effect.leak();
+            }
+        });
+
+        run();
+    }
+
+    #[test]
+    fn comparator_reads_do_not_become_effect_dependencies() {
+        use crate::memo_by_in;
+
+        let runs = Rc::new(Counter::new(0usize));
+
+        queue_macrotask({
+            let runs = Rc::clone(&runs);
+            move || {
+                let reactor = Reactor::new();
+                let tuning = signal_in(&reactor, 0i32);
+                let source = signal_in(&reactor, 1i32);
+
+                // A comparator that (questionably) reads reactive state. When the memo
+                // refreshes inside the effect's run, those reads must not become the effect's
+                // dependencies.
+                let value = memo_by_in(
+                    &reactor,
+                    {
+                        let tuning = tuning.clone();
+                        move |old: &i32, new: &i32| {
+                            let _ = tuning.get();
+                            old == new
+                        }
+                    },
+                    {
+                        let source = source.clone();
+                        move || source.get()
+                    },
+                );
+
+                let effect = reactor.effect({
+                    let value = value.clone();
+                    let source = source.clone();
+                    let runs = Rc::clone(&runs);
+                    move || {
+                        runs.set(runs.get() + 1);
+                        let _ = source.get();
+                        let _ = value.get();
+                    }
+                });
+
+                reactor.flush_now();
+                assert_eq!(runs.get(), 1);
+
+                // Forces the memo to refresh (running the comparator) inside the effect body.
+                source.set(2);
+                reactor.flush_now();
+                assert_eq!(runs.get(), 2);
+
+                // If the comparator's read had been tracked, this write would rerun the effect.
+                tuning.set(99);
+                reactor.flush_now();
+                assert_eq!(runs.get(), 2, "comparator reads must not be tracked");
+
+                effect.leak();
+            }
+        });
+
+        run();
     }
 
     #[test]

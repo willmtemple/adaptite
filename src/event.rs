@@ -5,6 +5,7 @@ use core::cell::{Cell, RefCell};
 
 use hashbrown::HashMap;
 
+use crate::scope::{OwnedDisposable, adopt_into_current};
 use crate::{NodeId, Reactor, current, trace_targets};
 
 type SubscriberFn<T> = dyn Fn(&T) + 'static;
@@ -112,10 +113,13 @@ pub struct Event<T> {
 
 /// Disposable subscription handle.
 ///
-/// A subscription is cancelled when its last clone is dropped. Call [`leak`](Subscription::leak)
-/// to keep the subscriber active for the remainder of the program without retaining the handle.
+/// A subscription created outside any owner is cancelled when the last clone of its handle is
+/// dropped; call [`leak`](Subscription::leak) to keep the subscriber active for the remainder
+/// of the program without retaining the handle. A subscription created inside an owner (an
+/// effect's run, or a [`crate::scope`]) is kept alive by that owner instead and is cancelled
+/// with it — the same ownership rule as [`crate::EffectHandle`].
 #[derive(Clone)]
-#[must_use = "subscriptions are cancelled when dropped, so you must keep the handle or explicitly leak it"]
+#[must_use = "an unowned subscription is cancelled when its handle is dropped; hold the handle, leak it, or subscribe inside a scope"]
 pub struct Subscription {
     inner: Rc<SubscriptionInner>,
 }
@@ -217,9 +221,13 @@ impl<T: 'static> Event<T> {
             subscriber_count = subscribers.len(),
             "emitting event value"
         );
-        for subscriber in subscribers {
-            subscriber(&value);
-        }
+        // Immediate subscribers are not reactive observers: suspend tracking so that a
+        // subscriber's reads never become dependencies of whatever observer is emitting.
+        crate::untrack(|| {
+            for subscriber in subscribers {
+                subscriber(&value);
+            }
+        });
         self.inner.reactor.trigger(self.inner.id);
     }
 
@@ -264,12 +272,18 @@ impl<T> Drop for EventInner<T> {
 impl Subscription {
     #[track_caller]
     fn new(cancel: impl Fn() + 'static) -> Self {
-        Self {
-            inner: Rc::new(SubscriptionInner {
-                active: Cell::new(true),
-                cancel: Box::new(cancel),
-            }),
-        }
+        let inner = Rc::new(SubscriptionInner {
+            active: Cell::new(true),
+            cancel: Box::new(cancel),
+        });
+        // If an owner (an enclosing effect run or scope) is active, it keeps this subscription
+        // alive and cancels it. Crucially, for `on` this ties the queue-feeding direct
+        // subscriber and the draining effect together: the owner tears both down through the
+        // subscription's cancel closure, rather than disposing the effect and leaving the
+        // queue to grow unread.
+        let owned: Rc<dyn OwnedDisposable> = inner.clone();
+        let _ = adopt_into_current(owned);
+        Self { inner }
     }
 
     /// Cancels the subscription immediately.
@@ -290,6 +304,22 @@ impl Subscription {
     }
 }
 
+impl<T> core::fmt::Debug for Event<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Event")
+            .field("id", &self.inner.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("active", &self.inner.active.get())
+            .finish()
+    }
+}
+
 struct EventInner<T> {
     reactor: Reactor,
     id: NodeId,
@@ -300,6 +330,12 @@ struct EventInner<T> {
 struct SubscriptionInner {
     active: Cell<bool>,
     cancel: Box<dyn Fn() + 'static>,
+}
+
+impl OwnedDisposable for SubscriptionInner {
+    fn dispose_owned(&self) {
+        self.unsubscribe();
+    }
 }
 
 impl SubscriptionInner {
@@ -372,6 +408,53 @@ mod tests {
 
         run();
         assert_eq!(&*reactive.borrow(), &[1, 2]);
+    }
+
+    #[test]
+    fn subscriptions_created_inside_a_scope_are_cancelled_with_it() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            move || {
+                let reactor = Reactor::new();
+                let event = event_in::<usize>(&reactor);
+
+                // The scope owns the draining subscription: BOTH halves of `on` (the
+                // queue-feeding direct subscriber and the draining effect) must be torn down
+                // together when the scope is disposed.
+                let (scope_handle, subscription) = crate::scope({
+                    let reactor = reactor.clone();
+                    let event = event.clone();
+                    let seen = Rc::clone(&seen);
+                    move || {
+                        on_in(&reactor, &event, move |value| {
+                            seen.borrow_mut().push(*value);
+                        })
+                    }
+                });
+
+                event.emit(1);
+                reactor.flush_now();
+                assert!(subscription.is_active());
+
+                scope_handle.dispose();
+                assert!(
+                    !subscription.is_active(),
+                    "the owner must cancel the subscription"
+                );
+
+                event.emit(2);
+                reactor.flush_now();
+            }
+        });
+
+        run();
+        assert_eq!(
+            &*seen.borrow(),
+            &[1],
+            "events after scope disposal must not be delivered"
+        );
     }
 
     #[test]

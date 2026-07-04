@@ -30,7 +30,9 @@ thread_local! {
 /// Returns the current thread's default reactor.
 ///
 /// The first call on a thread creates a new reactor for that thread and caches it in thread-local
-/// storage.
+/// storage. The cache is weak: the default reactor lives only as long as some node or `Reactor`
+/// handle keeps it alive. If everything referencing it is dropped, the next call creates a
+/// fresh, unrelated reactor.
 pub fn current() -> Reactor {
     Reactor::current()
 }
@@ -107,6 +109,21 @@ impl From<Mark> for State {
         match mark {
             Mark::Check => State::Check,
             Mark::Dirty => State::Dirty,
+        }
+    }
+}
+
+/// Unwind guard used by computed nodes: restores the dirty mark when a compute closure panics,
+/// so the node is retried on its next read instead of being treated as clean.
+pub(crate) struct DirtyOnUnwind<'a> {
+    pub(crate) state: &'a Cell<State>,
+    pub(crate) armed: bool,
+}
+
+impl Drop for DirtyOnUnwind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.set(State::Dirty);
         }
     }
 }
@@ -420,7 +437,13 @@ impl Reactor {
     }
 
     /// Brings `node` up to date if it is a computed node that is currently registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`ReactCycleError`] message when `node` is currently mid-computation: a
+    /// dependency cycle discovered through verification rather than a direct read.
     pub(crate) fn refresh_node(&self, node: NodeId) {
+        self.assert_no_cycle(node);
         let hook = self
             .inner
             .observers

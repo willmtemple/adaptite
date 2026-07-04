@@ -50,7 +50,9 @@ fn main() {
         move || {
             let expected = match greeting_compute.get() {
                 0 => 3,
-                _ => 18,
+                // Lazy verification refreshes this thunk while `summary` is checking its
+                // dependencies, so it recomputes *before* summary does.
+                _ => 17,
             };
             greeting_compute.set(greeting_compute.get() + 1);
             log_event!(expected, "[compute] greeting thunk recomputes");
@@ -66,7 +68,7 @@ fn main() {
             let expected = match summary_compute.get() {
                 0 => 2,
                 1 => 9,
-                2 => 17,
+                2 => 18,
                 _ => 22,
             };
             summary_compute.set(summary_compute.get() + 1);

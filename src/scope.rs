@@ -50,15 +50,39 @@ impl OwnerFrame {
 
     /// Runs registered cleanups and disposes owned children, most recent first. Called before an
     /// effect re-runs and as part of disposal.
+    ///
+    /// Cleanups and disposals run untracked (their reads must not become dependencies of
+    /// whatever observer triggered the reset), and a panicking cleanup does not strand its
+    /// siblings: the remaining teardown still runs during unwinding.
     pub(crate) fn reset(&self) {
-        let cleanups = core::mem::take(&mut *self.cleanups.borrow_mut());
-        for cleanup in cleanups.into_iter().rev() {
-            cleanup();
+        struct RunRemaining(Vec<Box<dyn FnOnce()>>);
+
+        impl Drop for RunRemaining {
+            fn drop(&mut self) {
+                while let Some(cleanup) = self.0.pop() {
+                    cleanup();
+                }
+            }
         }
-        let children = core::mem::take(&mut *self.children.borrow_mut());
-        for child in children.into_iter().rev() {
-            child.dispose_owned();
+
+        struct DisposeRemaining(Vec<Rc<dyn OwnedDisposable>>);
+
+        impl Drop for DisposeRemaining {
+            fn drop(&mut self) {
+                while let Some(child) = self.0.pop() {
+                    child.dispose_owned();
+                }
+            }
         }
+
+        crate::untrack(|| {
+            drop(RunRemaining(core::mem::take(
+                &mut *self.cleanups.borrow_mut(),
+            )));
+            drop(DisposeRemaining(core::mem::take(
+                &mut *self.children.borrow_mut(),
+            )));
+        });
     }
 
     /// Terminally disposes the owner: resets it and rejects future children.
@@ -76,6 +100,14 @@ impl OwnerFrame {
 
     pub(crate) fn is_disposed(&self) -> bool {
         self.disposed.get()
+    }
+}
+
+impl Drop for OwnerFrame {
+    fn drop(&mut self) {
+        // Covers the case where the closure passed to `scope` panics before a handle exists:
+        // registered cleanups still run when the frame unwinds.
+        self.dispose();
     }
 }
 
@@ -232,6 +264,14 @@ impl ScopeHandle {
     /// program. You CANNOT recover a `ScopeHandle` after calling this method.
     pub fn leak(self) {
         core::mem::forget(self);
+    }
+}
+
+impl core::fmt::Debug for ScopeHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ScopeHandle")
+            .field("disposed", &self.inner.frame.is_disposed())
+            .finish()
     }
 }
 
@@ -410,6 +450,29 @@ mod tests {
                 "inner 1: 1",
                 "inner 1: 2",
             ]
+        );
+    }
+
+    #[test]
+    fn a_panicking_scope_closure_still_runs_registered_cleanups() {
+        use std::cell::Cell;
+
+        let ran = Rc::new(Cell::new(false));
+
+        let result = catch_unwind(AssertUnwindSafe({
+            let ran = Rc::clone(&ran);
+            move || {
+                let _ = scope(move || {
+                    on_cleanup(move || ran.set(true));
+                    panic!("scope body panics");
+                });
+            }
+        }));
+
+        assert!(result.is_err());
+        assert!(
+            ran.get(),
+            "cleanups registered before the panic must still run"
         );
     }
 

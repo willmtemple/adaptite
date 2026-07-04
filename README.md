@@ -70,13 +70,13 @@ passes the last value into the compute closure without creating a cycle.
 
 ### Ownership and cleanup
 
-Effects created during another effect's run (or inside `scope(...)`) are owned
-by it: they stay alive without their handles being held and are disposed when
-the owner re-runs or is disposed. `on_cleanup` registers teardown against the
-innermost owner; it runs before the owning effect's next run and on disposal.
-Top-level effects are owned by their `EffectHandle` — dropping the last handle
-disposes the effect, and `leak()` opts out. `Subscription` handles returned by
-`Event::subscribe` behave the same way.
+Effects and event subscriptions created during another effect's run (or inside
+`scope(...)`) are owned by it: they stay alive without their handles being held
+and are disposed when the owner re-runs or is disposed. `on_cleanup` registers
+teardown against the innermost owner; it runs before the owning effect's next
+run and on disposal. Top-level effects are owned by their `EffectHandle` —
+dropping the last handle disposes the effect, and `leak()` opts out.
+`Subscription` handles follow the same rules.
 
 ### Untracked reads
 
@@ -111,7 +111,7 @@ fn main() {
     })
     .leak();
 
-    // Queue a future to wait 5 seconds and then update `v`. This will trigger
+    // Schedule a callback to run after 5 seconds and update `v`. This will trigger
     // the effect to run again and print the new value.
     set_timeout(Duration::from_secs(5), {
         let v = v.clone();

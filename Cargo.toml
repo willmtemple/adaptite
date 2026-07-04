@@ -3,10 +3,9 @@ name = "adaptite"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Fine-grained reactivity (signals, memos, effects, events) for the runite runtime"
+description = "Fine-grained reactivity (signals, thunks, memos, effects, events) for the runite runtime"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/willmtemple/adaptite"
-homepage = "https://github.com/willmtemple/adaptite"
 documentation = "https://docs.rs/adaptite"
 readme = "README.md"
 keywords = ["reactive", "signals", "incremental", "frp", "runite"]
@@ -19,8 +18,8 @@ exclude = [
   "/.claude",
   "/target",
   "/cop-checks",
+  ".gitignore",
   "mise.toml",
-  "mise.lock",
   "rust-toolchain.toml",
   "ROADMAP.md",
 ]

@@ -94,7 +94,8 @@ impl<T: 'static> Signal<T> {
         f(&value)
     }
 
-    /// Replaces the current value and notifies dependents.
+    /// Replaces the current value and marks dependents stale, even when the new value equals
+    /// the old one (compare [`set`](Signal::set)).
     pub fn replace(&self, value: T) -> T {
         let previous = self.inner.value.replace(value);
         tracing::debug!(
@@ -107,7 +108,13 @@ impl<T: 'static> Signal<T> {
         previous
     }
 
-    /// Mutates the current value in place and notifies dependents.
+    /// Mutates the current value in place and marks dependents stale, regardless of whether
+    /// `f` actually changed anything (compare [`set`](Signal::set)).
+    ///
+    /// # Panics
+    ///
+    /// `f` runs while the value is mutably borrowed: calling `get`, `with`, `peek`, or `set`
+    /// on the *same* signal from inside `f` panics with a borrow error.
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let output = {
             let mut value = self.inner.value.borrow_mut();
@@ -142,8 +149,14 @@ impl<T: PartialEq + 'static> Signal<T> {
     /// Returns the previous value if the signal changed, or `None` when the new value was equal to
     /// the old one.
     pub fn set(&self, value: T) -> Option<T> {
-        let mut current = self.inner.value.borrow_mut();
-        if *current == value {
+        // Compare under a shared borrow, without tracking: a `PartialEq` impl that reads
+        // reactive state must neither conflict with this signal's own borrow nor record
+        // dependencies for whatever observer is performing the write.
+        let unchanged = {
+            let current = self.inner.value.borrow();
+            crate::untrack(|| *current == value)
+        };
+        if unchanged {
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::SIGNAL,
@@ -155,8 +168,7 @@ impl<T: PartialEq + 'static> Signal<T> {
             return None;
         }
 
-        let previous = core::mem::replace(&mut *current, value);
-        drop(current);
+        let previous = self.inner.value.replace(value);
         tracing::debug!(
             target: trace_targets::SIGNAL,
             event = "set_signal",
@@ -166,6 +178,14 @@ impl<T: PartialEq + 'static> Signal<T> {
         );
         self.inner.reactor.trigger(self.inner.id);
         Some(previous)
+    }
+}
+
+impl<T> core::fmt::Debug for Signal<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Signal")
+            .field("id", &self.inner.id)
+            .finish_non_exhaustive()
     }
 }
 

@@ -20,7 +20,7 @@ fn main() {
     })
     .leak();
 
-    // Queue a future to wait 5 seconds and then update `v`. This will trigger
+    // Schedule a callback to run after 5 seconds and update `v`. This will trigger
     // the effect to run again and print the new value.
     set_timeout(Duration::from_secs(5), {
         let v = v.clone();
