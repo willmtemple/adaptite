@@ -4,6 +4,23 @@ use core::cell::RefCell;
 use crate::{NodeId, Reactor, current, trace_targets};
 
 /// Creates a [`Signal`] in the current thread's default reactor.
+///
+/// # Examples
+///
+/// ```rust
+/// use adaptite::signal;
+///
+/// let value = signal(10);
+/// assert_eq!(value.get(), 10);
+///
+/// // Equal writes are suppressed and do not notify dependents.
+/// assert_eq!(value.set(10), None);
+/// assert_eq!(value.set(11), Some(10));
+///
+/// // Mutate in place, and read without recording a dependency.
+/// value.update(|v| *v += 1);
+/// assert_eq!(value.peek(), 12);
+/// ```
 #[track_caller]
 pub fn signal<T: 'static>(initial: T) -> Signal<T> {
     current().signal(initial)
@@ -16,6 +33,15 @@ pub fn signal_in<T: 'static>(reactor: &Reactor, initial: T) -> Signal<T> {
 }
 
 /// Mutable source node in the reactive graph.
+///
+/// Reading a signal from inside an observer (an effect, thunk, or memo computation) records a
+/// dependency; writing to it invalidates those observers. Clones share the same underlying
+/// node, so a signal can be captured by any number of closures. The node lives as long as any
+/// clone does.
+///
+/// Writes through [`set`](Signal::set) are suppressed when the new value equals the old one,
+/// which is what allows convergent feedback (e.g. an effect clamping a value it reads) to
+/// settle. [`replace`](Signal::replace) and [`update`](Signal::update) always notify.
 #[derive(Clone)]
 pub struct Signal<T> {
     inner: Rc<SignalInner<T>>,

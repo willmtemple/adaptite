@@ -10,6 +10,22 @@ type ComputePrevFn<T> = dyn Fn(Option<&T>) -> T + 'static;
 type EqualsFn<T> = dyn Fn(&T, &T) -> bool + 'static;
 
 /// Creates a [`Thunk`] in the current thread's default reactor.
+///
+/// # Examples
+///
+/// ```rust
+/// use adaptite::{signal, thunk};
+///
+/// let base = signal(2);
+/// let doubled = thunk({
+///     let base = base.clone();
+///     move || base.get() * 2
+/// });
+///
+/// assert_eq!(doubled.get(), 4);
+/// base.set(5); // marks `doubled` stale; nothing recomputes until it is read
+/// assert_eq!(doubled.get(), 10);
+/// ```
 #[track_caller]
 pub fn thunk<T: 'static>(compute: impl Fn() -> T + 'static) -> Thunk<T> {
     current().thunk(compute)
@@ -22,6 +38,46 @@ pub fn thunk_in<T: 'static>(reactor: &Reactor, compute: impl Fn() -> T + 'static
 }
 
 /// Creates an equality-aware memo in the current thread's default reactor.
+///
+/// A memo recomputes like a [`Thunk`], but when the new value equals the old one (under
+/// `PartialEq`), downstream observers are not invalidated.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::Cell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{memo, signal, thunk};
+///
+/// let n = signal(1i32);
+/// let parity = memo({
+///     let n = n.clone();
+///     move || n.get() % 2
+/// });
+///
+/// let label_computes = Rc::new(Cell::new(0));
+/// let label = thunk({
+///     let parity = parity.clone();
+///     let label_computes = Rc::clone(&label_computes);
+///     move || {
+///         label_computes.set(label_computes.get() + 1);
+///         format!("parity: {}", parity.get())
+///     }
+/// });
+///
+/// assert_eq!(label.get(), "parity: 1");
+///
+/// // 1 -> 3 keeps the parity at 1: the memo recomputes, sees an equal result,
+/// // and the downstream thunk's cache stays valid.
+/// n.set(3);
+/// assert_eq!(label.get(), "parity: 1");
+/// assert_eq!(label_computes.get(), 1);
+///
+/// n.set(4);
+/// assert_eq!(label.get(), "parity: 0");
+/// assert_eq!(label_computes.get(), 2);
+/// ```
 #[track_caller]
 pub fn memo<T: PartialEq + 'static>(compute: impl Fn() -> T + 'static) -> Memo<T> {
     current().memo(compute)
@@ -37,6 +93,30 @@ pub fn memo_in<T: PartialEq + 'static>(
 }
 
 /// Creates a comparator-aware memo in the current thread's default reactor.
+///
+/// Like [`memo`], but "unchanged" is decided by the `equals` closure instead of `PartialEq` —
+/// useful for coarser notions of change than value equality.
+///
+/// # Examples
+///
+/// ```rust
+/// use adaptite::{memo_by, signal};
+///
+/// let price = signal(104u32);
+/// // Downstream observers only care which $10 bucket the price is in.
+/// let bucket = memo_by(
+///     |old: &u32, new: &u32| old / 10 == new / 10,
+///     {
+///         let price = price.clone();
+///         move || price.get()
+///     },
+/// );
+///
+/// assert_eq!(bucket.get(), 104);
+/// price.set(109); // same bucket: dependents of `bucket` are not invalidated
+/// price.set(112); // new bucket: they are
+/// assert_eq!(bucket.get(), 112);
+/// ```
 #[track_caller]
 pub fn memo_by<T: 'static>(
     equals: impl Fn(&T, &T) -> bool + 'static,
@@ -60,7 +140,30 @@ pub fn memo_by_in<T: 'static>(
 ///
 /// The previous value is `None` on the first computation. This is the supported way to express
 /// reduction-style computations ("fold the new inputs into the last result") without creating a
-/// dependency cycle.
+/// dependency cycle — a memo that read *itself* would panic with a cycle error.
+///
+/// # Examples
+///
+/// ```rust
+/// use adaptite::{memo_with_prev, signal};
+///
+/// let sample = signal(5i64);
+///
+/// // A running maximum over every value the memo observes.
+/// let max_seen = memo_with_prev({
+///     let sample = sample.clone();
+///     move |previous: Option<&i64>| {
+///         let current = sample.get();
+///         previous.map_or(current, |&best| best.max(current))
+///     }
+/// });
+///
+/// assert_eq!(max_seen.get(), 5);
+/// sample.set(9);
+/// assert_eq!(max_seen.get(), 9);
+/// sample.set(3);
+/// assert_eq!(max_seen.get(), 9);
+/// ```
 #[track_caller]
 pub fn memo_with_prev<T: PartialEq + 'static>(
     compute: impl Fn(Option<&T>) -> T + 'static,
@@ -79,12 +182,36 @@ pub fn memo_with_prev_in<T: PartialEq + 'static>(
 }
 
 /// Lazy computed node in the reactive graph.
+///
+/// A thunk caches the result of its compute closure and recomputes on read after any of its
+/// dependencies change. It is both an observer (its computation records dependencies) and an
+/// observable (reading it from another observer records a dependency on it). Every
+/// recomputation counts as a change; use [`Memo`] to stop propagation of equal results.
+///
+/// Clones share the same underlying node.
+///
+/// # Panics
+///
+/// Reading a thunk whose computation (transitively) reads itself panics with a
+/// [`crate::ReactCycleError`] describing the cycle path.
 #[derive(Clone)]
 pub struct Thunk<T> {
     inner: Rc<ThunkInner<T>>,
 }
 
 /// Equality/comparator-aware computed node.
+///
+/// Like [`Thunk`], but a recomputation that produces an unchanged value (under `PartialEq` for
+/// [`memo`], or a custom comparator for [`memo_by`]) does not invalidate downstream observers.
+/// Effects depending only on unchanged memos skip their re-runs entirely.
+///
+/// Clones share the same underlying node.
+///
+/// # Panics
+///
+/// Reading a memo whose computation (transitively) reads itself panics with a
+/// [`crate::ReactCycleError`]. To fold the memo's own previous value into the next one, use
+/// [`memo_with_prev`].
 #[derive(Clone)]
 pub struct Memo<T> {
     inner: Rc<MemoInner<T>>,

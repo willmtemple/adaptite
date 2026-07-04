@@ -123,6 +123,32 @@ pub(crate) fn adopt_into_current(child: Rc<dyn OwnedDisposable>) -> bool {
 /// # Panics
 ///
 /// Panics when called outside a reactive owner, since the cleanup could never run.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{on_cleanup, scope};
+///
+/// let log = Rc::new(RefCell::new(Vec::new()));
+///
+/// let (handle, ()) = scope({
+///     let log = Rc::clone(&log);
+///     move || {
+///         log.borrow_mut().push("setup");
+///         on_cleanup({
+///             let log = Rc::clone(&log);
+///             move || log.borrow_mut().push("teardown")
+///         });
+///     }
+/// });
+///
+/// assert_eq!(*log.borrow(), ["setup"]);
+/// handle.dispose();
+/// assert_eq!(*log.borrow(), ["setup", "teardown"]);
+/// ```
 pub fn on_cleanup(cleanup: impl FnOnce() + 'static) {
     let Some(owner) = current_owner() else {
         panic!(
@@ -142,6 +168,32 @@ pub fn on_cleanup(cleanup: impl FnOnce() + 'static) {
 ///
 /// The scope is disposed when the last clone of the handle is dropped; call
 /// [`leak`](ScopeHandle::leak) to keep it alive for the remainder of the program.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{on_cleanup, scope};
+///
+/// let torn_down = Rc::new(RefCell::new(false));
+///
+/// let (handle, greeting) = scope({
+///     let torn_down = Rc::clone(&torn_down);
+///     move || {
+///         // Effects created here would be owned by the scope and disposed with it.
+///         on_cleanup(move || *torn_down.borrow_mut() = true);
+///         "hello"
+///     }
+/// });
+///
+/// assert_eq!(greeting, "hello");
+/// assert!(!handle.is_disposed());
+///
+/// handle.dispose();
+/// assert!(*torn_down.borrow());
+/// ```
 pub fn scope<T>(f: impl FnOnce() -> T) -> (ScopeHandle, T) {
     let frame = OwnerFrame::new();
     tracing::debug!(

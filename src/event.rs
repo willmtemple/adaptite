@@ -22,6 +22,41 @@ pub fn event_in<T: 'static>(reactor: &Reactor) -> Event<T> {
 }
 
 /// Creates a reactive draining subscription for `event` in the current reactor.
+///
+/// Unlike [`Event::subscribe`], the handler does not run inline with `emit`: values queue up
+/// and are drained by an effect on the microtask queue, in emission order.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{event, on};
+/// use runite::{queue_macrotask, run};
+///
+/// let seen = Rc::new(RefCell::new(Vec::new()));
+///
+/// queue_macrotask({
+///     let seen = Rc::clone(&seen);
+///     move || {
+///         let messages = event::<u32>();
+///         on(&messages, {
+///             let seen = Rc::clone(&seen);
+///             move |message| seen.borrow_mut().push(*message)
+///         })
+///         .leak();
+///
+///         messages.emit(1);
+///         messages.emit(2);
+///         // Delivery is deferred to the microtask flush.
+///         assert!(seen.borrow().is_empty());
+///     }
+/// });
+/// run();
+///
+/// assert_eq!(*seen.borrow(), [1, 2]);
+/// ```
 #[must_use = "subscriptions created with `on` must be used to stay active"]
 #[track_caller]
 pub fn on<T: Clone + 'static>(event: &Event<T>, handler: impl Fn(&T) + 'static) -> Subscription {
@@ -40,6 +75,36 @@ pub fn on_in<T: Clone + 'static>(
 }
 
 /// Push-style event source.
+///
+/// Events carry values that happen *at a moment* rather than state that *is*. Immediate
+/// subscribers added with [`subscribe`](Event::subscribe) are called synchronously during
+/// [`emit`](Event::emit); reactive draining subscriptions created with [`on`] queue values and
+/// deliver them through an effect on the microtask queue.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::event;
+///
+/// let clicks = event::<u32>();
+/// let seen = Rc::new(RefCell::new(Vec::new()));
+///
+/// let subscription = clicks.subscribe({
+///     let seen = Rc::clone(&seen);
+///     move |button| seen.borrow_mut().push(*button)
+/// });
+///
+/// clicks.emit(1);
+/// clicks.emit(2);
+/// assert_eq!(*seen.borrow(), [1, 2]);
+///
+/// drop(subscription); // unsubscribes
+/// clicks.emit(3);
+/// assert_eq!(*seen.borrow(), [1, 2]);
+/// ```
 #[derive(Clone)]
 pub struct Event<T> {
     inner: Rc<EventInner<T>>,

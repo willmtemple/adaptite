@@ -18,6 +18,37 @@ pub fn source_in(reactor: &Reactor) -> Source {
 ///
 /// `Source` is useful for advanced data structures that want precise control over when reads
 /// observe and writes trigger invalidation without storing their state in a [`crate::Signal`].
+///
+/// # Examples
+///
+/// Wrapping state that lives outside the graph:
+///
+/// ```rust
+/// use std::cell::Cell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{source, thunk};
+///
+/// let external = Rc::new(Cell::new(1));
+/// let node = source();
+///
+/// let view = thunk({
+///     let node = node.clone();
+///     let external = Rc::clone(&external);
+///     move || {
+///         node.observe(); // reads of `external` depend on `node`
+///         external.get() * 10
+///     }
+/// });
+///
+/// assert_eq!(view.get(), 10);
+///
+/// external.set(2);
+/// assert_eq!(view.get(), 10); // the graph has not been told about the write
+///
+/// node.trigger();
+/// assert_eq!(view.get(), 20); // now the thunk recomputes
+/// ```
 #[derive(Clone)]
 pub struct Source {
     inner: Rc<SourceInner>,

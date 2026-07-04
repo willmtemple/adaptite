@@ -14,7 +14,40 @@ const MAX_RUNS_PER_FLUSH: u32 = 100;
 /// Creates an effect in the current thread's default reactor.
 ///
 /// The effect is scheduled immediately and then re-scheduled whenever one of its dependencies
-/// changes.
+/// changes. Effects never run inline with the write that triggered them: they are flushed on
+/// the runtime's microtask queue, so consecutive writes within one task coalesce into a single
+/// run.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{effect, signal};
+/// use runite::{queue_macrotask, run};
+///
+/// let seen = Rc::new(RefCell::new(Vec::new()));
+///
+/// queue_macrotask({
+///     let seen = Rc::clone(&seen);
+///     move || {
+///         let value = signal(1);
+///         effect({
+///             let seen = Rc::clone(&seen);
+///             let value = value.clone();
+///             move || seen.borrow_mut().push(value.get())
+///         })
+///         .leak();
+///
+///         // Coalesces with the initial run: the effect observes only the final value.
+///         value.set(2);
+///     }
+/// });
+/// run();
+///
+/// assert_eq!(*seen.borrow(), [2]);
+/// ```
 #[track_caller]
 pub fn effect(f: impl Fn() + 'static) -> EffectHandle {
     current().effect(f)

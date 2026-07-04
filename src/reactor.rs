@@ -40,6 +40,31 @@ pub fn current() -> Reactor {
 /// Reads made while `f` executes do not record dependencies for the currently running observer,
 /// so the observer will not re-run when those values change. Cycle detection remains active.
 /// Tracking resumes when `f` returns; nested `untrack` calls are permitted.
+///
+/// # Examples
+///
+/// ```rust
+/// use adaptite::{signal, thunk, untrack};
+///
+/// let count = signal(0);
+/// let label = signal("count");
+///
+/// let display = thunk({
+///     let count = count.clone();
+///     let label = label.clone();
+///     move || format!("{}: {}", untrack(|| label.get()), count.get())
+/// });
+///
+/// assert_eq!(display.get(), "count: 0");
+///
+/// // `label` is not a dependency: changing it does not invalidate the thunk.
+/// label.set("hits");
+/// assert_eq!(display.get(), "count: 0");
+///
+/// // The next genuine recomputation observes the new label.
+/// count.set(3);
+/// assert_eq!(display.get(), "hits: 3");
+/// ```
 pub fn untrack<T>(f: impl FnOnce() -> T) -> T {
     UNTRACKED_DEPTH.with(|depth| depth.set(depth.get() + 1));
 
@@ -144,6 +169,32 @@ impl Error for ReactCycleError {}
 ///
 /// A reactor tracks dependency edges between reactive nodes, manages the currently executing
 /// observer stack, and schedules deferred jobs onto the runtime microtask queue.
+///
+/// Most programs never touch a reactor directly: the free constructors ([`crate::signal`],
+/// [`crate::thunk`], [`crate::memo`], [`crate::effect`], [`crate::event`]) use the thread's
+/// default reactor from [`current`]. Construct explicit reactors (and use the `*_in`
+/// constructor variants) to keep several independent graphs on one thread. Nodes from
+/// different reactors must not observe each other; debug builds panic on such reads.
+///
+/// Nodes hold their reactor alive, so dropping a `Reactor` handle does not tear down the graph.
+///
+/// # Examples
+///
+/// ```rust
+/// use adaptite::{Reactor, memo_in, signal_in};
+///
+/// let reactor = Reactor::new();
+///
+/// let celsius = signal_in(&reactor, 20.0f64);
+/// let fahrenheit = memo_in(&reactor, {
+///     let celsius = celsius.clone();
+///     move || celsius.get() * 9.0 / 5.0 + 32.0
+/// });
+///
+/// assert_eq!(fahrenheit.get(), 68.0);
+/// celsius.set(25.0);
+/// assert_eq!(fahrenheit.get(), 77.0);
+/// ```
 #[derive(Clone)]
 pub struct Reactor {
     inner: Rc<ReactorInner>,
