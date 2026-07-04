@@ -13,12 +13,14 @@ pub(crate) mod trace_targets {
     pub const MEMO: &str = "adaptite::memo";
     pub const EFFECT: &str = "adaptite::effect";
     pub const EVENT: &str = "adaptite::event";
+    pub const SCOPE: &str = "adaptite::scope";
 }
 
 mod effect;
 mod event;
 mod id;
 mod reactor;
+mod scope;
 mod signal;
 mod source;
 mod thunk;
@@ -27,6 +29,7 @@ pub use effect::{EffectHandle, effect, effect_in};
 pub use event::{Event, Subscription, event, event_in, on, on_in};
 pub use id::NodeId;
 pub use reactor::{ReactCycleError, Reactor, current, untrack};
+pub use scope::{ScopeHandle, on_cleanup, scope};
 pub use signal::{Signal, signal, signal_in};
 pub use source::{Source, source, source_in};
 pub use thunk::{

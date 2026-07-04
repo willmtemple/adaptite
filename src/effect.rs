@@ -3,6 +3,7 @@ use alloc::rc::{Rc, Weak};
 use core::cell::{Cell, RefCell};
 
 use crate::reactor::{Mark, ObserverHook, State};
+use crate::scope::{OwnedDisposable, OwnerFrame, adopt_into_current, with_owner};
 use crate::{NodeId, Reactor, current, trace_targets};
 
 /// Maximum number of times a single effect may run within one job flush before the reactor
@@ -26,8 +27,12 @@ pub fn effect_in(reactor: &Reactor, f: impl Fn() + 'static) -> EffectHandle {
 }
 
 /// Disposable handle for a reactive effect.
+///
+/// An effect created outside any owner is disposed when the last clone of its handle is
+/// dropped. An effect created inside an owner (another effect's run, or a [`crate::scope`]) is
+/// kept alive by that owner instead and is disposed with it, so its handle may be discarded.
 #[derive(Clone)]
-#[must_use = "effects are automatically disposed when dropped, so you must use the handle or explicitly leak it"]
+#[must_use = "an unowned effect is disposed when its handle is dropped; hold the handle, leak it, or create the effect inside a scope"]
 pub struct EffectHandle {
     inner: Rc<EffectInner>,
 }
@@ -55,6 +60,7 @@ impl EffectHandle {
             scheduled: Cell::new(false),
             disposed: Cell::new(false),
             self_ref: RefCell::new(Weak::new()),
+            owner: OwnerFrame::new(),
             #[cfg(debug_assertions)]
             last_flush_epoch: Cell::new(u64::MAX),
             #[cfg(debug_assertions)]
@@ -70,6 +76,10 @@ impl EffectHandle {
 
         let observer: Rc<dyn ObserverHook> = inner.clone();
         reactor.register_observer(id, observer);
+        // If an owner (an enclosing effect run or scope) is active, it keeps this effect alive
+        // and disposes it; otherwise the handle alone manages the effect's lifetime.
+        let owned: Rc<dyn OwnedDisposable> = inner.clone();
+        let _ = adopt_into_current(owned);
         inner.schedule();
         Self { inner }
     }
@@ -101,6 +111,8 @@ struct EffectInner {
     scheduled: Cell<bool>,
     disposed: Cell<bool>,
     self_ref: RefCell<Weak<EffectInner>>,
+    /// Ownership frame for cleanups and nested effects created during this effect's runs.
+    owner: Rc<OwnerFrame>,
     #[cfg(debug_assertions)]
     last_flush_epoch: Cell<u64>,
     #[cfg(debug_assertions)]
@@ -178,7 +190,12 @@ impl EffectInner {
             node_id = self.id.0
         )
         .entered();
-        self.reactor.run_in_context(self.id, || (self.effect)());
+        // Run cleanups from the previous run and dispose nested effects it created, then run
+        // with this effect as the innermost owner so new cleanups and children register here.
+        self.owner.reset();
+        with_owner(&self.owner, || {
+            self.reactor.run_in_context(self.id, || (self.effect)())
+        });
     }
 
     /// Panics when this effect keeps re-running within a single flush, which indicates a
@@ -223,8 +240,15 @@ impl EffectInner {
             node_id = self.id.0,
             "disposed reactive effect"
         );
+        self.owner.dispose();
         self.reactor.unregister_observer(self.id);
         self.reactor.dispose(self.id);
+    }
+}
+
+impl OwnedDisposable for EffectInner {
+    fn dispose_owned(&self) {
+        self.dispose();
     }
 }
 
