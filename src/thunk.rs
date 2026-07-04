@@ -321,7 +321,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
 
-    use runite::{queue_task, run};
+    use runite::{queue_macrotask, run};
 
     use super::Thunk;
     use crate::{Cell, EffectHandle, Memo, Reactor, cell_in, memo_by_in, memo_in, thunk_in};
@@ -446,7 +446,7 @@ mod tests {
         let parity_slot = Rc::new(RefCell::new(None::<Memo<usize>>));
         let bucket_slot = Rc::new(RefCell::new(None::<Memo<usize>>));
 
-        queue_task({
+        queue_macrotask({
             let reactive_seen = Rc::clone(&reactive_seen);
             let effect_slot = Rc::clone(&effect_slot);
             let source_slot = Rc::clone(&source_slot);
@@ -489,7 +489,7 @@ mod tests {
         run();
         assert_eq!(&*reactive_seen.borrow(), &[(1, 1)]);
 
-        queue_task({
+        queue_macrotask({
             let source_slot = Rc::clone(&source_slot);
             move || {
                 let source = source_slot

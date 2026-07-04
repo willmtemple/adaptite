@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use adaptite::{cell, effect};
-use runite::{main, set_timeout};
+use runite::{main, time::set_timeout};
 
 #[main]
 fn main() {

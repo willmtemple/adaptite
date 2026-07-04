@@ -167,7 +167,7 @@ mod tests {
     use std::cell::{Cell as Counter, RefCell};
     use std::rc::Rc;
 
-    use runite::{queue_future, queue_task, run, yield_now};
+    use runite::{queue_macrotask, run, spawn, yield_now};
 
     use crate::{Reactor, cell_in};
 
@@ -178,7 +178,7 @@ mod tests {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let handle_slot = Rc::new(RefCell::new(None::<EffectHandle>));
 
-        queue_task({
+        queue_macrotask({
             let seen = Rc::clone(&seen);
             let handle_slot = Rc::clone(&handle_slot);
             move || {
@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(&*seen.borrow(), &[2]);
 
         let reruns = Rc::new(Counter::new(0usize));
-        queue_task({
+        queue_macrotask({
             let reruns = Rc::clone(&reruns);
             let seen = Rc::clone(&seen);
             let handle_slot = Rc::clone(&handle_slot);
@@ -232,7 +232,7 @@ mod tests {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let handle_slot = Rc::new(RefCell::new(None::<EffectHandle>));
 
-        queue_task({
+        queue_macrotask({
             let seen = Rc::clone(&seen);
             let handle_slot = Rc::clone(&handle_slot);
             move || {
@@ -245,7 +245,7 @@ mod tests {
                 });
                 *handle_slot.borrow_mut() = Some(effect);
 
-                std::mem::drop(queue_future({
+                std::mem::drop(spawn({
                     let source = source.clone();
                     async move {
                         yield_now().await;

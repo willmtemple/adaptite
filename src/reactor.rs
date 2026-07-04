@@ -436,7 +436,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
 
-    use runite::{queue_task, run};
+    use runite::{queue_macrotask, run};
 
     use super::{Reactor, current};
 
@@ -504,7 +504,7 @@ mod tests {
     fn scheduled_jobs_flush_on_runtime_microtask_queue() {
         let observed = Rc::new(Cell::new(0usize));
 
-        queue_task({
+        queue_macrotask({
             let observed = Rc::clone(&observed);
             move || {
                 let reactor = Reactor::new();

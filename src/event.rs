@@ -245,7 +245,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use runite::{queue_task, run};
+    use runite::{queue_macrotask, run};
 
     use crate::{Reactor, event_in};
 
@@ -257,7 +257,7 @@ mod tests {
         let reactive = Rc::new(RefCell::new(Vec::new()));
         let keep_alive = Rc::new(RefCell::new(Vec::<Subscription>::new()));
 
-        queue_task({
+        queue_macrotask({
             let immediate = Rc::clone(&immediate);
             let reactive = Rc::clone(&reactive);
             let keep_alive = Rc::clone(&keep_alive);

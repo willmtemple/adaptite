@@ -1,7 +1,10 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use adaptite::event;
-use runite::{main, queue_future, set_interval, time::sleep};
+use runite::{
+    main,
+    time::{set_interval, sleep},
+};
 
 #[main]
 fn main() {
@@ -22,8 +25,8 @@ fn main() {
     });
 
     // After 5 seconds, clear the interval to stop emitting events.
-    queue_future(async move {
+    runite::spawn(async move {
         sleep(Duration::from_secs(5)).await;
-        interval.clear();
+        interval.cancel();
     });
 }

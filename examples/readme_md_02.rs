@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use adaptite::{cell, effect, thunk};
-use runite::{clear_interval, main, set_interval, set_timeout};
+use runite::{
+    main,
+    time::{set_interval, set_timeout},
+};
 
 #[main]
 fn main() {
@@ -44,6 +47,6 @@ fn main() {
     // empty and the program will exit since there are no more pending tasks.
     set_timeout(Duration::from_secs(10), move || {
         println!("clearing interval...");
-        clear_interval(&interval);
+        interval.cancel();
     });
 }
