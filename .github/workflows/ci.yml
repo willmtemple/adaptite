@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Lets mise's github backend fetch the cop release and verify attestations
+  # without hitting unauthenticated GitHub API rate limits.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  lint:
+    name: Lint & docs (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install toolchain via mise
+        uses: jdx/mise-action@v4
+      # mise's rust backend delegates to rustup, whose toolchain lives outside the
+      # cached mise dir. On a mise cache hit the component install is skipped and
+      # rustup auto-installs a minimal toolchain (no rustfmt/clippy), so install the
+      # required components explicitly and idempotently against the pinned toolchain.
+      - name: Ensure rust components
+        run: mise exec -- bash -c 'rustup toolchain install "$RUSTUP_TOOLCHAIN" -c rustfmt -c clippy -c llvm-tools --no-self-update'
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # cop is an experimental external analyzer whose `rust` provider can be
+      # auto-updated to a version the pinned cop binary cannot load. Keep these
+      # steps advisory (non-blocking) so upstream tooling churn never reds CI.
+      - name: Cop checks
+        continue-on-error: true
+        run: cop cop-checks/main.cop -t .
+      - name: Cop verify
+        continue-on-error: true
+        run: cop verify cop-checks/
+
+  test-linux:
+    name: Test (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install toolchain via mise
+        uses: jdx/mise-action@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
+
+  test-macos:
+    name: Test (macOS aarch64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install toolchain via mise
+        uses: jdx/mise-action@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
+
+  test-windows:
+    name: Test (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Install only the pinned Rust: the other mise tools (cop) run in the
+      # Linux lint job, and skipping them keeps Windows provisioning fast.
+      - name: Install toolchain via mise
+        uses: jdx/mise-action@v4
+        with:
+          install_args: rust
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace

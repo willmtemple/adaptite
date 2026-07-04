@@ -2,6 +2,28 @@
 name = "adaptite"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Fine-grained reactivity (signals, memos, effects, events) for the runite runtime"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/willmtemple/adaptite"
+homepage = "https://github.com/willmtemple/adaptite"
+documentation = "https://docs.rs/adaptite"
+readme = "README.md"
+keywords = ["reactive", "signals", "incremental", "frp", "runite"]
+categories = ["asynchronous", "caching", "gui"]
+# Keep the crates.io package to what a *user* of the library needs: source,
+# examples, README/CHANGELOG, licenses. Repo process files (CI, toolchain
+# pins, static-analysis rules) stay out.
+exclude = [
+  "/.github",
+  "/.claude",
+  "/target",
+  "/cop-checks",
+  "mise.toml",
+  "mise.lock",
+  "rust-toolchain.toml",
+  "ROADMAP.md",
+]
 
 [dependencies]
 runite = "0.1.0"
