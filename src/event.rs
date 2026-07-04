@@ -46,7 +46,11 @@ pub struct Event<T> {
 }
 
 /// Disposable subscription handle.
+///
+/// A subscription is cancelled when its last clone is dropped. Call [`leak`](Subscription::leak)
+/// to keep the subscriber active for the remainder of the program without retaining the handle.
 #[derive(Clone)]
+#[must_use = "subscriptions are cancelled when dropped, so you must keep the handle or explicitly leak it"]
 pub struct Subscription {
     inner: Rc<SubscriptionInner>,
 }
@@ -212,6 +216,13 @@ impl Subscription {
     pub fn is_active(&self) -> bool {
         self.inner.active.get()
     }
+
+    /// Consumes the subscription and leaks it, keeping the subscriber active for the remainder
+    /// of the program. You CANNOT recover a `Subscription` after calling this method, so be sure
+    /// to call it on a subscription you will never need to cancel.
+    pub fn leak(self) {
+        core::mem::forget(self);
+    }
 }
 
 struct EventInner<T> {
@@ -241,12 +252,11 @@ impl SubscriptionInner {
     }
 }
 
-// TODO: it's actually kind of hard to use events if subcscriptions have to be manually managed.
-// impl Drop for SubscriptionInner {
-//     fn drop(&mut self) {
-//         self.unsubscribe();
-//     }
-// }
+impl Drop for SubscriptionInner {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -297,5 +307,42 @@ mod tests {
 
         run();
         assert_eq!(&*reactive.borrow(), &[1, 2]);
+    }
+
+    #[test]
+    fn dropping_a_subscription_cancels_it() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let reactor = Reactor::new();
+        let event = event_in::<usize>(&reactor);
+
+        let subscription = event.subscribe({
+            let seen = Rc::clone(&seen);
+            move |value| seen.borrow_mut().push(*value)
+        });
+        event.emit(1);
+        assert!(subscription.is_active());
+
+        drop(subscription);
+        event.emit(2);
+        assert_eq!(&*seen.borrow(), &[1], "dropped subscription must not fire");
+    }
+
+    #[test]
+    fn leaked_subscriptions_stay_active() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let reactor = Reactor::new();
+        let event = event_in::<usize>(&reactor);
+
+        event
+            .subscribe({
+                let seen = Rc::clone(&seen);
+                move |value| seen.borrow_mut().push(*value)
+            })
+            .leak();
+        event.emit(1);
+        event.emit(2);
+        assert_eq!(&*seen.borrow(), &[1, 2]);
     }
 }

@@ -131,9 +131,12 @@ use runite::{
 fn main() {
     let my_event = event::<String>();
 
-    my_event.subscribe(|message| {
-        println!("got event with message: {message}");
-    });
+    // Subscriptions are cancelled when dropped; leak this one so it lives for the whole program.
+    my_event
+        .subscribe(|message| {
+            println!("got event with message: {message}");
+        })
+        .leak();
 
     // Emit an event every 250ms with an incrementing count.
     let interval = set_interval(Duration::from_millis(250), {
