@@ -310,6 +310,33 @@ mod tests {
     }
 
     #[test]
+    fn self_unsubscribe_during_emit_applies_to_the_next_emit() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let subscription_slot = Rc::new(RefCell::new(None::<Subscription>));
+
+        let reactor = Reactor::new();
+        let event = event_in::<usize>(&reactor);
+
+        let subscription = event.subscribe({
+            let seen = Rc::clone(&seen);
+            let subscription_slot = Rc::clone(&subscription_slot);
+            move |value| {
+                seen.borrow_mut().push(*value);
+                if let Some(subscription) = subscription_slot.borrow().as_ref() {
+                    subscription.unsubscribe();
+                }
+            }
+        });
+        *subscription_slot.borrow_mut() = Some(subscription);
+
+        // The emit that triggers the unsubscribe still delivers (subscribers are snapshotted),
+        // but the next emit must not.
+        event.emit(1);
+        event.emit(2);
+        assert_eq!(&*seen.borrow(), &[1]);
+    }
+
+    #[test]
     fn dropping_a_subscription_cancels_it() {
         let seen = Rc::new(RefCell::new(Vec::new()));
 

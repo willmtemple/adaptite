@@ -72,3 +72,57 @@ impl Drop for SourceInner {
         self.reactor.dispose(self.id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use runite::{queue_macrotask, run};
+
+    use crate::{EffectHandle, Reactor, Source, source_in};
+
+    #[test]
+    fn sources_have_distinct_ids() {
+        let reactor = Reactor::new();
+        let one = source_in(&reactor);
+        let two = source_in(&reactor);
+        assert_ne!(one.id(), two.id());
+    }
+
+    #[test]
+    fn observe_and_trigger_drive_an_effect_around_external_state() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let keep_alive = Rc::new(RefCell::new(None::<(Source, EffectHandle)>));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            let keep_alive = Rc::clone(&keep_alive);
+            move || {
+                let reactor = Reactor::new();
+                let source = source_in(&reactor);
+                // State managed outside the reactive graph; the source stands in for it.
+                let external = Rc::new(Cell::new(1usize));
+
+                let effect = reactor.effect({
+                    let source = source.clone();
+                    let external = Rc::clone(&external);
+                    let seen = Rc::clone(&seen);
+                    move || {
+                        source.observe();
+                        seen.borrow_mut().push(external.get());
+                    }
+                });
+                *keep_alive.borrow_mut() = Some((source.clone(), effect));
+
+                runite::queue_macrotask(move || {
+                    external.set(2);
+                    source.trigger();
+                });
+            }
+        });
+
+        run();
+        assert_eq!(&*seen.borrow(), &[1, 2]);
+    }
+}

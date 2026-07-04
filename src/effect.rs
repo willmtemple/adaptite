@@ -366,6 +366,102 @@ mod tests {
     }
 
     #[test]
+    fn disposing_a_queued_effect_prevents_its_run() {
+        let b_runs = Rc::new(Counter::new(0usize));
+        let keep_alive = Rc::new(RefCell::new(None::<EffectHandle>));
+
+        queue_macrotask({
+            let b_runs = Rc::clone(&b_runs);
+            let keep_alive = Rc::clone(&keep_alive);
+            move || {
+                let reactor = Reactor::new();
+                let trigger_a = signal_in(&reactor, 0usize);
+                let trigger_b = signal_in(&reactor, 0usize);
+                let b_slot = Rc::new(RefCell::new(None::<EffectHandle>));
+
+                let b = reactor.effect({
+                    let b_runs = Rc::clone(&b_runs);
+                    let trigger_b = trigger_b.clone();
+                    move || {
+                        let _ = trigger_b.get();
+                        b_runs.set(b_runs.get() + 1);
+                    }
+                });
+                *b_slot.borrow_mut() = Some(b);
+
+                let a = reactor.effect({
+                    let trigger_a = trigger_a.clone();
+                    let b_slot = Rc::clone(&b_slot);
+                    move || {
+                        if trigger_a.get() == 1
+                            && let Some(b) = b_slot.borrow().as_ref()
+                        {
+                            b.dispose();
+                        }
+                    }
+                });
+                *keep_alive.borrow_mut() = Some(a);
+
+                runite::queue_macrotask(move || {
+                    // Queue A's rerun (which disposes B) ahead of B's rerun: B's queued job
+                    // must observe the disposal and skip.
+                    trigger_a.set(1);
+                    trigger_b.set(1);
+                });
+            }
+        });
+
+        run();
+        assert_eq!(
+            b_runs.get(),
+            1,
+            "an effect disposed while queued must not run"
+        );
+    }
+
+    #[test]
+    fn effect_writes_propagate_to_other_effects_in_the_same_flush() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let keep_alive = Rc::new(RefCell::new(Vec::<EffectHandle>::new()));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            let keep_alive = Rc::clone(&keep_alive);
+            move || {
+                let reactor = Reactor::new();
+                let input = signal_in(&reactor, 0usize);
+                let mirrored = signal_in(&reactor, 0usize);
+
+                // One effect mirrors `input` into `mirrored`; another observes `mirrored`.
+                let mirror = reactor.effect({
+                    let input = input.clone();
+                    let mirrored = mirrored.clone();
+                    move || {
+                        let _ = mirrored.set(input.get());
+                    }
+                });
+                let observe = reactor.effect({
+                    let mirrored = mirrored.clone();
+                    let seen = Rc::clone(&seen);
+                    move || seen.borrow_mut().push(mirrored.get())
+                });
+                keep_alive.borrow_mut().extend([mirror, observe]);
+
+                runite::queue_macrotask(move || {
+                    input.set(5);
+                });
+            }
+        });
+
+        run();
+        assert_eq!(
+            &*seen.borrow(),
+            &[0, 5],
+            "the observer must settle on the mirrored value within the flush"
+        );
+    }
+
+    #[test]
     fn untracked_and_peeked_reads_do_not_create_dependencies() {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let handle_slot = Rc::new(RefCell::new(None::<EffectHandle>));

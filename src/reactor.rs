@@ -763,6 +763,38 @@ mod tests {
     }
 
     #[test]
+    fn graph_survives_dropping_the_reactor_handle() {
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let keep_alive = Rc::new(std::cell::RefCell::new(None::<crate::EffectHandle>));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            let keep_alive = Rc::clone(&keep_alive);
+            move || {
+                let reactor = Reactor::new();
+                let source = crate::signal_in(&reactor, 1usize);
+                let effect = reactor.effect({
+                    let seen = Rc::clone(&seen);
+                    let source = source.clone();
+                    move || seen.borrow_mut().push(source.get())
+                });
+                *keep_alive.borrow_mut() = Some(effect);
+
+                // Nodes hold the reactor alive; the user's handle is not load-bearing.
+                drop(reactor);
+
+                runite::queue_macrotask(move || {
+                    source.set(2);
+                });
+            }
+        });
+
+        run();
+
+        assert_eq!(&*seen.borrow(), &[1, 2]);
+    }
+
+    #[test]
     fn flush_recovers_after_a_panicking_job() {
         let observed = Rc::new(Cell::new(0usize));
 
