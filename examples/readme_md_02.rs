@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use adaptite::{cell, effect, thunk};
+use adaptite::{effect, signal, thunk};
 use runite::{
     main,
     time::{set_interval, set_timeout},
@@ -9,8 +9,8 @@ use runite::{
 #[main]
 fn main() {
     // Two primitive observable values.
-    let x = cell(5);
-    let y = cell(10);
+    let x = signal(5);
+    let y = signal(10);
 
     // A derived observable value that depends on `x` and `y`. The closure will only run when `x` or `y` change, and the
     // result will be cached until then.

@@ -324,12 +324,12 @@ mod tests {
     use runite::{queue_macrotask, run};
 
     use super::Thunk;
-    use crate::{Cell, EffectHandle, Memo, Reactor, cell_in, memo_by_in, memo_in, thunk_in};
+    use crate::{EffectHandle, Memo, Reactor, Signal, memo_by_in, memo_in, signal_in, thunk_in};
 
     #[test]
     fn thunk_caches_until_invalidated() {
         let reactor = Reactor::new();
-        let source = cell_in(&reactor, 2usize);
+        let source = signal_in(&reactor, 2usize);
         let compute_count = Rc::new(Counter::new(0usize));
         let thunk = thunk_in(&reactor, {
             let source = source.clone();
@@ -352,8 +352,8 @@ mod tests {
     #[test]
     fn nested_thunks_recompute_only_affected_layers() {
         let reactor = Reactor::new();
-        let base = cell_in(&reactor, 5usize);
-        let extra = cell_in(&reactor, 1usize);
+        let base = signal_in(&reactor, 5usize);
+        let extra = signal_in(&reactor, 1usize);
 
         let double_count = Rc::new(Counter::new(0usize));
         let label_count = Rc::new(Counter::new(0usize));
@@ -442,7 +442,7 @@ mod tests {
     fn memo_suppresses_unchanged_results_and_memo_by_uses_custom_comparator() {
         let reactive_seen = Rc::new(RefCell::new(Vec::new()));
         let effect_slot = Rc::new(RefCell::new(None::<EffectHandle>));
-        let source_slot = Rc::new(RefCell::new(None::<Cell<usize>>));
+        let source_slot = Rc::new(RefCell::new(None::<Signal<usize>>));
         let parity_slot = Rc::new(RefCell::new(None::<Memo<usize>>));
         let bucket_slot = Rc::new(RefCell::new(None::<Memo<usize>>));
 
@@ -454,7 +454,7 @@ mod tests {
             let bucket_slot = Rc::clone(&bucket_slot);
             move || {
                 let reactor = Reactor::new();
-                let source = cell_in(&reactor, 1usize);
+                let source = signal_in(&reactor, 1usize);
                 let parity = memo_in(&reactor, {
                     let source = source.clone();
                     move || source.get() % 2
@@ -495,7 +495,7 @@ mod tests {
                 let source = source_slot
                     .borrow()
                     .as_ref()
-                    .expect("source cell should still be alive")
+                    .expect("source signal should still be alive")
                     .clone();
                 source.set(3);
                 source.set(9);

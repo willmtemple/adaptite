@@ -6,7 +6,7 @@
 //! - `RUST_LOG=info,runite::runtime=debug,adaptite::graph=debug cargo run -p adaptite --example tracing_subscriber_showcase`
 //! - `RUST_LOG=info,runite::scheduler=trace,adaptite::event=trace,adaptite::effect=debug cargo run -p adaptite --example tracing_subscriber_showcase`
 
-use adaptite::{cell, effect, event, on, thunk};
+use adaptite::{effect, event, on, signal, thunk};
 use runite::time::sleep;
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
@@ -47,7 +47,7 @@ async fn main() {
         "starting tracing subscriber showcase"
     );
 
-    let count = cell(0usize);
+    let count = signal(0usize);
     let doubled = thunk({
         let count = count.clone();
         move || count.get() * 2
@@ -60,7 +60,7 @@ async fn main() {
             tracing::info!(
                 event = "apply_click_delta",
                 delta = *delta,
-                "draining queued event into cell update"
+                "draining queued event into signal update"
             );
             count.update(|value| *value += *delta);
         }

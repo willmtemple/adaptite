@@ -15,7 +15,7 @@ pub fn source_in(reactor: &Reactor) -> Source {
 /// Low-level observable source node.
 ///
 /// `Source` is useful for advanced data structures that want precise control over when reads
-/// observe and writes trigger invalidation without storing their state in a [`crate::Cell`].
+/// observe and writes trigger invalidation without storing their state in a [`crate::Signal`].
 #[derive(Clone)]
 pub struct Source {
     inner: Rc<SourceInner>,

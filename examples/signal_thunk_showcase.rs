@@ -1,4 +1,4 @@
-use adaptite::{cell, thunk};
+use adaptite::{signal, thunk};
 use std::cell::Cell as Counter;
 use std::fmt;
 use std::rc::Rc;
@@ -39,8 +39,8 @@ fn unix_timestamp_millis() -> String {
 fn main() {
     START.get_or_init(Instant::now);
 
-    let first = cell(String::from("Adaptite"));
-    let visits = cell(1usize);
+    let first = signal(String::from("Adaptite"));
+    let visits = signal(1usize);
     let greeting_compute = Rc::new(Counter::new(0usize));
     let summary_compute = Rc::new(Counter::new(0usize));
 

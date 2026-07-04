@@ -5,8 +5,8 @@ Automatic thread-stack-based reactivity for runite programs.
 Adaptite provides an implementation of fine-grained reactivity primitives
 for dependency tracking and incremental computation. Those primitives are:
 
-- `Cell<T>`: a tracked-state value cell, primitively observable (sometimes
-  called a "signal" in other reactor implementations).
+- `Signal<T>`: a tracked-state value cell, primitively observable (the same
+  concept is called a "signal" in most other reactor implementations).
 - `effect`: a primitive observer that runs once, observes its dependencies, and
   runs again whenever its dependencies change.
 - `Thunk<T>`: a tracked-state recomputable value defined by a closure.
@@ -23,19 +23,19 @@ dependencies between entities on the same thread only.
 
 ## Examples
 
-### Observe a cell using an effect
+### Observe a signal using an effect
 
 ```rs
 use std::time::Duration;
 
-use adaptite::{cell, effect};
+use adaptite::{effect, signal};
 use runite::{main, time::set_timeout};
 
 #[main]
 fn main() {
     // Creates an observable value. Calling `.get` from within an observer will create a dependency, and calling `.set`
     // will trigger updates to any dependent observers.
-    let v = cell(5);
+    let v = signal(5);
 
     // Creates an observer that prints the value of `v` whenever it changes.
     // Calling `.leak()` on the effect handle allows it to run for the lifetime of the program without automatically
@@ -64,7 +64,7 @@ fn main() {
 ```rs
 use std::time::Duration;
 
-use adaptite::{cell, effect, thunk};
+use adaptite::{effect, signal, thunk};
 use runite::{
     main,
     time::{set_interval, set_timeout},
@@ -73,8 +73,8 @@ use runite::{
 #[main]
 fn main() {
     // Two primitive observable values.
-    let x = cell(5);
-    let y = cell(10);
+    let x = signal(5);
+    let y = signal(10);
 
     // A derived observable value that depends on `x` and `y`. The closure will only run when `x` or `y` change, and the
     // result will be cached until then.

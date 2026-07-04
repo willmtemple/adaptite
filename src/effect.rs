@@ -169,7 +169,7 @@ mod tests {
 
     use runite::{queue_macrotask, run, spawn, yield_now};
 
-    use crate::{Reactor, cell_in};
+    use crate::{Reactor, signal_in};
 
     use super::EffectHandle;
 
@@ -183,7 +183,7 @@ mod tests {
             let handle_slot = Rc::clone(&handle_slot);
             move || {
                 let reactor = Reactor::new();
-                let source = cell_in(&reactor, 0usize);
+                let source = signal_in(&reactor, 0usize);
                 let effect = reactor.effect({
                     let seen = Rc::clone(&seen);
                     let source = source.clone();
@@ -208,7 +208,7 @@ mod tests {
             let handle_slot = Rc::clone(&handle_slot);
             move || {
                 let reactor = Reactor::new();
-                let source = cell_in(&reactor, 2usize);
+                let source = signal_in(&reactor, 2usize);
                 let effect = reactor.effect({
                     let reruns = Rc::clone(&reruns);
                     let seen = Rc::clone(&seen);
@@ -237,7 +237,7 @@ mod tests {
             let handle_slot = Rc::clone(&handle_slot);
             move || {
                 let reactor = Reactor::new();
-                let source = cell_in(&reactor, 0usize);
+                let source = signal_in(&reactor, 0usize);
                 let effect = reactor.effect({
                     let seen = Rc::clone(&seen);
                     let source = source.clone();
