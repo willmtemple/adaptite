@@ -26,7 +26,7 @@ mod thunk;
 pub use effect::{EffectHandle, effect, effect_in};
 pub use event::{Event, Subscription, event, event_in, on, on_in};
 pub use id::NodeId;
-pub use reactor::{ReactCycleError, Reactor, current};
+pub use reactor::{ReactCycleError, Reactor, current, untrack};
 pub use signal::{Signal, signal, signal_in};
 pub use source::{Source, source, source_in};
 pub use thunk::{

@@ -17,6 +17,7 @@ type Job = Box<dyn FnOnce() + 'static>;
 
 thread_local! {
     static CURRENT_REACTOR: RefCell<Weak<ReactorInner>> = const { RefCell::new(Weak::new()) };
+    static UNTRACKED_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 #[cfg(debug_assertions)]
@@ -32,6 +33,30 @@ thread_local! {
 /// storage.
 pub fn current() -> Reactor {
     Reactor::current()
+}
+
+/// Runs `f` with dependency tracking suspended.
+///
+/// Reads made while `f` executes do not record dependencies for the currently running observer,
+/// so the observer will not re-run when those values change. Cycle detection remains active.
+/// Tracking resumes when `f` returns; nested `untrack` calls are permitted.
+pub fn untrack<T>(f: impl FnOnce() -> T) -> T {
+    UNTRACKED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+
+    struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            UNTRACKED_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+
+    let _guard = Guard;
+    f()
+}
+
+fn is_untracked() -> bool {
+    UNTRACKED_DEPTH.with(|depth| depth.get() > 0)
 }
 
 /// How stale an observer has become after an upstream write.
@@ -248,6 +273,12 @@ impl Reactor {
     /// error if doing so would create a dependency cycle.
     pub fn try_observe(&self, observable: NodeId) -> Result<(), ReactCycleError> {
         self.cycle_check(observable)?;
+
+        // Untracked reads record nothing, and are also the sanctioned way to read one reactor's
+        // nodes from inside another reactor's computation.
+        if is_untracked() {
+            return Ok(());
+        }
 
         #[cfg(debug_assertions)]
         self.assert_running_reactor();

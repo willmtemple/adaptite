@@ -342,6 +342,56 @@ mod tests {
     }
 
     #[test]
+    fn untracked_and_peeked_reads_do_not_create_dependencies() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let handle_slot = Rc::new(RefCell::new(None::<EffectHandle>));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            let handle_slot = Rc::clone(&handle_slot);
+            move || {
+                let reactor = Reactor::new();
+                let tracked = signal_in(&reactor, 1usize);
+                let untracked_via_fn = signal_in(&reactor, 10usize);
+                let untracked_via_peek = signal_in(&reactor, 100usize);
+
+                let effect = reactor.effect({
+                    let seen = Rc::clone(&seen);
+                    let tracked = tracked.clone();
+                    let untracked_via_fn = untracked_via_fn.clone();
+                    let untracked_via_peek = untracked_via_peek.clone();
+                    move || {
+                        let total = tracked.get()
+                            + crate::untrack(|| untracked_via_fn.get())
+                            + untracked_via_peek.peek();
+                        seen.borrow_mut().push(total);
+                    }
+                });
+                *handle_slot.borrow_mut() = Some(effect);
+
+                runite::queue_macrotask({
+                    let untracked_via_fn = untracked_via_fn.clone();
+                    let untracked_via_peek = untracked_via_peek.clone();
+                    let tracked = tracked.clone();
+                    move || {
+                        // Neither untracked write may rerun the effect...
+                        untracked_via_fn.set(20);
+                        untracked_via_peek.set(200);
+
+                        runite::queue_macrotask(move || {
+                            // ...but a tracked write reruns it, observing the untracked values.
+                            tracked.set(2);
+                        });
+                    }
+                });
+            }
+        });
+
+        run();
+        assert_eq!(&*seen.borrow(), &[111, 222]);
+    }
+
+    #[test]
     fn convergent_feedback_loops_settle() {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let handle_slot = Rc::new(RefCell::new(None::<EffectHandle>));

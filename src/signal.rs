@@ -62,6 +62,12 @@ impl<T: 'static> Signal<T> {
         f(&value)
     }
 
+    /// Runs `f` with a shared reference to the current value without recording a dependency.
+    pub fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let value = self.inner.value.borrow();
+        f(&value)
+    }
+
     /// Replaces the current value and notifies dependents.
     pub fn replace(&self, value: T) -> T {
         let previous = self.inner.value.replace(value);
@@ -96,6 +102,11 @@ impl<T: Clone + 'static> Signal<T> {
     /// Clones and returns the current value.
     pub fn get(&self) -> T {
         self.with(T::clone)
+    }
+
+    /// Clones and returns the current value without recording a dependency.
+    pub fn peek(&self) -> T {
+        self.with_peek(T::clone)
     }
 }
 

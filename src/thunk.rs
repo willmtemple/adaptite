@@ -177,10 +177,28 @@ impl<T: 'static> Thunk<T> {
     }
 }
 
+impl<T: 'static> Thunk<T> {
+    /// Runs `f` with a shared reference to the current computed value without recording a
+    /// dependency. The thunk is still brought up to date before `f` runs.
+    pub fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.inner.reactor.assert_no_cycle(self.inner.id);
+        self.inner.refresh();
+        let value = self.inner.value.borrow();
+        f(value
+            .as_ref()
+            .expect("thunk should have a cached value after recomputing"))
+    }
+}
+
 impl<T: Clone + 'static> Thunk<T> {
     /// Clones and returns the current computed value.
     pub fn get(&self) -> T {
         self.with(T::clone)
+    }
+
+    /// Clones and returns the current computed value without recording a dependency.
+    pub fn peek(&self) -> T {
+        self.with_peek(T::clone)
     }
 }
 
@@ -231,10 +249,28 @@ impl<T: 'static> Memo<T> {
     }
 }
 
+impl<T: 'static> Memo<T> {
+    /// Runs `f` with a shared reference to the current computed value without recording a
+    /// dependency. The memo is still brought up to date before `f` runs.
+    pub fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.inner.reactor.assert_no_cycle(self.inner.id);
+        self.inner.refresh();
+        let value = self.inner.value.borrow();
+        f(value
+            .as_ref()
+            .expect("memo should have a cached value after recomputing"))
+    }
+}
+
 impl<T: Clone + 'static> Memo<T> {
     /// Clones and returns the current computed value.
     pub fn get(&self) -> T {
         self.with(T::clone)
+    }
+
+    /// Clones and returns the current computed value without recording a dependency.
+    pub fn peek(&self) -> T {
+        self.with_peek(T::clone)
     }
 }
 
