@@ -1,31 +1,94 @@
 # adaptite
 
-Automatic thread-stack-based reactivity for runite programs.
+Fine-grained reactivity for [runite](https://github.com/willmtemple/runite) programs.
 
-Adaptite provides an implementation of fine-grained reactivity primitives
-for dependency tracking and incremental computation. Those primitives are:
+Adaptite provides reactivity primitives for dependency tracking and incremental
+computation. Those primitives are:
 
 - `Signal<T>`: a tracked-state value cell, primitively observable (the same
   concept is called a "signal" in most other reactor implementations).
 - `effect`: a primitive observer that runs once, observes its dependencies, and
   runs again whenever its dependencies change.
-- `Thunk<T>`: a tracked-state recomputable value defined by a closure.
-  Invalidated if any of its dependencies change. A `Thunk` is both an observer
-  and an observable.
+- `Thunk<T>`: a tracked-state recomputable value defined by a closure,
+  recomputed on read after any of its dependencies change. A `Thunk` is both an
+  observer and an observable.
+- `Memo<T>`: a `Thunk` with an equality (or custom comparator) gate — if a
+  recomputation produces an equal value, downstream observers do not re-run.
 - `Event<T>`: a push-style source of events of type `T`. Supports subscription
   and cancellation of interest in events.
+- `scope`/`on_cleanup`: ownership for reactive subgraphs — dispose a whole tree
+  of effects at once, and register teardown that runs before an effect re-runs.
+- `Source`: a low-level observable node for building custom reactive data
+  structures.
 
 Adaptite requires the runite runtime to function, and cannot be used on
 threads not managed by the runite runtime.
 
-Adaptite does not function across thread boundaries. It tracks
-dependencies between entities on the same thread only.
+Adaptite does not function across thread boundaries. It tracks dependencies
+between entities on the same thread only. Async work feeds the graph from the
+edges by updating signals or emitting events.
+
+## The reactivity model
+
+### Lazy, glitch-free propagation
+
+Writes are cheap: setting a signal marks its direct dependents dirty and their
+transitive dependents "check", and nothing recomputes until it is read.
+On read, a computed node verifies whether its recorded inputs actually changed
+(refreshing them first) and recomputes only if so. This makes propagation
+glitch-free — a computation can never observe a half-updated ("torn") view of
+the graph — and guarantees each node recomputes at most once per change, even
+in diamond-shaped graphs.
+
+`Signal::set` suppresses writes of equal values entirely. A `Memo` whose
+recomputation produces an equal value (under `PartialEq` or a custom
+comparator via `memo_by`) does not propagate further, so downstream effects
+skip their re-runs.
+
+### Effects and scheduling
+
+Effects never run inline with the write that triggered them. They are queued
+on the reactor's job queue and flushed on the runtime's microtask queue, so
+consecutive writes within one task coalesce into a single effect run — batching
+is implicit. Host integrations that need synchronous propagation (for example,
+native resize loops) can call `Reactor::flush_now`.
+
+### Feedback loops
+
+An effect may write state it depends on, as long as the loop converges — for
+example clamping a value, normalizing input, or syncing two representations.
+Convergence is reached when the rewritten value is equal to the existing one
+and the write is suppressed. A loop that never converges is a bug: in debug
+builds, an effect that runs more than 100 times in a single flush panics with
+the effect's creation site instead of hanging the event loop.
+
+Synchronous read cycles (a thunk whose computation reads itself, directly or
+transitively) have no convergent interpretation and always panic, reporting
+the cycle path with the source location of each node. For "reduction"-style
+computations that want their own previous value, use `memo_with_prev`, which
+passes the last value into the compute closure without creating a cycle.
+
+### Ownership and cleanup
+
+Effects created during another effect's run (or inside `scope(...)`) are owned
+by it: they stay alive without their handles being held and are disposed when
+the owner re-runs or is disposed. `on_cleanup` registers teardown against the
+innermost owner; it runs before the owning effect's next run and on disposal.
+Top-level effects are owned by their `EffectHandle` — dropping the last handle
+disposes the effect, and `leak()` opts out. `Subscription` handles returned by
+`Event::subscribe` behave the same way.
+
+### Untracked reads
+
+`untrack(|| ...)` suspends dependency recording, and `signal.peek()` /
+`with_peek(...)` read a single value without recording. Computed nodes are
+still brought up to date before an untracked read.
 
 ## Examples
 
 ### Observe a signal using an effect
 
-```rs
+```rust,no_run
 use std::time::Duration;
 
 use adaptite::{effect, signal};
@@ -61,7 +124,7 @@ fn main() {
 
 ### Observe a thunk using an effect
 
-```rs
+```rust,no_run
 use std::time::Duration;
 
 use adaptite::{effect, signal, thunk};
@@ -118,7 +181,7 @@ fn main() {
 
 ### Use an event to handle intra-thread messaging
 
-```rs
+```rust,no_run
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use adaptite::event;
@@ -155,6 +218,14 @@ fn main() {
     });
 }
 ```
+
+## Tracing
+
+Adaptite emits [`tracing`](https://docs.rs/tracing) diagnostics under the
+targets `adaptite::graph`, `adaptite::signal`, `adaptite::thunk`,
+`adaptite::memo`, `adaptite::effect`, `adaptite::event`, and
+`adaptite::scope`. See `examples/tracing_subscriber_showcase.rs` for a
+suggested subscriber setup.
 
 ## License
 

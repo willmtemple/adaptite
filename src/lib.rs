@@ -1,8 +1,5 @@
-//! Fine-grained reactivity primitives for [runite](https://github.com/willmtemple/runite).
-//!
-//! This crate is intentionally layered on top of `runite`. The reactive graph is
-//! single-threaded and designed to live on a runtime-managed thread, while async work feeds it
-//! from the edges by updating state or emitting events.
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 
 extern crate alloc;
 
