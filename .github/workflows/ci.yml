@@ -64,6 +64,10 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: Test
         run: cargo test --workspace
+      # Every example runs to completion. Beyond keeping the examples honest,
+      # this exercises the reactive graph end-to-end on the real runtime.
+      - name: Smoke-run examples
+        run: mise run examples
 
   test-macos:
     name: Test (macOS aarch64)

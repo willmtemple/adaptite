@@ -58,6 +58,19 @@ run = [
 description = "Emit lcov coverage for CI consumption"
 run = "cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info"
 
+[tasks.examples]
+description = "Smoke-run every example to completion"
+# mise runs tasks with `sh` by default; dash rejects `pipefail`, so pin bash.
+shell = "bash -c"
+run = """
+set -euo pipefail
+for ex in spreadsheet stock_ticker screen_router signal_thunk_showcase \
+          tracing_subscriber_showcase readme_md_01 readme_md_02 readme_md_03; do
+  echo "== example: $ex =="
+  cargo run --quiet --example "$ex"
+done
+"""
+
 [tasks.cop]
 description = "Run Agent Cop static-analysis checks"
 run = "cop cop-checks/main.cop -t ."
