@@ -1,6 +1,9 @@
 use core::fmt;
 
 /// Stable identifier for a node in a reactive graph.
+///
+/// Ids are unique within a single [`crate::Reactor`]; nodes belonging to different reactors
+/// may share the same id.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeId(pub(crate) u64);
 

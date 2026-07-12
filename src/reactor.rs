@@ -43,6 +43,9 @@ pub fn current() -> Reactor {
 /// so the observer will not re-run when those values change. Cycle detection remains active.
 /// Tracking resumes when `f` returns; nested `untrack` calls are permitted.
 ///
+/// Untracked reads are also exempt from the debug-build cross-reactor check, making `untrack`
+/// the sanctioned way to read one reactor's nodes from inside another reactor's computation.
+///
 /// # Examples
 ///
 /// ```rust
@@ -140,6 +143,29 @@ pub(crate) trait ObserverHook {
 }
 
 /// Error type for cycles detected in the reactive graph. Contains the path of nodes that form the cycle.
+///
+/// Returned by [`Reactor::try_observe`]. The panicking read paths ([`Reactor::observe`], and
+/// thunk/memo reads) panic with this error's `Display` output rather than the error value
+/// itself.
+///
+/// # Examples
+///
+/// ```rust
+/// use adaptite::{Reactor, source_in};
+///
+/// let reactor = Reactor::new();
+/// let node = source_in(&reactor);
+///
+/// // Reading a node from inside its own computation closes a cycle.
+/// let error = reactor
+///     .run_in_context(node.id(), || reactor.try_observe(node.id()))
+///     .expect_err("self-read is a cycle");
+///
+/// // The path starts and ends with the node that closed the cycle, and each entry
+/// // carries the source location where that node was created.
+/// assert_eq!(error.cycle().first(), error.cycle().last());
+/// assert!(error.origins().iter().all(|origin| origin.is_some()));
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReactCycleError {
     cycle: Vec<NodeId>,
@@ -152,6 +178,8 @@ impl ReactCycleError {
     }
 
     /// Returns the cycle path that was detected.
+    ///
+    /// The path starts and ends with the same node — the one whose read closed the cycle.
     pub fn cycle(&self) -> &[NodeId] {
         &self.cycle
     }
@@ -258,6 +286,9 @@ impl Reactor {
     /// Existing dependencies for `observer` are cleared before `f` runs. Any calls to
     /// [`observe`](Self::observe) made while `f` executes will become the observer's new
     /// dependencies.
+    ///
+    /// Contexts nest: dependencies are recorded for the innermost observer. Debug builds
+    /// assert that `observer` is not already running further up the stack.
     pub fn run_in_context<T>(&self, observer: NodeId, f: impl FnOnce() -> T) -> T {
         let _span = tracing::debug_span!(
             target: trace_targets::GRAPH,
@@ -339,6 +370,13 @@ impl Reactor {
 
     /// Attempts to record a dependency on `observable` for the currently running observer, returning an
     /// error if doing so would create a dependency cycle.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics when called while a computation belonging to a *different*
+    /// reactor is running on this thread: such a dependency cannot be tracked, so the observer
+    /// would never re-run. Wrap the read in [`untrack`] if the cross-reactor read is
+    /// intentional.
     pub fn try_observe(&self, observable: NodeId) -> Result<(), ReactCycleError> {
         self.cycle_check(observable)?;
 
@@ -384,17 +422,57 @@ impl Reactor {
     ///
     /// # Panics
     ///
-    /// Panics if recording the dependency would create a cycle in the reactive graph.
+    /// Panics with the formatted [`ReactCycleError`] if recording the dependency would close a
+    /// cycle in the reactive graph, and under the same debug-build cross-reactor condition as
+    /// [`try_observe`](Self::try_observe).
     pub fn observe(&self, observable: NodeId) {
         if let Err(e) = self.try_observe(observable) {
             panic!("{e}");
         }
     }
 
-    /// Notifies dependents of `observable` that its value changed.
+    /// Records that `observable`'s value changed and marks its dependents stale.
     ///
-    /// Direct dependents are marked dirty; transitive dependents are marked so that they verify
-    /// their inputs before recomputing.
+    /// The node's version is bumped (this is what dependency verification compares against),
+    /// direct dependents are marked dirty, and transitive dependents are marked so that they
+    /// verify their inputs before recomputing. Nothing recomputes inline: computed nodes
+    /// refresh on their next read, and affected effects are queued for the next microtask
+    /// flush.
+    ///
+    /// # Examples
+    ///
+    /// Together with [`observe`](Self::observe), this is the raw interface custom primitives
+    /// are built on ([`crate::Source`] is a thin wrapper over exactly this pair):
+    ///
+    /// ```rust
+    /// use std::cell::Cell;
+    /// use std::rc::Rc;
+    ///
+    /// use adaptite::{Reactor, source_in, thunk_in};
+    ///
+    /// let reactor = Reactor::new();
+    /// let node = source_in(&reactor);          // provides a NodeId
+    /// let external = Rc::new(Cell::new(1u32)); // state living outside the graph
+    ///
+    /// let view = thunk_in(&reactor, {
+    ///     let reactor = reactor.clone();
+    ///     let node = node.clone();
+    ///     let external = Rc::clone(&external);
+    ///     move || {
+    ///         reactor.observe(node.id()); // reads of `external` depend on `node`
+    ///         external.get() * 10
+    ///     }
+    /// });
+    ///
+    /// assert_eq!(view.get(), 10);
+    /// assert!(reactor.is_observed(node.id()));
+    ///
+    /// external.set(2);
+    /// assert_eq!(view.get(), 10); // the graph has not been told about the write
+    ///
+    /// reactor.trigger(node.id());
+    /// assert_eq!(view.get(), 20); // now the thunk recomputes
+    /// ```
     pub fn trigger(&self, observable: NodeId) {
         self.bump_version(observable);
         self.mark_dependents(observable, Mark::Dirty);
@@ -532,10 +610,44 @@ impl Reactor {
         self.inner.ensure_flush_scheduled();
     }
 
-    /// Flushes currently queued reactive jobs immediately on the calling thread.
+    /// Flushes queued reactive jobs immediately on the calling thread.
     ///
-    /// This is useful when host integrations need synchronous propagation
-    /// (for example, during native resize loops).
+    /// The queue is drained until empty, so jobs queued *during* the flush — such as effect
+    /// re-runs triggered by writes made from other effects — also run before this returns. If
+    /// a job panics, the panic propagates to the caller and any remaining jobs are handed to a
+    /// fresh microtask flush, so one panicking effect cannot silently disable the reactor.
+    ///
+    /// This is useful when host integrations need synchronous propagation (for example,
+    /// during native resize loops) and in tests that drive effects without a runtime tick.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    ///
+    /// use adaptite::{Reactor, signal_in};
+    ///
+    /// let reactor = Reactor::new();
+    /// let value = signal_in(&reactor, 1);
+    /// let seen = Rc::new(RefCell::new(Vec::new()));
+    ///
+    /// let effect = reactor.effect({
+    ///     let value = value.clone();
+    ///     let seen = Rc::clone(&seen);
+    ///     move || seen.borrow_mut().push(value.get())
+    /// });
+    ///
+    /// // The initial run is queued, not inline; flush it synchronously.
+    /// assert!(seen.borrow().is_empty());
+    /// reactor.flush_now();
+    /// assert_eq!(*seen.borrow(), [1]);
+    ///
+    /// value.set(2);
+    /// reactor.flush_now();
+    /// assert_eq!(*seen.borrow(), [1, 2]);
+    /// # effect.dispose();
+    /// ```
     pub fn flush_now(&self) {
         Rc::clone(&self.inner).flush_jobs();
     }

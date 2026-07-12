@@ -154,21 +154,51 @@ pub(crate) fn adopt_into_current(child: Rc<dyn OwnedDisposable>) -> bool {
 /// outlive the screen or component that spawned it. Capture an `Owner` before suspending and
 /// use [`run_in`](Owner::run_in) to re-attach later work:
 ///
-/// ```rust,no_run
-/// use adaptite::{effect, owner, signal};
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
 ///
-/// let data = signal(0);
-/// let scope_owner = owner().expect("called inside an effect or scope");
-/// runite::spawn(async move {
-///     let response = 42; // ... await a fetch ...
-///     scope_owner.run_in(|| {
-///         // Owned by the original scope: disposed when it is.
-///         let _ = effect({
+/// use adaptite::{effect, owner, scope, signal};
+/// use runite::{queue_macrotask, run, yield_now};
+///
+/// let seen = Rc::new(RefCell::new(Vec::new()));
+///
+/// queue_macrotask({
+///     let seen = Rc::clone(&seen);
+///     move || {
+///         let data = signal(0);
+///         let (handle, ()) = scope({
 ///             let data = data.clone();
-///             move || println!("{} (fetched {response})", data.get())
+///             let seen = Rc::clone(&seen);
+///             move || {
+///                 // Capture the owner before suspending...
+///                 let scope_owner = owner().expect("scope is the current owner");
+///                 std::mem::drop(runite::spawn(async move {
+///                     yield_now().await; // ... await a fetch ...
+///                     // ...and re-enter it afterwards: the effect is owned again.
+///                     scope_owner.run_in(|| {
+///                         let _ = effect({
+///                             let data = data.clone();
+///                             let seen = Rc::clone(&seen);
+///                             move || seen.borrow_mut().push(data.get())
+///                         });
+///                     });
+///                 }));
+///             }
 ///         });
-///     });
+///
+///         runite::queue_macrotask({
+///             let data = data.clone();
+///             move || {
+///                 handle.dispose();
+///                 data.set(1); // disposed with the scope: not observed
+///             }
+///         });
+///     }
 /// });
+/// run();
+///
+/// assert_eq!(*seen.borrow(), [0]);
 /// ```
 ///
 /// Unlike [`ScopeHandle`], dropping an `Owner` does **not** dispose anything: it is a
@@ -214,6 +244,10 @@ pub fn owner() -> Option<Owner> {
 /// The cleanup runs before the owning effect next re-runs, and when the owner is disposed. Use
 /// it to release resources acquired during an effect run.
 ///
+/// Cleanups run untracked (their reads do not become dependencies of whatever triggered the
+/// teardown) and in reverse registration order: the most recently registered cleanup runs
+/// first, before any children of the owner are disposed.
+///
 /// # Panics
 ///
 /// Panics when called outside a reactive owner, since the cleanup could never run.
@@ -243,6 +277,48 @@ pub fn owner() -> Option<Owner> {
 /// handle.dispose();
 /// assert_eq!(*log.borrow(), ["setup", "teardown"]);
 /// ```
+///
+/// Cleanups pair naturally with effect re-runs for subscribe/unsubscribe patterns:
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{effect, on_cleanup, signal};
+/// use runite::{queue_macrotask, run};
+///
+/// let log = Rc::new(RefCell::new(Vec::new()));
+///
+/// queue_macrotask({
+///     let log = Rc::clone(&log);
+///     move || {
+///         let channel = signal("news");
+///         effect({
+///             let channel = channel.clone();
+///             let log = Rc::clone(&log);
+///             move || {
+///                 let name = channel.get();
+///                 log.borrow_mut().push(format!("subscribe {name}"));
+///                 on_cleanup({
+///                     let log = Rc::clone(&log);
+///                     move || log.borrow_mut().push(format!("unsubscribe {name}"))
+///                 });
+///             }
+///         })
+///         .leak();
+///
+///         runite::queue_macrotask(move || {
+///             channel.set("sports");
+///         });
+///     }
+/// });
+/// run();
+///
+/// assert_eq!(
+///     *log.borrow(),
+///     ["subscribe news", "unsubscribe news", "subscribe sports"]
+/// );
+/// ```
 pub fn on_cleanup(cleanup: impl FnOnce() + 'static) {
     let Some(owner) = current_owner() else {
         panic!(
@@ -258,9 +334,11 @@ pub fn on_cleanup(cleanup: impl FnOnce() + 'static) {
 ///
 /// Effects (and nested scopes) created while `f` executes are owned by the scope: they stay
 /// alive without their handles being held, and they are disposed together when the scope is
-/// disposed. Scopes created inside another owner are disposed with that owner.
+/// disposed.
 ///
-/// The scope is disposed when the last clone of the handle is dropped; call
+/// A scope created inside another owner (an effect's run, or an enclosing scope) is kept alive
+/// by that owner — even if every [`ScopeHandle`] clone is dropped — and is disposed with it. An
+/// unowned scope is disposed when the last clone of its handle is dropped; call
 /// [`leak`](ScopeHandle::leak) to keep it alive for the remainder of the program.
 ///
 /// # Examples
@@ -305,6 +383,11 @@ pub fn scope<T>(f: impl FnOnce() -> T) -> (ScopeHandle, T) {
 }
 
 /// Disposable handle for an ownership scope created with [`scope`].
+///
+/// Clones share the same scope. An unowned scope is disposed when the last clone is dropped; a
+/// scope created inside another owner is kept alive by that owner regardless of handles and is
+/// disposed with it. [`dispose`](ScopeHandle::dispose) tears the scope down immediately;
+/// [`leak`](ScopeHandle::leak) keeps an unowned scope alive for the remainder of the program.
 #[derive(Clone)]
 #[must_use = "scopes are disposed when dropped, so you must keep the handle or explicitly leak it"]
 pub struct ScopeHandle {

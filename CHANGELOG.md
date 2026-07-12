@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-07-04
+## [0.1.0] - 2026-07-12
 
 Initial release.
+
+### Added
 
 - `Signal<T>` tracked-state cells with equality-suppressed `set`, plus
   `replace`, `update`, `with`, `get`, and untracked `peek`/`with_peek`.
@@ -42,6 +44,9 @@ Initial release.
   effects are still disposed with their scope.
 - `Reactor::is_observed` / `Source::is_observed` for garbage-collecting
   per-key dependency units in fine-grained data structures.
+- Explicit reactors: `Reactor::new` and `*_in` constructor variants keep
+  several independent graphs on one thread; `Reactor::flush_now` flushes
+  queued reactive jobs synchronously for host integrations.
 - Handle types (`Signal`, `Thunk`, `Memo`, `Event`) are cloneable without
   requiring `T: Clone`.
 - Diagnostics: reactive cycle errors report the cycle path with each node's

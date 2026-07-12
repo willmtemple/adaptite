@@ -2,9 +2,9 @@
 //!
 //! Try:
 //!
-//! - `cargo run -p adaptite --example tracing_subscriber_showcase`
-//! - `RUST_LOG=info,runite::runtime=debug,adaptite::graph=debug cargo run -p adaptite --example tracing_subscriber_showcase`
-//! - `RUST_LOG=info,runite::scheduler=trace,adaptite::event=trace,adaptite::effect=debug cargo run -p adaptite --example tracing_subscriber_showcase`
+//! - `cargo run --example tracing_subscriber_showcase`
+//! - `RUST_LOG=info,runite::runtime=debug,adaptite::graph=debug cargo run --example tracing_subscriber_showcase`
+//! - `RUST_LOG=info,runite::scheduler=trace,adaptite::event=trace,adaptite::effect=debug cargo run --example tracing_subscriber_showcase`
 
 use adaptite::{effect, event, on, signal, thunk};
 use runite::time::sleep;

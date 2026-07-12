@@ -11,8 +11,9 @@ use crate::{EffectHandle, Reactor, current};
 /// state (or write signals) without subscribing to it. The source value is equality-gated —
 /// writes that leave it unchanged do not invoke the handler.
 ///
-/// The handler receives the new value and the previous one (`None` on the first, immediate
-/// invocation).
+/// The handler receives the new value and the previous one (`None` on the first invocation).
+/// Like [`crate::effect`], the first invocation does not run inline with `watch`: it is
+/// flushed on the runtime's microtask queue, as is every subsequent invocation.
 ///
 /// # Examples
 ///

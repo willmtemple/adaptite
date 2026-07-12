@@ -13,7 +13,7 @@ use crate::{NodeId, Reactor, current, trace_targets};
 /// let value = signal(10);
 /// assert_eq!(value.get(), 10);
 ///
-/// // Equal writes are suppressed and do not notify dependents.
+/// // Equal writes are suppressed and do not mark dependents stale.
 /// assert_eq!(value.set(10), None);
 /// assert_eq!(value.set(11), Some(10));
 ///
@@ -35,13 +35,15 @@ pub fn signal_in<T: 'static>(reactor: &Reactor, initial: T) -> Signal<T> {
 /// Mutable source node in the reactive graph.
 ///
 /// Reading a signal from inside an observer (an effect, thunk, or memo computation) records a
-/// dependency; writing to it invalidates those observers. Clones share the same underlying
+/// dependency; writing to it marks those observers stale — thunks and memos recompute on their
+/// next read, and effects are queued for the next microtask flush. Clones share the same underlying
 /// node, so a signal can be captured by any number of closures. The node lives as long as any
 /// clone does.
 ///
 /// Writes through [`set`](Signal::set) are suppressed when the new value equals the old one,
 /// which is what allows convergent feedback (e.g. an effect clamping a value it reads) to
-/// settle. [`replace`](Signal::replace) and [`update`](Signal::update) always notify.
+/// settle. [`replace`](Signal::replace) and [`update`](Signal::update) always mark dependents
+/// stale.
 pub struct Signal<T> {
     inner: Rc<SignalInner<T>>,
 }
@@ -82,7 +84,13 @@ impl<T: 'static> Signal<T> {
         }
     }
 
-    /// Runs `f` with a shared reference to the current value.
+    /// Runs `f` with a shared reference to the current value, recording a dependency for the
+    /// currently running observer.
+    ///
+    /// # Panics
+    ///
+    /// A shared borrow is held while `f` runs: writing this same signal (`set`, `replace`, or
+    /// `update`) from inside `f` panics with a borrow error.
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         #[cfg(debug_assertions)]
         tracing::trace!(
@@ -121,8 +129,9 @@ impl<T: 'static> Signal<T> {
     ///
     /// # Panics
     ///
-    /// `f` runs while the value is mutably borrowed: calling `get`, `with`, `peek`, or `set`
-    /// on the *same* signal from inside `f` panics with a borrow error.
+    /// `f` runs while the value is mutably borrowed: any read or write of the *same* signal
+    /// from inside `f` (`get`, `with`, `peek`, `set`, `replace`, or a nested `update`) panics
+    /// with a borrow error.
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let output = {
             let mut value = self.inner.value.borrow_mut();
@@ -156,6 +165,9 @@ impl<T: PartialEq + 'static> Signal<T> {
     ///
     /// Returns the previous value if the signal changed, or `None` when the new value was equal to
     /// the old one.
+    ///
+    /// The equality check runs untracked, so a `PartialEq` implementation that reads reactive
+    /// state records no dependencies for the currently running observer.
     pub fn set(&self, value: T) -> Option<T> {
         // Compare under a shared borrow, without tracking: a `PartialEq` impl that reads
         // reactive state must neither conflict with this signal's own borrow nor record

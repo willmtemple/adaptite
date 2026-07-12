@@ -97,10 +97,17 @@ pub fn memo_in<T: PartialEq + 'static>(
 /// Like [`memo`], but "unchanged" is decided by the `equals` closure instead of `PartialEq` —
 /// useful for coarser notions of change than value equality.
 ///
+/// `equals` receives the previous and the new value, in that order, and returns `true` when
+/// downstream observers should treat the result as unchanged. It always runs untracked:
+/// reactive reads made by the comparator never become dependencies of the running observer.
+///
 /// # Examples
 ///
 /// ```rust
-/// use adaptite::{memo_by, signal};
+/// use std::cell::Cell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{memo_by, signal, thunk};
 ///
 /// let price = signal(104u32);
 /// // Downstream observers only care which $10 bucket the price is in.
@@ -112,10 +119,25 @@ pub fn memo_in<T: PartialEq + 'static>(
 ///     },
 /// );
 ///
-/// assert_eq!(bucket.get(), 104);
-/// price.set(109); // same bucket: dependents of `bucket` are not invalidated
-/// price.set(112); // new bucket: they are
-/// assert_eq!(bucket.get(), 112);
+/// let label_computes = Rc::new(Cell::new(0));
+/// let label = thunk({
+///     let bucket = bucket.clone();
+///     let label_computes = Rc::clone(&label_computes);
+///     move || {
+///         label_computes.set(label_computes.get() + 1);
+///         format!("${} range", bucket.get() / 10 * 10)
+///     }
+/// });
+///
+/// assert_eq!(label.get(), "$100 range");
+///
+/// price.set(109); // same bucket: the downstream thunk's cache stays valid
+/// assert_eq!(label.get(), "$100 range");
+/// assert_eq!(label_computes.get(), 1);
+///
+/// price.set(112); // new bucket
+/// assert_eq!(label.get(), "$110 range");
+/// assert_eq!(label_computes.get(), 2);
 /// ```
 #[track_caller]
 pub fn memo_by<T: 'static>(
@@ -183,6 +205,9 @@ pub fn memo_with_prev_in<T: PartialEq + 'static>(
 
 /// Creates a comparator-aware memo whose compute closure receives the memo's previous value, in
 /// the current thread's default reactor.
+///
+/// The previous value is `None` on the first computation; "unchanged" is decided by the
+/// `equals` closure as in [`memo_by`].
 #[track_caller]
 pub fn memo_by_with_prev<T: 'static>(
     equals: impl Fn(&T, &T) -> bool + 'static,
@@ -211,10 +236,13 @@ pub fn memo_by_with_prev_in<T: 'static>(
 ///
 /// Clones share the same underlying node.
 ///
+/// If the compute closure panics, the panic propagates to the reader and the node stays
+/// dirty, so the next read retries the computation.
+///
 /// # Panics
 ///
 /// Reading a thunk whose computation (transitively) reads itself panics with a
-/// [`crate::ReactCycleError`] describing the cycle path.
+/// [`crate::ReactCycleError`] message describing the cycle path.
 pub struct Thunk<T> {
     inner: Rc<ThunkInner<T>>,
 }
@@ -236,11 +264,14 @@ impl<T> Clone for Thunk<T> {
 ///
 /// Clones share the same underlying node.
 ///
+/// If the compute closure panics, the panic propagates to the reader and the node stays
+/// dirty, so the next read retries the computation.
+///
 /// # Panics
 ///
 /// Reading a memo whose computation (transitively) reads itself panics with a
-/// [`crate::ReactCycleError`]. To fold the memo's own previous value into the next one, use
-/// [`memo_with_prev`].
+/// [`crate::ReactCycleError`] message describing the cycle path. To fold the memo's own
+/// previous value into the next one, use [`memo_with_prev`].
 pub struct Memo<T> {
     inner: Rc<MemoInner<T>>,
 }

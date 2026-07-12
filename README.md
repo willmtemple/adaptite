@@ -5,8 +5,8 @@ Fine-grained reactivity for [runite](https://github.com/willmtemple/runite) prog
 Adaptite provides reactivity primitives for dependency tracking and incremental
 computation. Those primitives are:
 
-- `Signal<T>`: a tracked-state value cell, primitively observable (the same
-  concept is called a "signal" in most other reactor implementations).
+- `Signal<T>`: a tracked-state value cell, primitively observable — the
+  "signal" familiar from other fine-grained reactivity libraries.
 - `effect`: a primitive observer that runs once, observes its dependencies, and
   runs again whenever its dependencies change.
 - `Thunk<T>`: a tracked-state recomputable value defined by a closure,
@@ -14,8 +14,10 @@ computation. Those primitives are:
   observer and an observable.
 - `Memo<T>`: a `Thunk` with an equality (or custom comparator) gate — if a
   recomputation produces an equal value, downstream observers do not re-run.
-- `Event<T>`: a push-style source of events of type `T`. Supports subscription
-  and cancellation of interest in events.
+- `Event<T>`: a push-style source of events of type `T`. Immediate subscribers
+  (`subscribe`) run inline with `emit`; draining subscriptions (`on`) queue
+  values and deliver them in order on the microtask flush. Subscriptions
+  cancel on drop.
 - `Resource<T>`: reactive async state — a value fetched by a future,
   re-fetched (with stale fetches aborted) whenever its tracked inputs change.
 - `watch`: an explicitly-scoped observer — only its source closure is tracked,
@@ -30,8 +32,11 @@ computation. Those primitives are:
   structures with sub-container granularity (per-key, per-field), including
   `is_observed` for garbage-collecting dependency units nobody reads.
 
-Adaptite requires the runite runtime to function, and cannot be used on
-threads not managed by the runite runtime.
+Adaptite is built for the runite runtime: effects, draining subscriptions,
+and resources are flushed or spawned on runite's queues, so anything that
+schedules work must run on a runtime-managed thread. (Pure signal, thunk, and
+memo graphs can be read and written without a runtime; nothing that *reacts*
+can.)
 
 Adaptite does not function across thread boundaries. It tracks dependencies
 between entities on the same thread only. Async work feeds the graph from the
@@ -243,12 +248,16 @@ fn main() {
 }
 ```
 
+More complete demonstrations live in [`examples/`](./examples): a
+dependency-switching spreadsheet, a streaming stock ticker with running
+statistics and threshold alerts, and an ownership-based screen router.
+
 ## Tracing
 
 Adaptite emits [`tracing`](https://docs.rs/tracing) diagnostics under the
 targets `adaptite::graph`, `adaptite::signal`, `adaptite::thunk`,
-`adaptite::memo`, `adaptite::effect`, `adaptite::event`, and
-`adaptite::scope`. See `examples/tracing_subscriber_showcase.rs` for a
+`adaptite::memo`, `adaptite::effect`, `adaptite::event`, `adaptite::scope`,
+and `adaptite::resource`. See `examples/tracing_subscriber_showcase.rs` for a
 suggested subscriber setup.
 
 ## License

@@ -18,6 +18,24 @@ const MAX_RUNS_PER_FLUSH: u32 = 100;
 /// the runtime's microtask queue, so consecutive writes within one task coalesce into a single
 /// run.
 ///
+/// A queued run first verifies its inputs: when only equality-suppressed memo updates
+/// occurred upstream, the run is skipped without executing the body. If an upstream
+/// computation panics during that verification, the panic propagates out of the flush and the
+/// effect re-marks itself dirty and re-queues, so it recovers once the underlying cause is
+/// fixed.
+///
+/// Each run is an ownership scope: [`crate::on_cleanup`] callbacks and nested effects
+/// registered during a run are disposed before the next run, and again when the effect itself
+/// is disposed.
+///
+/// # Panics
+///
+/// Debug builds panic when the effect runs more than 100 times within a single flush, which
+/// indicates a divergent feedback loop: the effect writes state it (transitively) depends on
+/// with a value that never converges. The panic message names the effect's creation site.
+/// Convergent feedback (for example clamping, where the rewritten value is suppressed by the
+/// signal's equality check) is legal and settles well below the limit.
+///
 /// # Examples
 ///
 /// ```rust
@@ -117,15 +135,48 @@ impl EffectHandle {
         Self { inner }
     }
 
-    /// Consumes the effect and leaks it, allowing it to run for the remainder of the program without automatically
-    /// disposing when dropped. Use this for effects that you want to run for the lifetime of the program. You CANNOT
-    /// recover an EffectHandle after calling this method, so be sure to call it on an EffectHandle that you don't need
-    /// to later dispose of.
+    /// Consumes the handle without disposing the effect, letting the effect run for the
+    /// remainder of the program.
+    ///
+    /// This forfeits only the handle's lifetime management: an effect created inside an owner
+    /// (another effect's run or a [`crate::scope`]) is still disposed with that owner. The
+    /// handle cannot be recovered afterwards, so only leak effects you will never need to
+    /// dispose explicitly.
     pub fn leak(self) {
         core::mem::forget(self);
     }
 
-    /// Disposes the effect immediately.
+    /// Disposes the effect immediately: runs cleanups registered during its last run, disposes
+    /// nested effects and scopes it owns, and unhooks it from the graph. A run already queued
+    /// for the next flush is skipped. Disposing an already-disposed effect is a no-op.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    ///
+    /// use adaptite::{Reactor, signal_in};
+    ///
+    /// let reactor = Reactor::new();
+    /// let value = signal_in(&reactor, 1);
+    /// let seen = Rc::new(RefCell::new(Vec::new()));
+    ///
+    /// let effect = reactor.effect({
+    ///     let value = value.clone();
+    ///     let seen = Rc::clone(&seen);
+    ///     move || seen.borrow_mut().push(value.get())
+    /// });
+    /// reactor.flush_now();
+    /// assert_eq!(*seen.borrow(), [1]);
+    ///
+    /// effect.dispose();
+    /// assert!(effect.is_disposed());
+    ///
+    /// value.set(2); // no longer observed: nothing is queued
+    /// reactor.flush_now();
+    /// assert_eq!(*seen.borrow(), [1]);
+    /// ```
     pub fn dispose(&self) {
         self.inner.dispose();
     }

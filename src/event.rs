@@ -126,6 +126,40 @@ impl<T> Clone for Event<T> {
 /// of the program without retaining the handle. A subscription created inside an owner (an
 /// effect's run, or a [`crate::scope`]) is kept alive by that owner instead and is cancelled
 /// with it — the same ownership rule as [`crate::EffectHandle`].
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{event, on, scope};
+/// use runite::{queue_macrotask, run};
+///
+/// let seen = Rc::new(RefCell::new(Vec::new()));
+///
+/// queue_macrotask({
+///     let seen = Rc::clone(&seen);
+///     move || {
+///         let messages = event::<u32>();
+///         let (handle, subscription) = scope({
+///             let messages = messages.clone();
+///             let seen = Rc::clone(&seen);
+///             move || on(&messages, move |message| seen.borrow_mut().push(*message))
+///         });
+///
+///         messages.emit(1);
+///         runite::queue_macrotask(move || {
+///             handle.dispose();
+///             assert!(!subscription.is_active(), "cancelled by its owner");
+///             messages.emit(2); // no longer delivered
+///         });
+///     }
+/// });
+/// run();
+///
+/// assert_eq!(*seen.borrow(), [1]);
+/// ```
 #[derive(Clone)]
 #[must_use = "an unowned subscription is cancelled when its handle is dropped; hold the handle, leak it, or subscribe inside a scope"]
 pub struct Subscription {
@@ -169,9 +203,14 @@ impl Reactor {
                     drained = drained.len(),
                     "draining queued event values reactively"
                 );
-                for value in &drained {
-                    handler(value);
-                }
+                // The handler is not a reactive observer: suspend tracking so its reads never
+                // become dependencies of the draining effect (matching `watch` handlers and
+                // immediate `emit` subscribers).
+                crate::untrack(|| {
+                    for value in &drained {
+                        handler(value);
+                    }
+                });
             }
         });
 
@@ -214,6 +253,11 @@ impl<T: 'static> Event<T> {
     }
 
     /// Emits a value to immediate subscribers, then notifies reactive dependents.
+    ///
+    /// Subscribers run untracked: their reads never become dependencies of whatever observer
+    /// is emitting. The subscriber list is snapshotted when `emit` begins, so a handler that
+    /// unsubscribes (or a subscriber added) during delivery takes effect from the next emit —
+    /// the current emit still reaches the original set.
     pub fn emit(&self, value: T) {
         let subscribers = self
             .inner
@@ -416,6 +460,48 @@ mod tests {
 
         run();
         assert_eq!(&*reactive.borrow(), &[1, 2]);
+    }
+
+    #[test]
+    fn on_handlers_run_untracked() {
+        let drains = Rc::new(RefCell::new(0usize));
+
+        queue_macrotask({
+            let drains = Rc::clone(&drains);
+            move || {
+                let reactor = Reactor::new();
+                let event = event_in::<usize>(&reactor);
+                let unrelated = crate::signal_in(&reactor, 0usize);
+
+                let subscription = on_in(&reactor, &event, {
+                    let drains = Rc::clone(&drains);
+                    let unrelated = unrelated.clone();
+                    move |_value| {
+                        // The handler reads a signal it must not subscribe to.
+                        let _ = unrelated.get();
+                        *drains.borrow_mut() += 1;
+                    }
+                });
+
+                event.emit(1);
+                reactor.flush_now();
+                assert_eq!(*drains.borrow(), 1);
+
+                // If the handler's read had been tracked, this write would re-run the draining
+                // effect (delivering nothing, but observable via graph churn on later emits).
+                unrelated.set(99);
+                reactor.flush_now();
+                assert_eq!(*drains.borrow(), 1, "handler reads must not be tracked");
+
+                event.emit(2);
+                reactor.flush_now();
+                assert_eq!(*drains.borrow(), 2);
+
+                subscription.leak();
+            }
+        });
+
+        run();
     }
 
     #[test]

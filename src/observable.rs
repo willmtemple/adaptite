@@ -185,6 +185,11 @@ impl<T: 'static> DynObservable<T> {
 impl<T: 'static> Observable for DynObservable<T> {
     type Item = T;
 
+    // Already erased: avoid wrapping a second Rc around the handle.
+    fn into_dyn(self) -> DynObservable<T> {
+        self
+    }
+
     fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let mut f = Some(f);
         let mut output = None;

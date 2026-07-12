@@ -1,3 +1,18 @@
+//! A guided tour of lazy, glitch-free propagation through two signals and two chained thunks:
+//!
+//! - **Reads compute; writes only mark.** Thunks recompute during `get()`, never during
+//!   `set()`.
+//! - **Caches hold until a dependency changes.** Re-reading an up-to-date summary runs
+//!   nothing.
+//! - **Equal `set` calls are suppressed**, while `replace`/`update` always propagate.
+//! - **Verification refreshes upstream first.** After a name change, the greeting thunk
+//!   recomputes while `summary` is checking its dependencies, before `summary` does.
+//!
+//! Each log line pairs the order it actually ran in (`actual`) with the order predicted in
+//! the source (`expected`); the columns always agree.
+//!
+//! Run with `cargo run --example signal_thunk_showcase`.
+
 use adaptite::{signal, thunk};
 use std::cell::Cell as Counter;
 use std::fmt;

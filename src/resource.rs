@@ -44,15 +44,18 @@ where
 ///
 /// - `source` runs **tracked** and produces the fetch input. Whenever the input actually
 ///   changes (it is equality-gated like a memo), a new fetch starts.
-/// - `fetch` receives the input and returns a future, which is spawned on the runite runtime.
-///   When it completes, the resource's value updates and dependents re-run.
+/// - `fetch` receives the input and returns a future, which is spawned on the runite runtime
+///   as a task local to the current thread (it need not be `Send`); a runite runtime must be
+///   driving this thread for fetches to make progress. When the future completes, the
+///   resource's value updates and dependents re-run.
 /// - A fetch that is superseded (its input changed again) or whose resource is disposed is
 ///   **aborted**, and a late completion from a stale fetch can never overwrite a newer value.
 ///
 /// The value is `None` until the first fetch completes; [`loading`](Resource::loading) is
 /// `true` while a fetch is in flight (the previous value is retained during a refetch, so UIs
-/// can render stale data with a spinner). Errors are not given special treatment: make `T` a
-/// `Result` if the fetch can fail.
+/// can render stale data with a spinner). The first fetch does not start inline with the
+/// constructor: it begins when the driving effect first runs, on the next microtask flush.
+/// Errors are not given special treatment: make `T` a `Result` if the fetch can fail.
 ///
 /// A resource created inside an owner (an effect run or [`crate::scope`]) is disposed with it,
 /// cancelling any in-flight fetch. Otherwise it stops fetching when its last handle is dropped.
@@ -189,9 +192,15 @@ impl Reactor {
                     });
 
                     // Cancel this fetch when the effect re-runs (a newer fetch supersedes it)
-                    // or when the resource's owner is disposed.
+                    // or when the resource's owner is disposed. Clear `loading` too: an aborted
+                    // fetch never reports completion, and on supersession the next run re-sets
+                    // it before anything can observe the gap.
                     let abort = handle.abort_handle();
-                    crate::on_cleanup(move || abort.abort());
+                    let loading = loading.clone();
+                    crate::on_cleanup(move || {
+                        abort.abort();
+                        let _ = loading.set(false);
+                    });
                 });
             }
         });
@@ -218,11 +227,60 @@ impl<T: 'static> Resource<T> {
     }
 
     /// Returns `true` while a fetch is in flight, recording a dependency.
+    ///
+    /// `loading` is tracked separately from the value: an observer that reads only `loading`
+    /// re-runs on loading transitions, not when the value updates (and vice versa). It is
+    /// `false` until the first fetch starts (on the first microtask flush after creation), and
+    /// it is cleared when the resource's owner disposes an in-flight fetch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    ///
+    /// use adaptite::{effect, resource, signal};
+    /// use runite::{queue_macrotask, run};
+    ///
+    /// let frames = Rc::new(RefCell::new(Vec::new()));
+    ///
+    /// queue_macrotask({
+    ///     let frames = Rc::clone(&frames);
+    ///     move || {
+    ///         let query = signal("adaptite");
+    ///         let results = resource(
+    ///             {
+    ///                 let query = query.clone();
+    ///                 move || query.get()
+    ///             },
+    ///             |q| async move { format!("results for {q}") },
+    ///         );
+    ///
+    ///         effect({
+    ///             let results = results.clone();
+    ///             let frames = Rc::clone(&frames);
+    ///             move || frames.borrow_mut().push((results.get(), results.loading()))
+    ///         })
+    ///         .leak();
+    ///     }
+    /// });
+    /// run();
+    ///
+    /// assert_eq!(
+    ///     *frames.borrow(),
+    ///     [
+    ///         (None, true), // fetch in flight: render a spinner
+    ///         (Some(String::from("results for adaptite")), false),
+    ///     ]
+    /// );
+    /// ```
     pub fn loading(&self) -> bool {
         self.loading.get()
     }
 
     /// Starts a new fetch with the current input, even though the input has not changed.
+    ///
+    /// Has no effect once the resource has been disposed.
     pub fn refetch(&self) {
         self.refetch_tick
             .update(|tick| *tick = tick.wrapping_add(1));
@@ -402,9 +460,14 @@ mod tests {
 
                 std::mem::drop(runite::spawn(async move {
                     sleep(Duration::from_millis(10)).await;
+                    assert!(fetched.loading(), "the fetch should be in flight");
                     handle.dispose();
                     sleep(Duration::from_millis(60)).await;
                     assert_eq!(fetched.peek(), None, "aborted fetch must not publish");
+                    assert!(
+                        !fetched.loading(),
+                        "loading must clear when the owner disposes the in-flight fetch"
+                    );
                 }));
             }
         });
