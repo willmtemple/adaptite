@@ -28,6 +28,22 @@ Initial release.
   draining subscriptions (`on`); subscriptions cancel on drop.
 - `Source` low-level observable nodes for custom reactive data structures.
 - `untrack` for dependency-free reads.
+- `Observable` trait unifying reads across `Signal`/`Thunk`/`Memo`/`Resource`,
+  with `DynObservable<T>` for type-erased reactive handles (including
+  `DynObservable::constant`).
+- `Resource<T>`: reactive async state fetched by a future, equality-gated
+  refetch on input change, explicit `refetch()`, a tracked `loading` flag, and
+  abort-on-supersede/dispose with stale-completion protection.
+- `watch(source, handler)`: explicitly-scoped observation — the source closure
+  is tracked and equality-gated; the handler runs untracked with new and
+  previous values.
+- `owner()` / `Owner::run_in` / `ScopeHandle::owner`: capture the current
+  reactive owner and re-enter it after async suspension, so late-created
+  effects are still disposed with their scope.
+- `Reactor::is_observed` / `Source::is_observed` for garbage-collecting
+  per-key dependency units in fine-grained data structures.
+- Handle types (`Signal`, `Thunk`, `Memo`, `Event`) are cloneable without
+  requiring `T: Clone`.
 - Diagnostics: reactive cycle errors report the cycle path with each node's
   creation site; debug builds panic (instead of hanging) on divergent effect
   feedback loops and detect cross-reactor reads.

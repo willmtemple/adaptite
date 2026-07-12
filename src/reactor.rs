@@ -471,6 +471,20 @@ impl Reactor {
         false
     }
 
+    /// Returns `true` if any live observer currently records a dependency on `node`.
+    ///
+    /// This reflects the edges recorded by each observer's most recent run: an observer that
+    /// stopped reading `node` still counts until it next re-runs (or is disposed). The primary
+    /// use is garbage collection in fine-grained data structures — dropping per-key
+    /// [`crate::Source`] nodes that no longer have readers.
+    pub fn is_observed(&self, node: NodeId) -> bool {
+        self.inner
+            .dependents
+            .borrow()
+            .get(&node)
+            .is_some_and(|observers| !observers.is_empty())
+    }
+
     /// Disposes all graph bookkeeping for `node`.
     pub fn dispose(&self, node: NodeId) {
         tracing::debug!(

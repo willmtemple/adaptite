@@ -146,6 +146,68 @@ pub(crate) fn adopt_into_current(child: Rc<dyn OwnedDisposable>) -> bool {
     }
 }
 
+/// A non-owning handle to a reactive owner (an effect or scope), used to re-enter it later.
+///
+/// Ownership is established by *where code runs*: an effect or subscription is adopted by the
+/// owner active at its creation. Async work breaks that link — after an `.await`, the original
+/// owner is no longer on the stack, so anything created there would be unowned and would
+/// outlive the screen or component that spawned it. Capture an `Owner` before suspending and
+/// use [`run_in`](Owner::run_in) to re-attach later work:
+///
+/// ```rust,no_run
+/// use adaptite::{effect, owner, signal};
+///
+/// let data = signal(0);
+/// let scope_owner = owner().expect("called inside an effect or scope");
+/// runite::spawn(async move {
+///     let response = 42; // ... await a fetch ...
+///     scope_owner.run_in(|| {
+///         // Owned by the original scope: disposed when it is.
+///         let _ = effect({
+///             let data = data.clone();
+///             move || println!("{} (fetched {response})", data.get())
+///         });
+///     });
+/// });
+/// ```
+///
+/// Unlike [`ScopeHandle`], dropping an `Owner` does **not** dispose anything: it is a
+/// re-entry token, not a lifetime manager. If the owner has already been disposed when
+/// [`run_in`](Owner::run_in) executes, children created inside are disposed immediately and
+/// cleanups run immediately.
+#[derive(Clone)]
+pub struct Owner {
+    frame: Rc<OwnerFrame>,
+}
+
+impl Owner {
+    /// Runs `f` with this owner as the innermost reactive owner on the current thread.
+    pub fn run_in<T>(&self, f: impl FnOnce() -> T) -> T {
+        with_owner(&self.frame, f)
+    }
+
+    /// Returns `true` if the underlying owner has been disposed.
+    pub fn is_disposed(&self) -> bool {
+        self.frame.is_disposed()
+    }
+}
+
+impl core::fmt::Debug for Owner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Owner")
+            .field("disposed", &self.frame.is_disposed())
+            .finish()
+    }
+}
+
+/// Captures the innermost reactive owner (the currently running effect, or the scope currently
+/// being constructed) for later re-entry, or `None` when no owner is active.
+///
+/// See [`Owner`] for the async re-attachment pattern this enables.
+pub fn owner() -> Option<Owner> {
+    current_owner().map(|frame| Owner { frame })
+}
+
 /// Registers `cleanup` against the innermost reactive owner (the currently running effect, or
 /// the scope currently being constructed).
 ///
@@ -264,6 +326,14 @@ impl ScopeHandle {
     /// program. You CANNOT recover a `ScopeHandle` after calling this method.
     pub fn leak(self) {
         core::mem::forget(self);
+    }
+
+    /// Returns a non-owning [`Owner`] for this scope, for re-entering it later (for example
+    /// from async work). Dropping the returned owner does not dispose the scope.
+    pub fn owner(&self) -> Owner {
+        Owner {
+            frame: Rc::clone(&self.inner.frame),
+        }
     }
 }
 
@@ -473,6 +543,140 @@ mod tests {
         assert!(
             ran.get(),
             "cleanups registered before the panic must still run"
+        );
+    }
+
+    #[test]
+    fn problem_effects_created_after_an_await_escape_their_scope() {
+        // Validates the problem Owner exists to solve: ownership is established by the owner
+        // stack at creation time, so an effect created in a spawned task -- after the scope
+        // closure has returned -- is NOT owned by the scope, and disposing the scope does not
+        // stop it. (See `owner_run_in_reattaches_async_work_to_its_scope` for the fix.)
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            move || {
+                let reactor = Reactor::new();
+                let data = signal_in(&reactor, 0usize);
+
+                let (handle, ()) = scope({
+                    let reactor = reactor.clone();
+                    let data = data.clone();
+                    let seen = Rc::clone(&seen);
+                    move || {
+                        std::mem::drop(runite::spawn(async move {
+                            runite::yield_now().await;
+                            // The scope closure returned long ago: this effect is unowned.
+                            crate::effect_in(&reactor, {
+                                let data = data.clone();
+                                let seen = Rc::clone(&seen);
+                                move || seen.borrow_mut().push(data.get())
+                            })
+                            .leak();
+                        }));
+                    }
+                });
+
+                runite::queue_macrotask({
+                    let data = data.clone();
+                    move || {
+                        handle.dispose();
+                        // The scope is gone, but the escaped effect still reacts.
+                        data.set(1);
+                    }
+                });
+            }
+        });
+
+        run();
+        assert_eq!(
+            &*seen.borrow(),
+            &[0, 1],
+            "without owner capture, the effect escapes its scope (this documents the problem)"
+        );
+    }
+
+    #[test]
+    fn owner_run_in_reattaches_async_work_to_its_scope() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            move || {
+                let reactor = Reactor::new();
+                let data = signal_in(&reactor, 0usize);
+
+                let (handle, ()) = scope({
+                    let reactor = reactor.clone();
+                    let data = data.clone();
+                    let seen = Rc::clone(&seen);
+                    move || {
+                        // Capture the owner before suspending...
+                        let scope_owner = super::owner().expect("scope should be the owner");
+                        std::mem::drop(runite::spawn(async move {
+                            runite::yield_now().await;
+                            // ...and re-enter it after the await: the effect is owned again.
+                            scope_owner.run_in(|| {
+                                let _ = crate::effect_in(&reactor, {
+                                    let data = data.clone();
+                                    let seen = Rc::clone(&seen);
+                                    move || seen.borrow_mut().push(data.get())
+                                });
+                            });
+                        }));
+                    }
+                });
+
+                runite::queue_macrotask({
+                    let data = data.clone();
+                    move || {
+                        handle.dispose();
+                        // Disposed with the scope: this write must not be observed.
+                        data.set(1);
+                    }
+                });
+            }
+        });
+
+        run();
+        assert_eq!(
+            &*seen.borrow(),
+            &[0],
+            "the re-attached effect must be disposed with its scope"
+        );
+    }
+
+    #[test]
+    fn run_in_on_a_disposed_owner_disposes_children_immediately() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            move || {
+                let reactor = Reactor::new();
+                let data = signal_in(&reactor, 0usize);
+
+                let (handle, ()) = scope(|| {});
+                let scope_owner = handle.owner();
+                handle.dispose();
+                assert!(scope_owner.is_disposed());
+
+                scope_owner.run_in(|| {
+                    let _ = crate::effect_in(&reactor, {
+                        let data = data.clone();
+                        let seen = Rc::clone(&seen);
+                        move || seen.borrow_mut().push(data.get())
+                    });
+                });
+                reactor.flush_now();
+            }
+        });
+
+        run();
+        assert!(
+            seen.borrow().is_empty(),
+            "children created under a disposed owner must never run"
         );
     }
 

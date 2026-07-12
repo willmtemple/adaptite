@@ -42,9 +42,17 @@ pub fn signal_in<T: 'static>(reactor: &Reactor, initial: T) -> Signal<T> {
 /// Writes through [`set`](Signal::set) are suppressed when the new value equals the old one,
 /// which is what allows convergent feedback (e.g. an effect clamping a value it reads) to
 /// settle. [`replace`](Signal::replace) and [`update`](Signal::update) always notify.
-#[derive(Clone)]
 pub struct Signal<T> {
     inner: Rc<SignalInner<T>>,
+}
+
+// Manual impl: cloning the handle shares the node and must not require `T: Clone`.
+impl<T> Clone for Signal<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
 }
 
 impl Reactor {

@@ -91,6 +91,14 @@ impl Source {
     pub fn id(&self) -> NodeId {
         self.inner.id
     }
+
+    /// Returns `true` if any live observer currently records a dependency on this source.
+    ///
+    /// See [`Reactor::is_observed`] for the exact semantics. Fine-grained data structures use
+    /// this to garbage-collect per-key sources nobody reads anymore.
+    pub fn is_observed(&self) -> bool {
+        self.inner.reactor.is_observed(self.inner.id)
+    }
 }
 
 impl core::fmt::Debug for Source {

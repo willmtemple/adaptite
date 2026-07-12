@@ -106,9 +106,17 @@ pub fn on_in<T: Clone + 'static>(
 /// clicks.emit(3);
 /// assert_eq!(*seen.borrow(), [1, 2]);
 /// ```
-#[derive(Clone)]
 pub struct Event<T> {
     inner: Rc<EventInner<T>>,
+}
+
+// Manual impl: cloning the handle shares the node and must not require `T: Clone`.
+impl<T> Clone for Event<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
 }
 
 /// Disposable subscription handle.

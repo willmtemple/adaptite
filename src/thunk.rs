@@ -215,9 +215,17 @@ pub fn memo_by_with_prev_in<T: 'static>(
 ///
 /// Reading a thunk whose computation (transitively) reads itself panics with a
 /// [`crate::ReactCycleError`] describing the cycle path.
-#[derive(Clone)]
 pub struct Thunk<T> {
     inner: Rc<ThunkInner<T>>,
+}
+
+// Manual impl: cloning the handle shares the node and must not require `T: Clone`.
+impl<T> Clone for Thunk<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
 }
 
 /// Equality/comparator-aware computed node.
@@ -233,9 +241,17 @@ pub struct Thunk<T> {
 /// Reading a memo whose computation (transitively) reads itself panics with a
 /// [`crate::ReactCycleError`]. To fold the memo's own previous value into the next one, use
 /// [`memo_with_prev`].
-#[derive(Clone)]
 pub struct Memo<T> {
     inner: Rc<MemoInner<T>>,
+}
+
+// Manual impl: cloning the handle shares the node and must not require `T: Clone`.
+impl<T> Clone for Memo<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
 }
 
 impl Reactor {

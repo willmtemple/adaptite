@@ -16,10 +16,19 @@ computation. Those primitives are:
   recomputation produces an equal value, downstream observers do not re-run.
 - `Event<T>`: a push-style source of events of type `T`. Supports subscription
   and cancellation of interest in events.
-- `scope`/`on_cleanup`: ownership for reactive subgraphs — dispose a whole tree
-  of effects at once, and register teardown that runs before an effect re-runs.
+- `Resource<T>`: reactive async state — a value fetched by a future,
+  re-fetched (with stale fetches aborted) whenever its tracked inputs change.
+- `watch`: an explicitly-scoped observer — only its source closure is tracked,
+  and its handler runs untracked with the new and previous values.
+- `scope`/`on_cleanup`/`owner`: ownership for reactive subgraphs — dispose a
+  whole tree of effects at once, register teardown that runs before an effect
+  re-runs, and re-attach async work to its owner after an `.await`.
+- `Observable`: the common trait over everything readable (`Signal`, `Thunk`,
+  `Memo`, `Resource`), with `DynObservable<T>` for type-erased handles in
+  component APIs.
 - `Source`: a low-level observable node for building custom reactive data
-  structures.
+  structures with sub-container granularity (per-key, per-field), including
+  `is_observed` for garbage-collecting dependency units nobody reads.
 
 Adaptite requires the runite runtime to function, and cannot be used on
 threads not managed by the runite runtime.
@@ -77,6 +86,21 @@ teardown against the innermost owner; it runs before the owning effect's next
 run and on disposal. Top-level effects are owned by their `EffectHandle` —
 dropping the last handle disposes the effect, and `leak()` opts out.
 `Subscription` handles follow the same rules.
+
+Ownership is established by where code *runs*, which async work escapes: after
+an `.await`, the original owner is no longer on the stack. Capture it first
+with `owner()` and re-enter with `Owner::run_in` so effects created after the
+suspension are still disposed with their scope.
+
+### Async data
+
+`resource(source, fetch)` connects the graph to runite's async side: `source`
+runs tracked and produces the fetch input; `fetch` returns a future that is
+spawned on the runtime. When the input changes (equality-gated) or `refetch()`
+is called, a new fetch starts and the superseded one is aborted; a stale
+completion can never overwrite a newer value. The resource exposes the latest
+value (`None` until first completion) and a separately-tracked `loading` flag,
+so a UI can render stale data with a spinner during refetch.
 
 ### Untracked reads
 
