@@ -32,7 +32,7 @@ pub use id::NodeId;
 pub use observable::{DynObservable, Observable};
 pub use reactor::{ReactCycleError, Reactor, current, untrack};
 pub use resource::{Resource, resource, resource_in};
-pub use scope::{Owner, ScopeHandle, on_cleanup, owner, scope};
+pub use scope::{Owner, ScopeHandle, on_cleanup, owner, scope, unowned};
 pub use signal::{Signal, signal, signal_in};
 pub use source::{Source, source, source_in};
 pub use thunk::{

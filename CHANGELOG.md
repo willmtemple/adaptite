@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-17
+
+### Added
+
+- `unowned(|| ...)`: runs a closure with no current reactive owner. Effects,
+  scopes, and subscriptions created inside are not adopted by an enclosing
+  effect or scope — they are kept alive by their handles and disposed when the
+  last handle drops. Lets facades and background work opt out of adoption
+  without creating a root scope.
+
 ## [0.1.0] - 2026-07-13
 
 Initial release.
@@ -53,5 +63,6 @@ Initial release.
   creation site; debug builds panic (instead of hanging) on divergent effect
   feedback loops and detect cross-reactor reads.
 
-[Unreleased]: https://github.com/willmtemple/adaptite/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/willmtemple/adaptite/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/willmtemple/adaptite/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/willmtemple/adaptite/releases/tag/v0.1.0
