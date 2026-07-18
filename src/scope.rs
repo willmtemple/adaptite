@@ -6,7 +6,9 @@ use core::cell::{Cell, RefCell};
 use crate::trace_targets;
 
 thread_local! {
-    static OWNER_STACK: RefCell<Vec<Rc<OwnerFrame>>> = const { RefCell::new(Vec::new()) };
+    /// `None` entries are barriers pushed by [`unowned`]: they shadow any enclosing owner
+    /// without establishing a new one.
+    static OWNER_STACK: RefCell<Vec<Option<Rc<OwnerFrame>>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A reactive resource that an owner can dispose when it is itself disposed or re-run.
@@ -113,7 +115,11 @@ impl Drop for OwnerFrame {
 
 /// Runs `f` with `frame` as the innermost reactive owner on this thread.
 pub(crate) fn with_owner<T>(frame: &Rc<OwnerFrame>, f: impl FnOnce() -> T) -> T {
-    OWNER_STACK.with(|stack| stack.borrow_mut().push(Rc::clone(frame)));
+    with_owner_entry(Some(Rc::clone(frame)), f)
+}
+
+fn with_owner_entry<T>(entry: Option<Rc<OwnerFrame>>, f: impl FnOnce() -> T) -> T {
+    OWNER_STACK.with(|stack| stack.borrow_mut().push(entry));
 
     struct Guard;
 
@@ -131,7 +137,7 @@ pub(crate) fn with_owner<T>(frame: &Rc<OwnerFrame>, f: impl FnOnce() -> T) -> T 
 
 /// Returns the innermost reactive owner on this thread, if any.
 pub(crate) fn current_owner() -> Option<Rc<OwnerFrame>> {
-    OWNER_STACK.with(|stack| stack.borrow().last().cloned())
+    OWNER_STACK.with(|stack| stack.borrow().last().cloned().flatten())
 }
 
 /// Hands `child` to the innermost owner on this thread, returning `false` when no owner is
@@ -236,6 +242,70 @@ impl core::fmt::Debug for Owner {
 /// See [`Owner`] for the async re-attachment pattern this enables.
 pub fn owner() -> Option<Owner> {
     current_owner().map(|frame| Owner { frame })
+}
+
+/// Runs `f` with no current reactive owner.
+///
+/// Effects, scopes, and subscriptions created inside are unowned even when `unowned` is called
+/// from within an effect run or a scope: they are kept alive by their handles and disposed when
+/// the last handle drops (or kept for the remainder of the program via `leak`). Use it to start
+/// background work from inside a component or effect without tying its lifetime to the
+/// enclosing owner.
+///
+/// The suppression applies only at the boundary: an owner established *inside* `f` (a scope, or
+/// an effect's own runs) works normally. [`owner`] returns `None` directly inside `f`, and
+/// [`on_cleanup`] there panics, since no owner could ever run the cleanup.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{effect, scope, signal, unowned};
+/// use runite::{queue_macrotask, run};
+///
+/// let seen = Rc::new(RefCell::new(Vec::new()));
+///
+/// queue_macrotask({
+///     let seen = Rc::clone(&seen);
+///     move || {
+///         let data = signal(0);
+///         let (handle, background) = scope({
+///             let data = data.clone();
+///             let seen = Rc::clone(&seen);
+///             move || {
+///                 // Created inside the scope, but deliberately not owned by it.
+///                 unowned(|| {
+///                     effect({
+///                         let data = data.clone();
+///                         let seen = Rc::clone(&seen);
+///                         move || seen.borrow_mut().push(data.get())
+///                     })
+///                 })
+///             }
+///         });
+///
+///         runite::queue_macrotask({
+///             let data = data.clone();
+///             move || {
+///                 handle.dispose();
+///                 data.set(1); // the scope is gone, but the unowned effect still reacts
+///
+///                 runite::queue_macrotask(move || {
+///                     drop(background); // last handle dropped: now it is disposed
+///                     data.set(2); // not observed
+///                 });
+///             }
+///         });
+///     }
+/// });
+/// run();
+///
+/// assert_eq!(*seen.borrow(), [0, 1]);
+/// ```
+pub fn unowned<T>(f: impl FnOnce() -> T) -> T {
+    with_owner_entry(None, f)
 }
 
 /// Registers `cleanup` against the innermost reactive owner (the currently running effect, or
@@ -760,6 +830,80 @@ mod tests {
         assert!(
             seen.borrow().is_empty(),
             "children created under a disposed owner must never run"
+        );
+    }
+
+    #[test]
+    fn unowned_suppresses_the_enclosing_owner_at_the_boundary_only() {
+        let (_handle, ()) = scope(|| {
+            assert!(super::owner().is_some(), "the scope is the current owner");
+            super::unowned(|| {
+                assert!(
+                    super::owner().is_none(),
+                    "no owner is current inside unowned"
+                );
+                // An owner established inside `unowned` works normally.
+                let (_inner, ()) = scope(|| {
+                    assert!(
+                        super::owner().is_some(),
+                        "a scope created inside unowned is the current owner"
+                    );
+                });
+            });
+            assert!(
+                super::owner().is_some(),
+                "the enclosing owner is restored after unowned returns"
+            );
+        });
+    }
+
+    #[test]
+    fn unowned_effects_escape_their_scope_and_die_with_their_handle() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        queue_macrotask({
+            let seen = Rc::clone(&seen);
+            move || {
+                let reactor = Reactor::new();
+                let data = signal_in(&reactor, 0usize);
+
+                let (handle, background) = scope({
+                    let reactor = reactor.clone();
+                    let data = data.clone();
+                    let seen = Rc::clone(&seen);
+                    move || {
+                        super::unowned(|| {
+                            crate::effect_in(&reactor, {
+                                let data = data.clone();
+                                let seen = Rc::clone(&seen);
+                                move || seen.borrow_mut().push(data.get())
+                            })
+                        })
+                    }
+                });
+
+                runite::queue_macrotask({
+                    let data = data.clone();
+                    move || {
+                        handle.dispose();
+                        // The scope is gone, but the unowned effect still reacts.
+                        data.set(1);
+
+                        runite::queue_macrotask(move || {
+                            // The last handle is the effect's only tether.
+                            drop(background);
+                            data.set(2);
+                        });
+                    }
+                });
+            }
+        });
+
+        run();
+        assert_eq!(
+            &*seen.borrow(),
+            &[0, 1],
+            "the effect must survive scope disposal and die when its handle drops"
         );
     }
 

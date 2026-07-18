@@ -90,7 +90,10 @@ and are disposed when the owner re-runs or is disposed. `on_cleanup` registers
 teardown against the innermost owner; it runs before the owning effect's next
 run and on disposal. Top-level effects are owned by their `EffectHandle` —
 dropping the last handle disposes the effect, and `leak()` opts out.
-`Subscription` handles follow the same rules.
+`Subscription` handles follow the same rules. To opt out of adoption entirely,
+`unowned(|| ...)` runs a closure with no current owner: everything created
+inside is kept alive by its handles alone, even when called from inside an
+effect or scope.
 
 Ownership is established by where code *runs*, which async work escapes: after
 an `.await`, the original owner is no longer on the stack. Capture it first
