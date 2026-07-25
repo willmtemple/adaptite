@@ -263,6 +263,36 @@ targets `adaptite::graph`, `adaptite::signal`, `adaptite::thunk`,
 and `adaptite::resource`. See `examples/tracing_subscriber_showcase.rs` for a
 suggested subscriber setup.
 
+## Causal diagnostics
+
+Performance tools can subscribe to a reactor's structured scheduling stream:
+
+```rust
+use adaptite::{DiagnosticEvent, Reactor};
+
+let reactor = Reactor::new();
+let subscription = reactor.subscribe_diagnostics(|event| {
+    if let DiagnosticEvent::ReactiveWrite { cause, .. } = event {
+        eprintln!(
+            "node {} created at {} changed at {}",
+            cause.node.get(),
+            cause.node_origin,
+            cause.write_origin
+        );
+    }
+});
+```
+
+The stream preserves the root write through thunk and memo propagation and
+reports effect invalidation, queue coalescing, flush epochs, effect
+run/skip/dispose outcomes, and source locations. Delivery is synchronous on
+the reactor thread. Callbacks should append the event to an external trace
+sink and return without reading or mutating the graph.
+
+Diagnostics are available in release builds. Without a subscription, the
+path is dormant and mutation/scheduling sites perform only a boolean check.
+Dropping `DiagnosticSubscription` removes the callback.
+
 ## License
 
 Licensed under either of

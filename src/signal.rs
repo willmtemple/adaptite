@@ -112,6 +112,7 @@ impl<T: 'static> Signal<T> {
 
     /// Replaces the current value and marks dependents stale, even when the new value equals
     /// the old one (compare [`set`](Signal::set)).
+    #[track_caller]
     pub fn replace(&self, value: T) -> T {
         let previous = self.inner.value.replace(value);
         tracing::debug!(
@@ -132,6 +133,7 @@ impl<T: 'static> Signal<T> {
     /// `f` runs while the value is mutably borrowed: any read or write of the *same* signal
     /// from inside `f` (`get`, `with`, `peek`, `set`, `replace`, or a nested `update`) panics
     /// with a borrow error.
+    #[track_caller]
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let output = {
             let mut value = self.inner.value.borrow_mut();
@@ -168,6 +170,7 @@ impl<T: PartialEq + 'static> Signal<T> {
     ///
     /// The equality check runs untracked, so a `PartialEq` implementation that reads reactive
     /// state records no dependencies for the currently running observer.
+    #[track_caller]
     pub fn set(&self, value: T) -> Option<T> {
         // Compare under a shared borrow, without tracking: a `PartialEq` impl that reads
         // reactive state must neither conflict with this signal's own borrow nor record

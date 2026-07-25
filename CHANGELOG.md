@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-25
+
+### Added
+
+- Opt-in reactive diagnostics through `Reactor::subscribe_diagnostics`, emitted
+  in release builds as well as debug builds. The stream reports root writes with source
+  creation and mutation locations, carries those root causes through computed
+  dependencies, and reports effect scheduling and coalescing, flushes, runs,
+  verification skips, and disposal.
+- Process-local `ReactorId` and public numeric accessors for `ReactorId` and
+  `NodeId`, allowing diagnostic consumers to correlate independent graphs.
+
+### Changed
+
+- Signal, event, and source mutation entry points preserve their caller
+  locations in diagnostic events. Without a subscriber, diagnostic event
+  construction and delivery remain dormant.
+
 ## [0.1.1] - 2026-07-17
 
 ### Added
@@ -63,6 +81,7 @@ Initial release.
   creation site; debug builds panic (instead of hanging) on divergent effect
   feedback loops and detect cross-reactor reads.
 
-[Unreleased]: https://github.com/willmtemple/adaptite/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/willmtemple/adaptite/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/willmtemple/adaptite/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/willmtemple/adaptite/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/willmtemple/adaptite/releases/tag/v0.1.0
