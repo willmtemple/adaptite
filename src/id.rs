@@ -11,6 +11,11 @@ impl NodeId {
     pub(crate) const fn new(raw: u64) -> Self {
         Self(raw)
     }
+
+    /// Returns the reactor-local numeric identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl fmt::Display for NodeId {

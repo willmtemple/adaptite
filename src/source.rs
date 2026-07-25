@@ -83,6 +83,7 @@ impl Source {
     }
 
     /// Triggers this source's dependents.
+    #[track_caller]
     pub fn trigger(&self) {
         self.inner.reactor.trigger(self.inner.id);
     }

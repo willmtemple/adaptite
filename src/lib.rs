@@ -14,6 +14,7 @@ pub(crate) mod trace_targets {
     pub const RESOURCE: &str = "adaptite::resource";
 }
 
+mod diagnostics;
 mod effect;
 mod event;
 mod id;
@@ -26,6 +27,9 @@ mod source;
 mod thunk;
 mod watch;
 
+pub use diagnostics::{
+    DiagnosticEvent, DiagnosticSubscription, InvalidationCause, InvalidationLevel, ReactorId,
+};
 pub use effect::{EffectHandle, effect, effect_in};
 pub use event::{Event, Subscription, event, event_in, on, on_in};
 pub use id::NodeId;

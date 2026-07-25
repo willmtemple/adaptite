@@ -4,7 +4,7 @@ use core::cell::{Cell, RefCell};
 
 use crate::reactor::{Mark, ObserverHook, State};
 use crate::scope::{OwnedDisposable, OwnerFrame, adopt_into_current, with_owner};
-use crate::{NodeId, Reactor, current, trace_targets};
+use crate::{DiagnosticEvent, InvalidationCause, NodeId, Reactor, current, trace_targets};
 
 /// Maximum number of times a single effect may run within one job flush before the reactor
 /// assumes it is caught in a divergent feedback loop (debug builds only).
@@ -214,7 +214,20 @@ struct EffectInner {
 
 impl EffectInner {
     fn schedule(&self) {
-        if self.disposed.get() || self.scheduled.replace(true) {
+        let skipped = self.disposed.get() || self.scheduled.replace(true);
+        if self.reactor.diagnostics_enabled()
+            && let Some(effect_origin) = self.reactor.origin(self.id)
+        {
+            self.reactor
+                .emit_diagnostic(DiagnosticEvent::EffectScheduled {
+                    reactor: self.reactor.diagnostic_id(),
+                    effect: self.id,
+                    effect_origin,
+                    queued: !skipped,
+                    flush_epoch: self.reactor.flush_epoch(),
+                });
+        }
+        if skipped {
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::EFFECT,
@@ -297,6 +310,14 @@ impl EffectInner {
         }
 
         if !should_run {
+            if self.reactor.diagnostics_enabled() {
+                self.reactor
+                    .emit_diagnostic(DiagnosticEvent::EffectRunSkipped {
+                        reactor: self.reactor.diagnostic_id(),
+                        effect: self.id,
+                        flush_epoch: self.reactor.flush_epoch(),
+                    });
+            }
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::EFFECT,
@@ -316,6 +337,44 @@ impl EffectInner {
             node_id = self.id.0
         )
         .entered();
+        let reactor_id = self.reactor.diagnostic_id();
+        let flush_epoch = self.reactor.flush_epoch();
+        let diagnostics_enabled = self.reactor.diagnostics_enabled();
+        if diagnostics_enabled && let Some(effect_origin) = self.reactor.origin(self.id) {
+            self.reactor
+                .emit_diagnostic(DiagnosticEvent::EffectRunStarted {
+                    reactor: reactor_id,
+                    effect: self.id,
+                    effect_origin,
+                    flush_epoch,
+                });
+        }
+        struct DiagnosticRunGuard<'a> {
+            reactor: &'a Reactor,
+            reactor_id: crate::ReactorId,
+            effect: NodeId,
+            flush_epoch: u64,
+            enabled: bool,
+        }
+        impl Drop for DiagnosticRunGuard<'_> {
+            fn drop(&mut self) {
+                if self.enabled {
+                    self.reactor
+                        .emit_diagnostic(DiagnosticEvent::EffectRunFinished {
+                            reactor: self.reactor_id,
+                            effect: self.effect,
+                            flush_epoch: self.flush_epoch,
+                        });
+                }
+            }
+        }
+        let _diagnostic_guard = DiagnosticRunGuard {
+            reactor: &self.reactor,
+            reactor_id,
+            effect: self.id,
+            flush_epoch,
+            enabled: diagnostics_enabled,
+        };
         // Run cleanups from the previous run and dispose nested effects it created, then run
         // with this effect as the innermost owner so new cleanups and children register here.
         self.owner.reset();
@@ -366,6 +425,13 @@ impl EffectInner {
             node_id = self.id.0,
             "disposed reactive effect"
         );
+        if self.reactor.diagnostics_enabled() {
+            self.reactor
+                .emit_diagnostic(DiagnosticEvent::EffectDisposed {
+                    reactor: self.reactor.diagnostic_id(),
+                    effect: self.id,
+                });
+        }
         self.owner.dispose();
         self.reactor.unregister_observer(self.id);
         self.reactor.dispose(self.id);
@@ -379,7 +445,19 @@ impl OwnedDisposable for EffectInner {
 }
 
 impl ObserverHook for EffectInner {
-    fn mark(&self, mark: Mark) {
+    fn mark(&self, mark: Mark, cause: Option<InvalidationCause>) {
+        if let Some(cause) = cause
+            && let Some(effect_origin) = self.reactor.origin(self.id)
+        {
+            self.reactor
+                .emit_diagnostic(DiagnosticEvent::EffectInvalidated {
+                    reactor: self.reactor.diagnostic_id(),
+                    effect: self.id,
+                    effect_origin,
+                    cause,
+                    level: mark.into(),
+                });
+        }
         let target = State::from(mark);
         if self.state.get() < target {
             self.state.set(target);

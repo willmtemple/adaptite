@@ -6,14 +6,21 @@ use core::cell::{Cell, RefCell};
 use core::error::Error;
 use core::fmt;
 use core::panic::Location;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use hashbrown::{HashMap, HashSet};
 
 use runite::queue_microtask;
 
-use crate::{NodeId, trace_targets};
+use crate::{
+    DiagnosticEvent, DiagnosticSubscription, InvalidationCause, InvalidationLevel, NodeId,
+    ReactorId, trace_targets,
+};
 
 type Job = Box<dyn FnOnce() + 'static>;
+type DiagnosticCallback = Rc<dyn Fn(DiagnosticEvent)>;
+
+static NEXT_REACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static CURRENT_REACTOR: RefCell<Weak<ReactorInner>> = const { RefCell::new(Weak::new()) };
@@ -116,6 +123,15 @@ impl From<Mark> for State {
     }
 }
 
+impl From<Mark> for InvalidationLevel {
+    fn from(mark: Mark) -> Self {
+        match mark {
+            Mark::Check => Self::Check,
+            Mark::Dirty => Self::Dirty,
+        }
+    }
+}
+
 /// Unwind guard used by computed nodes: restores the dirty mark when a compute closure panics,
 /// so the node is retried on its next read instead of being treated as clean.
 pub(crate) struct DirtyOnUnwind<'a> {
@@ -133,7 +149,7 @@ impl Drop for DirtyOnUnwind<'_> {
 
 pub(crate) trait ObserverHook {
     /// Records that this observer's inputs may have changed.
-    fn mark(&self, mark: Mark);
+    fn mark(&self, mark: Mark, cause: Option<InvalidationCause>);
 
     /// Brings a computed node up to date, recomputing if its inputs actually changed.
     ///
@@ -257,6 +273,41 @@ impl Reactor {
             "created reactive reactor"
         );
         reactor
+    }
+
+    /// Subscribes to this reactor's reactive causality events.
+    ///
+    /// Unlike the `tracing` instrumentation, these events are emitted in
+    /// release builds as well as debug builds.
+    ///
+    /// The stream is dormant when there are no subscribers. Delivery is
+    /// synchronous on this reactor's thread; callbacks should append to a
+    /// trace sink and return without reading or mutating the graph.
+    pub fn subscribe_diagnostics(
+        &self,
+        callback: impl Fn(DiagnosticEvent) + 'static,
+    ) -> DiagnosticSubscription {
+        let token = self.inner.next_diagnostic.get();
+        self.inner.next_diagnostic.set(token.wrapping_add(1).max(1));
+        self.inner
+            .diagnostics
+            .borrow_mut()
+            .push((token, Rc::new(callback)));
+        self.inner.diagnostics_active.set(true);
+        // The subscription keeps the graph alive. This matters when a tool
+        // subscribes to the thread-default reactor before its first node is
+        // created; otherwise the default reactor's weak cache would expire
+        // between subscription and node construction.
+        let inner = Rc::clone(&self.inner);
+        DiagnosticSubscription::new(move || {
+            inner
+                .diagnostics
+                .borrow_mut()
+                .retain(|(candidate, _)| *candidate != token);
+            inner
+                .diagnostics_active
+                .set(!inner.diagnostics.borrow().is_empty());
+        })
     }
 
     /// Returns the current thread's default reactor.
@@ -473,13 +524,37 @@ impl Reactor {
     /// reactor.trigger(node.id());
     /// assert_eq!(view.get(), 20); // now the thunk recomputes
     /// ```
+    #[track_caller]
     pub fn trigger(&self, observable: NodeId) {
         self.bump_version(observable);
-        self.mark_dependents(observable, Mark::Dirty);
+        let write_origin = Location::caller();
+        let cause = if self.diagnostics_enabled() {
+            self.origin(observable)
+                .map(|node_origin| InvalidationCause {
+                    node: observable,
+                    version: self.version(observable),
+                    node_origin,
+                    write_origin,
+                })
+        } else {
+            None
+        };
+        if let Some(cause) = cause {
+            self.inner.emit(DiagnosticEvent::ReactiveWrite {
+                reactor: self.inner.id,
+                cause,
+            });
+        }
+        self.mark_dependents(observable, Mark::Dirty, cause);
     }
 
     /// Marks every dependent of `observable` with `mark`.
-    pub(crate) fn mark_dependents(&self, observable: NodeId, mark: Mark) {
+    pub(crate) fn mark_dependents(
+        &self,
+        observable: NodeId,
+        mark: Mark,
+        cause: Option<InvalidationCause>,
+    ) {
         let dependents = self
             .inner
             .dependents
@@ -507,7 +582,7 @@ impl Reactor {
                 .cloned()
                 .and_then(|weak| weak.upgrade());
             if let Some(hook) = hook {
-                hook.mark(mark);
+                hook.mark(mark, cause);
             } else {
                 self.inner.observers.borrow_mut().remove(&dependent);
             }
@@ -723,6 +798,18 @@ impl Reactor {
         self.inner.flush_epoch.get()
     }
 
+    pub(crate) fn emit_diagnostic(&self, event: DiagnosticEvent) {
+        self.inner.emit(event);
+    }
+
+    pub(crate) fn diagnostics_enabled(&self) -> bool {
+        self.inner.diagnostics_active.get()
+    }
+
+    pub(crate) fn diagnostic_id(&self) -> ReactorId {
+        self.inner.id
+    }
+
     #[cfg(debug_assertions)]
     fn assert_running_reactor(&self) {
         RUNNING_REACTOR.with(|running| {
@@ -778,6 +865,7 @@ struct NodeMeta {
 }
 
 struct ReactorInner {
+    id: ReactorId,
     next_node: Cell<u64>,
     meta: RefCell<HashMap<NodeId, NodeMeta>>,
     dependencies: RefCell<HashMap<NodeId, HashMap<NodeId, u64>>>,
@@ -788,11 +876,15 @@ struct ReactorInner {
     pending_jobs: RefCell<VecDeque<Job>>,
     flush_scheduled: Cell<bool>,
     flush_epoch: Cell<u64>,
+    next_diagnostic: Cell<u64>,
+    diagnostics_active: Cell<bool>,
+    diagnostics: RefCell<Vec<(u64, DiagnosticCallback)>>,
 }
 
 impl ReactorInner {
     fn new() -> Self {
         Self {
+            id: ReactorId(NEXT_REACTOR_ID.fetch_add(1, AtomicOrdering::Relaxed)),
             next_node: Cell::new(1),
             meta: RefCell::new(HashMap::new()),
             dependencies: RefCell::new(HashMap::new()),
@@ -803,6 +895,30 @@ impl ReactorInner {
             pending_jobs: RefCell::new(VecDeque::new()),
             flush_scheduled: Cell::new(false),
             flush_epoch: Cell::new(0),
+            next_diagnostic: Cell::new(1),
+            diagnostics_active: Cell::new(false),
+            diagnostics: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn emit(&self, event: DiagnosticEvent) {
+        if !self.diagnostics_active.get() {
+            return;
+        }
+        let callbacks = self.diagnostics.borrow();
+        if callbacks.len() == 1 {
+            let callback = Rc::clone(&callbacks[0].1);
+            drop(callbacks);
+            callback(event);
+            return;
+        }
+        let snapshot = callbacks
+            .iter()
+            .map(|(_, callback)| Rc::clone(callback))
+            .collect::<Vec<_>>();
+        drop(callbacks);
+        for callback in snapshot {
+            callback(event);
         }
     }
 
@@ -831,15 +947,33 @@ impl ReactorInner {
         )
         .entered();
         self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
+        let epoch = self.flush_epoch.get();
+        if self.diagnostics_active.get() {
+            self.emit(DiagnosticEvent::FlushStarted {
+                reactor: self.id,
+                flush_epoch: epoch,
+                pending_jobs: self.pending_jobs.borrow().len(),
+            });
+        }
 
         // If a job panics, reset the flush flag and hand any remaining jobs to a fresh flush so
         // one panicking effect cannot silently disable the reactor.
         struct FlushGuard {
             inner: Rc<ReactorInner>,
+            // Pinned at construction: a job may call `flush_now`, whose nested flush bumps the
+            // shared epoch. Reporting the live value here would close the wrong flush.
+            epoch: u64,
         }
 
         impl Drop for FlushGuard {
             fn drop(&mut self) {
+                if self.inner.diagnostics_active.get() {
+                    self.inner.emit(DiagnosticEvent::FlushFinished {
+                        reactor: self.inner.id,
+                        flush_epoch: self.epoch,
+                        remaining_jobs: self.inner.pending_jobs.borrow().len(),
+                    });
+                }
                 self.inner.flush_scheduled.set(false);
                 if !self.inner.pending_jobs.borrow().is_empty() {
                     self.inner.ensure_flush_scheduled();
@@ -849,6 +983,7 @@ impl ReactorInner {
 
         let guard = FlushGuard {
             inner: Rc::clone(&self),
+            epoch,
         };
 
         loop {

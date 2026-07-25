@@ -258,6 +258,7 @@ impl<T: 'static> Event<T> {
     /// is emitting. The subscriber list is snapshotted when `emit` begins, so a handler that
     /// unsubscribes (or a subscriber added) during delivery takes effect from the next emit —
     /// the current emit still reaches the original set.
+    #[track_caller]
     pub fn emit(&self, value: T) {
         let subscribers = self
             .inner

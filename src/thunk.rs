@@ -3,7 +3,7 @@ use alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
 
 use crate::reactor::{Mark, ObserverHook, State};
-use crate::{NodeId, Reactor, current, trace_targets};
+use crate::{InvalidationCause, NodeId, Reactor, current, trace_targets};
 
 type ComputeFn<T> = dyn Fn() -> T + 'static;
 type ComputePrevFn<T> = dyn Fn(Option<&T>) -> T + 'static;
@@ -492,7 +492,13 @@ impl<T: Clone + 'static> Memo<T> {
 
 /// Shared marking behavior for computed nodes: record the strongest staleness seen, and when the
 /// node first leaves the clean state, tell downstream observers to verify their inputs.
-fn mark_computed(reactor: &Reactor, id: NodeId, state: &Cell<State>, mark: Mark) {
+fn mark_computed(
+    reactor: &Reactor,
+    id: NodeId,
+    state: &Cell<State>,
+    mark: Mark,
+    cause: Option<InvalidationCause>,
+) {
     let target = State::from(mark);
     let previous = state.get();
     if previous >= target {
@@ -500,7 +506,7 @@ fn mark_computed(reactor: &Reactor, id: NodeId, state: &Cell<State>, mark: Mark)
     }
     state.set(target);
     if previous == State::Clean {
-        reactor.mark_dependents(id, Mark::Check);
+        reactor.mark_dependents(id, Mark::Check, cause);
     }
 }
 
@@ -638,7 +644,7 @@ impl<T> MemoInner<T> {
 }
 
 impl<T: 'static> ObserverHook for ThunkInner<T> {
-    fn mark(&self, mark: Mark) {
+    fn mark(&self, mark: Mark, cause: Option<InvalidationCause>) {
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::THUNK,
@@ -647,7 +653,7 @@ impl<T: 'static> ObserverHook for ThunkInner<T> {
             ?mark,
             "marking thunk stale"
         );
-        mark_computed(&self.reactor, self.id, &self.state, mark);
+        mark_computed(&self.reactor, self.id, &self.state, mark, cause);
     }
 
     fn refresh(&self) {
@@ -663,7 +669,7 @@ impl<T> Drop for ThunkInner<T> {
 }
 
 impl<T: 'static> ObserverHook for MemoInner<T> {
-    fn mark(&self, mark: Mark) {
+    fn mark(&self, mark: Mark, cause: Option<InvalidationCause>) {
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::MEMO,
@@ -672,7 +678,7 @@ impl<T: 'static> ObserverHook for MemoInner<T> {
             ?mark,
             "marking memo stale"
         );
-        mark_computed(&self.reactor, self.id, &self.state, mark);
+        mark_computed(&self.reactor, self.id, &self.state, mark, cause);
     }
 
     fn refresh(&self) {
