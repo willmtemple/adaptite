@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-27
+
+This release moves adaptite onto runite 0.2, makes the ambient reactor an
+explicit contract, and adds the extension points a UI framework needs from the
+reactive core: consumer-defined effect scheduling, error boundaries, and
+observation lifecycle hooks. See [MIGRATING-0.2.md](docs/MIGRATING-0.2.md).
+
 ### Breaking
 
 - Adaptite now requires runite 0.2 (`runite = "0.2"`). Adaptite and the
