@@ -956,10 +956,12 @@ impl Reactor {
         self.inner.flush_depth.get() > 0
     }
 
+    /// Opens a flush this reactor is not itself driving. Pair with [`end_flush`](Self::end_flush).
     pub(crate) fn begin_flush(&self) {
         self.inner.begin_flush();
     }
 
+    /// Closes a flush opened by [`begin_flush`](Self::begin_flush).
     pub(crate) fn end_flush(&self) {
         self.inner.end_flush();
     }

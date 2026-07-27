@@ -91,12 +91,23 @@ host, so a render lane can run inside a paint callback instead of on the
 microtask queue. Adaptite deliberately ships no opinion about what the phases
 are.
 
-```rust,ignore
+```rust
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use adaptite::{EffectRun, Reactor, signal_in};
+
+let reactor = Reactor::new();
+let size = signal_in(&reactor, 1);
+let painted = Rc::new(RefCell::new(Vec::new()));
+
+// The render lane. Nothing in it runs until the host drains it.
 let lane: Rc<RefCell<Vec<EffectRun>>> = Rc::new(RefCell::new(Vec::new()));
 
-let effect = effect_with(
+let effect = reactor.effect_with(
     { let lane = Rc::clone(&lane); move |ready: EffectRun| lane.borrow_mut().push(ready) },
-    move || redraw(size.get()),
+    { let size = size.clone(); let painted = Rc::clone(&painted);
+      move || painted.borrow_mut().push(size.get()) },
 );
 
 // Later, inside the host's paint callback:
@@ -105,6 +116,8 @@ reactor.external_flush(|| {
         ready.run();
     }
 });
+assert_eq!(*painted.borrow(), [1]);
+# effect.dispose();
 ```
 
 Draining inside `Reactor::external_flush` gives the whole drain one flush epoch,

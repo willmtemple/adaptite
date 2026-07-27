@@ -538,6 +538,10 @@ pub(crate) fn error_handler_for(frame: &Rc<OwnerFrame>) -> Option<ErrorHandler> 
 ///   should tear down or replace the subtree, not do lengthy work.
 /// - A panic raised by `f` itself — the scope's own body, run synchronously — is *not* caught.
 ///   Only effects owned by the scope are covered.
+/// - Coverage follows ownership, so an effect created inside [`unowned`] is outside every
+///   boundary above it and its panics propagate as usual. That is the same opt-out `unowned`
+///   already applies to disposal; take an [`Owner`] and [`run_in`](Owner::run_in) to keep async
+///   work under the boundary that created it.
 ///
 /// # Examples
 ///
@@ -747,7 +751,7 @@ mod tests {
 
     use runite::{queue_macrotask, run};
 
-    use super::{ErrorInfo, ScopeHandle, on_cleanup, scope, scope_catch};
+    use super::{ErrorInfo, ScopeHandle, on_cleanup, scope, scope_catch, unowned};
     use crate::{Reactor, signal_in};
 
     /// Collects the messages a boundary reports.
@@ -1108,6 +1112,41 @@ mod tests {
         reactor.flush_now();
         assert_eq!(*errors.borrow(), ["upstream exploded"]);
 
+        boundary.dispose();
+    }
+
+    #[test]
+    fn an_unowned_effect_is_outside_every_boundary() {
+        // Coverage follows ownership, and `unowned` opts out of it. Pinned because the escape is
+        // surprising enough to be worth a deliberate decision rather than an accident.
+        let reactor = Reactor::new();
+        let (errors, handler) = error_log();
+        let value = signal_in(&reactor, 1);
+
+        let (boundary, effect) = scope_catch(
+            {
+                let reactor = reactor.clone();
+                let value = value.clone();
+                move || {
+                    unowned(|| {
+                        reactor.effect(move || {
+                            if value.get() == 2 {
+                                panic!("escaped");
+                            }
+                        })
+                    })
+                }
+            },
+            handler,
+        );
+        reactor.flush_now();
+
+        value.set(2);
+        let result = catch_unwind(AssertUnwindSafe(|| reactor.flush_now()));
+        assert!(result.is_err(), "the panic propagates past the boundary");
+        assert!(errors.borrow().is_empty(), "the handler was not consulted");
+
+        effect.dispose();
         boundary.dispose();
     }
 

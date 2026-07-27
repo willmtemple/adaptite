@@ -41,9 +41,11 @@ observation lifecycle hooks. See [MIGRATING-0.2.md](docs/MIGRATING-0.2.md).
   the handler runs — its dependency tracking was cut short mid-run, and a panic
   during verification re-queues it, so leaving it live would re-run and re-panic
   immediately — which makes the failure terminal for that effect and leaves the
-  handler to decide what replaces it. Siblings are unaffected. Boundaries are
-  for bugs; recoverable failures still belong in the graph as `Result` values,
-  and under `panic = "abort"` there is nothing to catch.
+  handler to decide what replaces it. Siblings are unaffected. Coverage follows
+  ownership, so an effect created inside `unowned` sits outside every boundary
+  above it. Boundaries are for bugs; recoverable failures still belong in the
+  graph as `Result` values, and under `panic = "abort"` there is nothing to
+  catch.
 - `source_with_hooks(on_watch, on_unwatch)` (plus `source_with_hooks_in` and
   `Reactor::source_with_hooks`) fires when a source gains its first observer and
   loses its last, so an external resource can be acquired and released promptly

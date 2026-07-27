@@ -32,9 +32,9 @@ the changes that produce no compiler diagnostic are:
 Owned-resource adoption (`File::from`, `TcpStream::from`, …) becoming fallible
 *is* a compile error, so the compiler will find those for you.
 
-adaptite tracks one runite minor at a time, and reaching a newer runite minor
-requires an adaptite release against it. `mise run runite-current` reports when a
-newer minor has shipped.
+adaptite tracks one runite minor at a time, so reaching a newer runite minor
+requires an adaptite release against it. If a runite version you need is out of
+reach, that is the thing to ask for.
 
 ## No source changes in adaptite's own API
 
@@ -110,7 +110,7 @@ there is nothing to catch.
 
 `source_with_hooks(on_watch, on_unwatch)` fires when a source gains its first
 observer and loses its last, so a socket or file watcher can be torn down
-promptly instead of by a `is_observed` sweep. Delivery is deferred to a reactor
+promptly instead of by an `is_observed` sweep. Delivery is deferred to a reactor
 job, which means a rerunning reader's leave/arrive pair collapses to nothing and
 neither hook is delivered twice in a row. `on_unwatch` can be late but never
 early.

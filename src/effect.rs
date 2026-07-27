@@ -21,7 +21,7 @@ const MAX_RUNS_PER_FLUSH: u32 = 100;
 /// The effect is scheduled immediately and then re-scheduled whenever one of its dependencies
 /// changes. Effects never run inline with the write that triggered them: they are flushed on
 /// the runtime's microtask queue, so consecutive writes within one task coalesce into a single
-/// run.
+/// run. Use [`effect_with`] to route runs to a lane of your own instead.
 ///
 /// A queued run first verifies its inputs: when only equality-suppressed memo updates
 /// occurred upstream, the run is skipped without executing the body. If an upstream
@@ -40,6 +40,11 @@ const MAX_RUNS_PER_FLUSH: u32 = 100;
 /// with a value that never converges. The panic message names the effect's creation site.
 /// Convergent feedback (for example clamping, where the rewritten value is suppressed by the
 /// signal's equality check) is legal and settles well below the limit.
+///
+/// Both behaviors above describe an effect with no enclosing error boundary. Under a
+/// [`crate::scope_catch`], any panic from this effect — from its body or from dependency
+/// verification — is instead delivered to that boundary's handler, and the effect is disposed
+/// rather than re-queued.
 ///
 /// # Examples
 ///
@@ -837,7 +842,7 @@ mod tests {
 
     #[test]
     fn separate_lanes_run_in_the_order_the_consumer_drains_them() {
-        // The point of the feature: phases are the consumer's to define and order.
+        // Phases are the consumer's to define and order; adaptite imposes none.
         let reactor = Reactor::new();
         let (state, render) = (Lane::default(), Lane::default());
         let value = signal_in(&reactor, 1);
