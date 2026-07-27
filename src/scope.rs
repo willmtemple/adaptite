@@ -1017,26 +1017,26 @@ mod tests {
     #[test]
     fn error_info_reports_the_effects_creation_site() {
         let reactor = Reactor::new();
-        type Captured = Rc<RefCell<Option<(u64, Option<String>)>>>;
+        type Captured = Rc<RefCell<Option<(u64, Option<String>, Option<u32>)>>>;
         let captured: Captured = Rc::new(RefCell::new(None));
         let value = signal_in(&reactor, 1);
 
-        let (boundary, effect_id) = scope_catch(
+        let (boundary, creation_line) = scope_catch(
             {
                 let reactor = reactor.clone();
                 let value = value.clone();
                 move || {
-                    let handle = reactor.effect({
-                        let value = value.clone();
-                        move || {
-                            if value.get() == 2 {
-                                panic!("located");
-                            }
+                    // Hoisted so the creation call below is a single short statement: it keeps
+                    // the panic site on a different line from the `#[track_caller]` call site,
+                    // which is the distinction this test exists to check.
+                    let body = move || {
+                        if value.get() == 2 {
+                            panic!("located");
                         }
-                    });
-                    let id = format!("{handle:?}");
-                    handle.leak();
-                    id
+                    };
+                    let creation_line = line!() + 1;
+                    reactor.effect(body).leak();
+                    creation_line
                 }
             },
             {
@@ -1044,24 +1044,33 @@ mod tests {
                 move |error: ErrorInfo| {
                     *captured.borrow_mut() = Some((
                         error.node().get(),
-                        error.origin().map(|origin| origin.file().to_string()),
+                        // `Location::file` uses the host's path separator, so compare the file
+                        // name rather than a hardcoded path.
+                        error.origin().and_then(|origin| {
+                            origin
+                                .file()
+                                .rsplit(['/', '\\'])
+                                .next()
+                                .map(alloc::string::ToString::to_string)
+                        }),
+                        error.origin().map(core::panic::Location::line),
                     ));
                 }
             },
         );
-        assert!(effect_id.contains("EffectHandle"));
 
         reactor.flush_now();
         value.set(2);
         reactor.flush_now();
 
         let captured = captured.borrow();
-        let (node, origin) = captured.as_ref().expect("the handler ran");
+        let (node, file, line) = captured.as_ref().expect("the handler ran");
         assert!(*node > 0);
+        assert_eq!(file.as_deref(), Some("scope.rs"));
         assert_eq!(
-            origin.as_deref(),
-            Some("src/scope.rs"),
-            "the origin points at the effect's creation site"
+            *line,
+            Some(creation_line),
+            "the origin points at the effect's creation site, not where it panicked"
         );
 
         boundary.dispose();
