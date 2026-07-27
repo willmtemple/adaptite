@@ -871,6 +871,92 @@ impl Reactor {
         Rc::clone(&self.inner).flush_jobs();
     }
 
+    /// Runs `f` as one flush of this reactor, for consumers draining their own effect lane.
+    ///
+    /// A custom [`crate::EffectScheduler`] decides *when* its effects run, so adaptite cannot see
+    /// where one drain ends and the next begins. Wrapping a drain in `external_flush` supplies
+    /// that boundary: every [`crate::EffectRun`] executed inside `f` shares one flush epoch, so
+    /// the debug divergence guard — which counts an effect's runs within a flush — keeps working
+    /// across the drain, and diagnostic consumers see one `FlushStarted`/`FlushFinished` pair
+    /// rather than one per effect.
+    ///
+    /// Without it, each externally scheduled run opens and closes its own single-run flush. That
+    /// is correct but blind: an effect that re-schedules itself into the same drain forever is
+    /// then a livelock the guard cannot see. Draining inside `external_flush` is therefore the
+    /// recommended shape.
+    ///
+    /// Nesting is permitted: a nested call (or a [`flush_now`](Self::flush_now) from inside `f`)
+    /// joins the enclosing flush rather than starting one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    ///
+    /// use adaptite::{EffectRun, Reactor, signal_in};
+    ///
+    /// // A render lane: the consumer decides when queued effects run.
+    /// let lane: Rc<RefCell<Vec<EffectRun>>> = Rc::new(RefCell::new(Vec::new()));
+    ///
+    /// let reactor = Reactor::new();
+    /// let value = signal_in(&reactor, 1);
+    /// let seen = Rc::new(RefCell::new(Vec::new()));
+    ///
+    /// let effect = reactor.effect_with(
+    ///     {
+    ///         let lane = Rc::clone(&lane);
+    ///         move |ready: EffectRun| lane.borrow_mut().push(ready)
+    ///     },
+    ///     {
+    ///         let value = value.clone();
+    ///         let seen = Rc::clone(&seen);
+    ///         move || seen.borrow_mut().push(value.get())
+    ///     },
+    /// );
+    ///
+    /// // Nothing runs until the lane is drained — not even the initial run.
+    /// reactor.flush_now();
+    /// assert!(seen.borrow().is_empty());
+    ///
+    /// value.set(2);
+    /// reactor.external_flush(|| {
+    ///     for ready in lane.borrow_mut().drain(..) {
+    ///         ready.run();
+    ///     }
+    /// });
+    /// assert_eq!(*seen.borrow(), [2]);
+    /// # effect.dispose();
+    /// ```
+    pub fn external_flush<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.inner.begin_flush();
+
+        struct Guard<'a>(&'a ReactorInner);
+
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.end_flush();
+            }
+        }
+
+        let _guard = Guard(&self.inner);
+        f()
+    }
+
+    /// Returns `true` while a flush of this reactor is in progress, including a drain opened by
+    /// [`external_flush`](Self::external_flush).
+    pub(crate) fn in_flush(&self) -> bool {
+        self.inner.flush_depth.get() > 0
+    }
+
+    pub(crate) fn begin_flush(&self) {
+        self.inner.begin_flush();
+    }
+
+    pub(crate) fn end_flush(&self) {
+        self.inner.end_flush();
+    }
+
     #[track_caller]
     pub(crate) fn allocate_node(&self) -> NodeId {
         let raw = self.inner.next_node.get();
@@ -1028,6 +1114,10 @@ struct ReactorInner {
     pending_jobs: RefCell<VecDeque<Job>>,
     flush_scheduled: Cell<bool>,
     flush_epoch: Cell<u64>,
+    /// Nesting depth of active flushes, including drains a consumer opened with
+    /// [`Reactor::external_flush`]. Non-zero means the current `flush_epoch` is live, so an
+    /// externally scheduled effect run joins it instead of opening one of its own.
+    flush_depth: Cell<u32>,
     next_diagnostic: Cell<u64>,
     diagnostics_active: Cell<bool>,
     diagnostics: RefCell<Vec<(u64, DiagnosticCallback)>>,
@@ -1047,6 +1137,7 @@ impl ReactorInner {
             pending_jobs: RefCell::new(VecDeque::new()),
             flush_scheduled: Cell::new(false),
             flush_epoch: Cell::new(0),
+            flush_depth: Cell::new(0),
             next_diagnostic: Cell::new(1),
             diagnostics_active: Cell::new(false),
             diagnostics: RefCell::new(Vec::new()),
@@ -1071,6 +1162,49 @@ impl ReactorInner {
         drop(callbacks);
         for callback in snapshot {
             callback(event);
+        }
+    }
+
+    /// Opens a flush that adaptite is not itself driving, bumping the epoch only when this is
+    /// the outermost one so a nested drain joins the flush already in progress.
+    fn begin_flush(&self) {
+        let depth = self.flush_depth.get();
+        self.flush_depth.set(depth + 1);
+        if depth > 0 {
+            return;
+        }
+
+        self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
+        let epoch = self.flush_epoch.get();
+        #[cfg(debug_assertions)]
+        tracing::trace!(
+            target: trace_targets::GRAPH,
+            event = "begin_external_flush",
+            flush_epoch = epoch,
+            "opened an externally driven flush"
+        );
+        if self.diagnostics_active.get() {
+            self.emit(DiagnosticEvent::FlushStarted {
+                reactor: self.id,
+                flush_epoch: epoch,
+                pending_jobs: self.pending_jobs.borrow().len(),
+            });
+        }
+    }
+
+    fn end_flush(&self) {
+        let depth = self.flush_depth.get().saturating_sub(1);
+        self.flush_depth.set(depth);
+        if depth > 0 {
+            return;
+        }
+
+        if self.diagnostics_active.get() {
+            self.emit(DiagnosticEvent::FlushFinished {
+                reactor: self.id,
+                flush_epoch: self.flush_epoch.get(),
+                remaining_jobs: self.pending_jobs.borrow().len(),
+            });
         }
     }
 
@@ -1119,6 +1253,9 @@ impl ReactorInner {
 
         impl Drop for FlushGuard {
             fn drop(&mut self) {
+                self.inner
+                    .flush_depth
+                    .set(self.inner.flush_depth.get().saturating_sub(1));
                 if self.inner.diagnostics_active.get() {
                     self.inner.emit(DiagnosticEvent::FlushFinished {
                         reactor: self.inner.id,
@@ -1133,6 +1270,7 @@ impl ReactorInner {
             }
         }
 
+        self.flush_depth.set(self.flush_depth.get() + 1);
         let guard = FlushGuard {
             inner: Rc::clone(&self),
             epoch,

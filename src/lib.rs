@@ -30,7 +30,9 @@ mod watch;
 pub use diagnostics::{
     DiagnosticEvent, DiagnosticSubscription, InvalidationCause, InvalidationLevel, ReactorId,
 };
-pub use effect::{EffectHandle, effect, effect_in};
+pub use effect::{
+    EffectHandle, EffectRun, EffectScheduler, effect, effect_in, effect_with, effect_with_in,
+};
 pub use event::{Event, Subscription, event, event_in, on, on_in};
 pub use id::NodeId;
 pub use observable::{DynObservable, Observable};

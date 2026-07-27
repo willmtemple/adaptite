@@ -24,6 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Consumer-defined effect scheduling. `effect_with(scheduler, f)` (plus
+  `effect_with_in` and `Reactor::effect_with`) hands each ready run to an
+  `EffectScheduler` — any `Fn(EffectRun)` — which decides when it runs. Marking,
+  coalescing, and dependency verification stay in the reactor; only *where the
+  ready effect runs* moves. Consumers build effect phases from this (one queue
+  per phase, drained in the order they choose), so a render lane can run inside
+  a host's paint callback instead of on the microtask queue, and adaptite ships
+  no opinion about what the phases are.
+- `Reactor::external_flush(f)` marks a consumer's drain as one flush: every
+  `EffectRun` executed inside shares a flush epoch, keeping the debug divergence
+  guard meaningful across the drain and reporting it to diagnostic consumers as
+  a single `FlushStarted`/`FlushFinished` pair. A run executed outside any flush
+  opens one of its own. Nesting joins the enclosing flush.
+- `EffectRun` exposes `id()` and `is_stale()` for schedulers that key queues by
+  node or prune entries for disposed effects. Discarding a run instead of
+  running it is supported: the effect keeps its dirty mark and is scheduled
+  again on its next invalidation, so a lane may drop work for a subtree that is
+  no longer visible without stranding it.
 - `Reactor::try_current()` (and the free `try_current()`) returns
   `Option<Reactor>` without installing a reactor, so code that must run on an
   existing graph can tell "the application's reactor" from "a fresh graph

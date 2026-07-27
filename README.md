@@ -75,6 +75,41 @@ consecutive writes within one task coalesce into a single effect run — batchin
 is implicit. Host integrations that need synchronous propagation (for example,
 native resize loops) can call `Reactor::flush_now`.
 
+That default lane is not the only one. `effect_with(scheduler, f)` hands each
+ready run to a consumer-supplied `EffectScheduler` — any `Fn(EffectRun)` — which
+decides when it runs. Marking, coalescing, and dependency verification stay in
+the reactor; only the *when* moves. Consumers build effect phases out of that:
+one queue per phase, drained in whatever order and at whatever moment suits the
+host, so a render lane can run inside a paint callback instead of on the
+microtask queue. Adaptite deliberately ships no opinion about what the phases
+are.
+
+```rust,ignore
+let lane: Rc<RefCell<Vec<EffectRun>>> = Rc::new(RefCell::new(Vec::new()));
+
+let effect = effect_with(
+    { let lane = Rc::clone(&lane); move |ready: EffectRun| lane.borrow_mut().push(ready) },
+    move || redraw(size.get()),
+);
+
+// Later, inside the host's paint callback:
+reactor.external_flush(|| {
+    for ready in lane.borrow_mut().drain(..) {
+        ready.run();
+    }
+});
+```
+
+Draining inside `Reactor::external_flush` gives the whole drain one flush epoch,
+which keeps the debug divergence guard meaningful across it and reports the
+drain to diagnostic consumers as a single flush. A run executed outside any
+flush opens one of its own. `EffectRun::run` must happen on the reactor's
+thread — verification and the effect body always do.
+
+Discarding an `EffectRun` instead of running it is legal: the effect keeps its
+dirty mark and is scheduled again on its next invalidation, so a lane may drop
+work for a subtree that is no longer visible without stranding it.
+
 ### Feedback loops
 
 An effect may write state it depends on, as long as the loop converges — for

@@ -77,6 +77,148 @@ pub fn effect_in(reactor: &Reactor, f: impl Fn() + 'static) -> EffectHandle {
     reactor.effect(f)
 }
 
+/// Creates an effect in the current thread's default reactor that is scheduled by `scheduler`
+/// instead of the reactor's microtask lane.
+///
+/// See [`Reactor::effect_with`] for the contract.
+#[track_caller]
+pub fn effect_with(
+    scheduler: impl EffectScheduler + 'static,
+    f: impl Fn() + 'static,
+) -> EffectHandle {
+    current().effect_with(scheduler, f)
+}
+
+/// Creates an effect associated with `reactor` that is scheduled by `scheduler`.
+#[track_caller]
+pub fn effect_with_in(
+    reactor: &Reactor,
+    scheduler: impl EffectScheduler + 'static,
+    f: impl Fn() + 'static,
+) -> EffectHandle {
+    reactor.effect_with(scheduler, f)
+}
+
+/// Decides when a ready effect actually runs.
+///
+/// Adaptite marks effects, coalesces repeat marks, and verifies dependencies; a scheduler
+/// controls only *where and when* the resulting run happens. That is enough to build effect
+/// phases — state-propagation before DOM writes before after-paint — without adaptite hardcoding
+/// a phase list: create one queue per phase and drain them in the order and at the moment you
+/// choose. A render lane can drain inside the host's paint callback rather than on the microtask
+/// queue.
+///
+/// Any `Fn(EffectRun)` is a scheduler, so a closure over a queue is usually all a consumer needs.
+///
+/// # Contract
+///
+/// - [`schedule`](Self::schedule) is called when the effect becomes ready — on creation and on
+///   each invalidation that is not coalesced into a pending run. It must not run the effect
+///   inline; store the [`EffectRun`] and run it later.
+/// - An [`EffectRun`] that is never run means the effect never runs. Dropping one is legal (the
+///   effect stays marked and is re-scheduled on the next invalidation), but a scheduler that
+///   routinely drops runs silently starves its effects.
+/// - [`EffectRun::run`] must be called on the reactor's thread. Verification and the effect body
+///   always execute there; adaptite provides no cross-thread hand-off.
+/// - Drain inside [`Reactor::external_flush`] to give a whole drain one flush epoch.
+pub trait EffectScheduler {
+    /// Called when `ready` becomes runnable. Store it and run it when the consumer's phase is due.
+    fn schedule(&self, ready: EffectRun);
+}
+
+impl<F: Fn(EffectRun)> EffectScheduler for F {
+    fn schedule(&self, ready: EffectRun) {
+        self(ready);
+    }
+}
+
+/// A ready effect, handed to an [`EffectScheduler`] for the consumer to run when its phase is due.
+///
+/// Running performs the same verify-then-body sequence the reactor's own lane performs: a run
+/// whose dependencies turn out not to have changed (an equality-suppressed memo upstream) skips
+/// the body.
+///
+/// An `EffectRun` holds only a weak reference, so it never keeps a disposed effect alive; running
+/// one whose effect has been disposed or dropped is a no-op.
+pub struct EffectRun {
+    effect: Weak<EffectInner>,
+}
+
+impl EffectRun {
+    /// Verifies the effect's dependencies and runs its body if they actually changed.
+    ///
+    /// Must be called on the reactor's thread. When called outside any flush, the run opens a
+    /// flush of its own; see [`Reactor::external_flush`] for draining a batch as one flush.
+    pub fn run(mut self) {
+        let Some(effect) = self.effect.upgrade() else {
+            return;
+        };
+        // Disarm the discard handling below: `run_scheduled` clears `scheduled` itself, and it
+        // must stay set until then so marks arriving mid-run coalesce instead of queueing a
+        // second run.
+        self.effect = Weak::new();
+
+        if effect.reactor.in_flush() {
+            effect.run_scheduled();
+            return;
+        }
+
+        // Outside any flush, this single run *is* the flush: it needs its own epoch so the
+        // divergence guard does not accumulate unrelated runs into whichever epoch the reactor's
+        // last microtask flush happened to leave behind.
+        let reactor = effect.reactor.clone();
+        reactor.begin_flush();
+
+        struct Guard<'a>(&'a Reactor);
+
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.end_flush();
+            }
+        }
+
+        let _guard = Guard(&reactor);
+        effect.run_scheduled();
+    }
+
+    /// Returns the effect's node id, for a scheduler that keys queues or diagnostics by node.
+    pub fn id(&self) -> Option<NodeId> {
+        self.effect.upgrade().map(|effect| effect.id)
+    }
+
+    /// Returns `true` when the effect has been disposed or dropped, so running this would be a
+    /// no-op. A scheduler may use it to drop stale entries from a queue.
+    pub fn is_stale(&self) -> bool {
+        self.effect
+            .upgrade()
+            .is_none_or(|effect| effect.disposed.get())
+    }
+}
+
+impl Drop for EffectRun {
+    /// Releases the effect's "already scheduled" latch when a scheduler discards a run.
+    ///
+    /// The latch is what makes repeat invalidations coalesce into one pending run. It is cleared
+    /// when a run executes; without clearing it here too, a discarded run would leave the effect
+    /// latched forever and every later invalidation would coalesce into a run that no longer
+    /// exists — permanent, silent starvation. The effect keeps its dirty mark, so the next
+    /// invalidation schedules it afresh and the missed change is not lost.
+    fn drop(&mut self) {
+        if let Some(effect) = self.effect.upgrade() {
+            effect.scheduled.set(false);
+        }
+    }
+}
+
+impl core::fmt::Debug for EffectRun {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EffectRun")
+            .field("id", &self.id())
+            .field("stale", &self.is_stale())
+            .finish()
+    }
+}
+
 /// Disposable handle for a reactive effect.
 ///
 /// An effect created outside any owner is disposed when the last clone of its handle is
@@ -95,18 +237,77 @@ impl Reactor {
     /// changes.
     #[track_caller]
     pub fn effect(&self, f: impl Fn() + 'static) -> EffectHandle {
-        EffectHandle::new(self.clone(), f)
+        EffectHandle::new(self.clone(), None, f)
+    }
+
+    /// Creates an effect scheduled by `scheduler` rather than by this reactor's microtask lane.
+    ///
+    /// Marking, coalescing, and dependency verification are unchanged; the scheduler decides only
+    /// when the ready run happens. Consumers build effect phases this way — one queue per phase,
+    /// drained in whatever order and at whatever moment suits the host — instead of adaptite
+    /// imposing a phase list. See [`EffectScheduler`] for the contract and
+    /// [`external_flush`](Self::external_flush) for draining a queue as one flush.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    ///
+    /// use adaptite::{EffectRun, Reactor, signal_in};
+    ///
+    /// let reactor = Reactor::new();
+    /// let lane: Rc<RefCell<Vec<EffectRun>>> = Rc::new(RefCell::new(Vec::new()));
+    /// let value = signal_in(&reactor, 1);
+    /// let seen = Rc::new(RefCell::new(Vec::new()));
+    ///
+    /// let effect = reactor.effect_with(
+    ///     {
+    ///         let lane = Rc::clone(&lane);
+    ///         move |ready: EffectRun| lane.borrow_mut().push(ready)
+    ///     },
+    ///     {
+    ///         let value = value.clone();
+    ///         let seen = Rc::clone(&seen);
+    ///         move || seen.borrow_mut().push(value.get())
+    ///     },
+    /// );
+    ///
+    /// // The reactor's own lane never runs this effect.
+    /// reactor.flush_now();
+    /// assert!(seen.borrow().is_empty());
+    ///
+    /// reactor.external_flush(|| {
+    ///     for ready in lane.borrow_mut().drain(..) {
+    ///         ready.run();
+    ///     }
+    /// });
+    /// assert_eq!(*seen.borrow(), [1]);
+    /// # effect.dispose();
+    /// ```
+    #[track_caller]
+    pub fn effect_with(
+        &self,
+        scheduler: impl EffectScheduler + 'static,
+        f: impl Fn() + 'static,
+    ) -> EffectHandle {
+        EffectHandle::new(self.clone(), Some(Rc::new(scheduler)), f)
     }
 }
 
 impl EffectHandle {
     #[track_caller]
-    fn new(reactor: Reactor, effect: impl Fn() + 'static) -> Self {
+    fn new(
+        reactor: Reactor,
+        scheduler: Option<Rc<dyn EffectScheduler>>,
+        effect: impl Fn() + 'static,
+    ) -> Self {
         let id = reactor.allocate_node();
         let inner = Rc::new(EffectInner {
             reactor: reactor.clone(),
             id,
             effect: Box::new(effect),
+            scheduler,
             state: Cell::new(State::Dirty),
             scheduled: Cell::new(false),
             disposed: Cell::new(false),
@@ -200,6 +401,8 @@ struct EffectInner {
     reactor: Reactor,
     id: NodeId,
     effect: Box<dyn Fn() + 'static>,
+    /// When set, ready runs are handed to this scheduler instead of the reactor's job queue.
+    scheduler: Option<Rc<dyn EffectScheduler>>,
     state: Cell<State>,
     scheduled: Cell<bool>,
     disposed: Cell<bool>,
@@ -241,15 +444,34 @@ impl EffectInner {
             return;
         }
 
+        let weak = self.self_ref.borrow().clone();
+
+        if let Some(scheduler) = &self.scheduler {
+            #[cfg(debug_assertions)]
+            tracing::trace!(
+                target: trace_targets::EFFECT,
+                event = "schedule_effect",
+                node_id = self.id.0,
+                queued = true,
+                external = true,
+                "handed ready effect to a consumer scheduler"
+            );
+            // The scheduler is free to run this inline, which would re-enter `schedule` through a
+            // write in the body; `scheduled` is already set, so that re-entry coalesces rather
+            // than recursing.
+            scheduler.schedule(EffectRun { effect: weak });
+            return;
+        }
+
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::EFFECT,
             event = "schedule_effect",
             node_id = self.id.0,
             queued = true,
+            external = false,
             "queued effect for microtask flush"
         );
-        let weak = self.self_ref.borrow().clone();
         let reactor = self.reactor.clone();
         reactor.schedule(move || {
             let Some(inner) = weak.upgrade() else {
@@ -481,7 +703,256 @@ mod tests {
 
     use crate::{Reactor, signal_in};
 
-    use super::EffectHandle;
+    use super::{EffectHandle, EffectRun};
+
+    /// A consumer-defined lane: effects queue here and run only when the consumer drains.
+    #[derive(Clone, Default)]
+    struct Lane(Rc<RefCell<Vec<EffectRun>>>);
+
+    impl Lane {
+        fn scheduler(&self) -> impl Fn(EffectRun) + 'static {
+            let queue = Rc::clone(&self.0);
+            move |ready| queue.borrow_mut().push(ready)
+        }
+
+        fn len(&self) -> usize {
+            self.0.borrow().len()
+        }
+
+        fn drain(&self, reactor: &Reactor) {
+            reactor.external_flush(|| {
+                // Take the queue rather than iterating it: a run may re-schedule its own effect,
+                // which pushes onto the same queue while we hold it.
+                let ready = core::mem::take(&mut *self.0.borrow_mut());
+                for run in ready {
+                    run.run();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_custom_scheduler_owns_when_the_effect_runs() {
+        let reactor = Reactor::new();
+        let lane = Lane::default();
+        let value = signal_in(&reactor, 1);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let effect = reactor.effect_with(lane.scheduler(), {
+            let value = value.clone();
+            let seen = Rc::clone(&seen);
+            move || seen.borrow_mut().push(value.get())
+        });
+
+        // Even the initial run belongs to the lane, and the reactor's own flush never claims it.
+        assert_eq!(lane.len(), 1);
+        reactor.flush_now();
+        assert!(seen.borrow().is_empty(), "the reactor lane must not run it");
+
+        lane.drain(&reactor);
+        assert_eq!(*seen.borrow(), [1]);
+
+        value.set(2);
+        assert_eq!(lane.len(), 1, "an invalidation re-enters the scheduler");
+        assert_eq!(*seen.borrow(), [1], "and still does not run inline");
+
+        lane.drain(&reactor);
+        assert_eq!(*seen.borrow(), [1, 2]);
+
+        effect.dispose();
+    }
+
+    #[test]
+    fn scheduled_runs_coalesce_between_drains() {
+        let reactor = Reactor::new();
+        let lane = Lane::default();
+        let value = signal_in(&reactor, 0);
+        let runs = Rc::new(Counter::new(0));
+
+        let effect = reactor.effect_with(lane.scheduler(), {
+            let value = value.clone();
+            let runs = Rc::clone(&runs);
+            move || {
+                value.get();
+                runs.set(runs.get() + 1);
+            }
+        });
+        lane.drain(&reactor);
+        assert_eq!(runs.get(), 1);
+
+        for next in 1..=5 {
+            value.set(next);
+        }
+        assert_eq!(
+            lane.len(),
+            1,
+            "repeat invalidations coalesce into the pending run"
+        );
+
+        lane.drain(&reactor);
+        assert_eq!(runs.get(), 2, "the effect observes only the final value");
+
+        effect.dispose();
+    }
+
+    #[test]
+    fn separate_lanes_run_in_the_order_the_consumer_drains_them() {
+        // The point of the feature: phases are the consumer's to define and order.
+        let reactor = Reactor::new();
+        let (state, render) = (Lane::default(), Lane::default());
+        let value = signal_in(&reactor, 1);
+        let order = Rc::new(RefCell::new(Vec::new()));
+
+        let write_dom = reactor.effect_with(render.scheduler(), {
+            let value = value.clone();
+            let order = Rc::clone(&order);
+            move || {
+                value.get();
+                order.borrow_mut().push("render");
+            }
+        });
+        let propagate = reactor.effect_with(state.scheduler(), {
+            let value = value.clone();
+            let order = Rc::clone(&order);
+            move || {
+                value.get();
+                order.borrow_mut().push("state");
+            }
+        });
+
+        // Drained state-first, though the render effect was created first and marked first.
+        state.drain(&reactor);
+        render.drain(&reactor);
+        assert_eq!(*order.borrow(), ["state", "render"]);
+
+        write_dom.dispose();
+        propagate.dispose();
+    }
+
+    #[test]
+    fn discarding_a_run_does_not_starve_the_effect_forever() {
+        // A render lane that drops queued work — for a pane that got hidden, say — must not
+        // permanently latch the effect as "already scheduled".
+        let reactor = Reactor::new();
+        let lane = Lane::default();
+        let value = signal_in(&reactor, 1);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let effect = reactor.effect_with(lane.scheduler(), {
+            let value = value.clone();
+            let seen = Rc::clone(&seen);
+            move || seen.borrow_mut().push(value.get())
+        });
+        lane.drain(&reactor);
+        assert_eq!(*seen.borrow(), [1], "the dependency edge is now recorded");
+
+        // Invalidate, then discard the queued run instead of running it.
+        value.set(2);
+        assert_eq!(lane.len(), 1);
+        lane.0.borrow_mut().clear();
+        assert_eq!(*seen.borrow(), [1], "the discarded run never executed");
+
+        // The next invalidation must reach the scheduler again.
+        value.set(3);
+        assert_eq!(
+            lane.len(),
+            1,
+            "a discarded run must leave the effect schedulable"
+        );
+
+        lane.drain(&reactor);
+        assert_eq!(
+            *seen.borrow(),
+            [1, 3],
+            "the effect resumes at the current value; the skipped one is not replayed"
+        );
+
+        effect.dispose();
+    }
+
+    #[test]
+    fn running_a_disposed_effect_is_a_no_op() {
+        let reactor = Reactor::new();
+        let lane = Lane::default();
+        let runs = Rc::new(Counter::new(0));
+
+        let effect = reactor.effect_with(lane.scheduler(), {
+            let runs = Rc::clone(&runs);
+            move || runs.set(runs.get() + 1)
+        });
+
+        assert_eq!(lane.len(), 1);
+        effect.dispose();
+
+        let ready = lane.0.borrow_mut().pop().expect("a run was queued");
+        assert!(ready.is_stale(), "a disposed effect reports its run stale");
+        ready.run();
+        assert_eq!(runs.get(), 0);
+    }
+
+    #[test]
+    fn external_flush_gives_a_whole_drain_one_epoch() {
+        let reactor = Reactor::new();
+        let lane = Lane::default();
+        let epochs = Rc::new(RefCell::new(Vec::new()));
+
+        // Two independent effects in one lane must share the drain's epoch, so the divergence
+        // guard counts their runs against the same flush rather than against one flush each.
+        for _ in 0..2 {
+            reactor
+                .effect_with(lane.scheduler(), {
+                    let reactor = reactor.clone();
+                    let epochs = Rc::clone(&epochs);
+                    move || epochs.borrow_mut().push(reactor.flush_epoch())
+                })
+                .leak();
+        }
+
+        lane.drain(&reactor);
+        let observed = epochs.borrow().clone();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(
+            observed[0], observed[1],
+            "one drain is one flush: {observed:?}"
+        );
+
+        // A second drain is a second flush.
+        epochs.borrow_mut().clear();
+        lane.drain(&reactor);
+        assert!(epochs.borrow().is_empty(), "nothing was invalidated");
+    }
+
+    #[test]
+    fn a_run_outside_any_flush_opens_its_own() {
+        let reactor = Reactor::new();
+        let lane = Lane::default();
+        let epochs = Rc::new(RefCell::new(Vec::new()));
+        let value = signal_in(&reactor, 0);
+
+        let effect = reactor.effect_with(lane.scheduler(), {
+            let reactor = reactor.clone();
+            let value = value.clone();
+            let epochs = Rc::clone(&epochs);
+            move || {
+                value.get();
+                epochs.borrow_mut().push(reactor.flush_epoch());
+            }
+        });
+
+        // Run bare, with no enclosing external_flush.
+        lane.0.borrow_mut().pop().expect("initial run queued").run();
+        value.set(1);
+        lane.0.borrow_mut().pop().expect("rerun queued").run();
+
+        let observed = epochs.borrow().clone();
+        assert_eq!(observed.len(), 2);
+        assert_ne!(
+            observed[0], observed[1],
+            "each bare run is its own flush: {observed:?}"
+        );
+
+        effect.dispose();
+    }
 
     #[test]
     fn effects_flush_through_microtasks_and_coalesce() {
