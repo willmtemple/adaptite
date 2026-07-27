@@ -118,6 +118,47 @@ completion can never overwrite a newer value. The resource exposes the latest
 value (`None` until first completion) and a separately-tracked `loading` flag,
 so a UI can render stale data with a spinner during refetch.
 
+### The ambient reactor, and state that outlives a component
+
+The free constructors (`signal`, `memo`, `effect`, …) create nodes on the
+thread's *default* reactor, obtained from `current()`. Creating long-lived
+reactive state this way — outside any component, from a key handler or a
+registry that owns it for the life of the process — is **supported**: those
+nodes join the ambient reactor, which is the same graph a host framework
+running on that thread flushes. A pane registry owning a signal per process,
+read by components that come and go, is a correct use of the library.
+
+What is *not* guaranteed for free is that the ambient reactor stays the same
+one. The thread default is cached weakly, so it lives only as long as some
+node, `Reactor` handle, or guard keeps it alive. If everything referencing it
+is dropped, the next `current()` installs a fresh, unrelated reactor — and
+because writes to a node on an unflushed graph mark dependents stale without
+scheduling anything, the symptom is "this value changes and nothing reacts",
+with no panic to point at the cause. Adaptite logs that re-install at `warn`
+level on the `adaptite::graph` target.
+
+An application or framework that owns a graph should make it a fact rather
+than a coincidence:
+
+```rust
+// Once, for the lifetime of the application. The guard holds a *strong*
+// reference, so the reactor cannot expire and be replaced underneath you.
+let reactor = adaptite::Reactor::new();
+let guard = reactor.enter();
+
+// Anything created from here on joins that reactor, with no handle in scope.
+assert_eq!(adaptite::current().id(), reactor.id());
+let pane_title = adaptite::signal(String::from("shell"));
+assert_eq!(pane_title.get(), "shell");
+
+drop(guard);
+```
+
+and `try_current()` returns `Option<Reactor>` without installing anything, for
+code where a missing reactor should be an error rather than a new graph. Two
+handles address the same graph exactly when `Reactor::id()` matches, which is
+how a consumer confirms its state landed where it expected.
+
 ### Untracked reads
 
 `untrack(|| ...)` suspends dependency recording, and `signal.peek()` /

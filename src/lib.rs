@@ -34,7 +34,7 @@ pub use effect::{EffectHandle, effect, effect_in};
 pub use event::{Event, Subscription, event, event_in, on, on_in};
 pub use id::NodeId;
 pub use observable::{DynObservable, Observable};
-pub use reactor::{ReactCycleError, Reactor, current, untrack};
+pub use reactor::{EnterGuard, ReactCycleError, Reactor, current, try_current, untrack};
 pub use resource::{Resource, resource, resource_in};
 pub use scope::{Owner, ScopeHandle, on_cleanup, owner, scope, unowned};
 pub use signal::{Signal, signal, signal_in};

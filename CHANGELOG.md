@@ -22,8 +22,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run()` cancelling tasks still pending at quiescence, and `select!` no longer
   polling in lexical order.
 
+### Added
+
+- `Reactor::try_current()` (and the free `try_current()`) returns
+  `Option<Reactor>` without installing a reactor, so code that must run on an
+  existing graph can tell "the application's reactor" from "a fresh graph
+  nobody flushes" instead of silently getting the latter.
+- `Reactor::enter()` installs a reactor as the thread default and returns an
+  `EnterGuard` holding a *strong* reference for its lifetime. The ambient
+  reactor becomes a fact rather than a race with whoever holds the last handle.
+  Entering nests; dropping a guard restores the previous default, including
+  none.
+- `Reactor::id()` exposes the process-local `ReactorId`. Two handles address the
+  same graph exactly when their ids match, which is how a consumer confirms that
+  ambient constructors landed on the reactor it expected.
+
 ### Changed
 
+- `Reactor::current()` logs at `warn` on the `adaptite::graph` target when it
+  has to install a *replacement* default — that is, when a previously installed
+  default expired. Nodes created on either side of that point are on separate
+  graphs and can never interact, and because writes on an unflushed graph mark
+  dependents stale without scheduling anything, the failure is otherwise silent.
+  The first install on a thread stays a `debug`-level event; implicit
+  installation remains the default for scripts and tests.
+- Documented the contract for reactive state created outside a component: such
+  nodes join the ambient reactor and this is supported, with `enter()` as the
+  supported way for a host framework to guarantee which reactor that is.
 - Documented the runite version contract: adaptite tracks one runite minor at a
   time, and an application should take whatever runite adaptite resolves rather
   than pinning its own. `mise run runite-current` reports when a newer runite

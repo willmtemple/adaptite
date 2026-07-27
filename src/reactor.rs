@@ -24,6 +24,13 @@ static NEXT_REACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static CURRENT_REACTOR: RefCell<Weak<ReactorInner>> = const { RefCell::new(Weak::new()) };
+    /// Strong reference held for the lifetime of an [`EnterGuard`], so an explicitly entered
+    /// reactor stays the thread default even when the caller holds no other handle.
+    static ANCHORED_REACTOR: RefCell<Option<Rc<ReactorInner>>> = const { RefCell::new(None) };
+    /// How many times a default reactor has been installed on this thread. A second install
+    /// means the previous default expired, so nodes created before and after it are on
+    /// different graphs — the silent failure [`Reactor::current`] warns about.
+    static DEFAULT_INSTALL_COUNT: Cell<u32> = const { Cell::new(0) };
     static UNTRACKED_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -34,14 +41,49 @@ thread_local! {
     static RUNNING_REACTOR: Cell<*const ()> = const { Cell::new(core::ptr::null()) };
 }
 
-/// Returns the current thread's default reactor.
+/// Returns the current thread's default reactor, installing one if there is none.
 ///
-/// The first call on a thread creates a new reactor for that thread and caches it in thread-local
-/// storage. The cache is weak: the default reactor lives only as long as some node or `Reactor`
-/// handle keeps it alive. If everything referencing it is dropped, the next call creates a
-/// fresh, unrelated reactor.
+/// See [`Reactor::current`] for the installation rules, and [`try_current`] for the
+/// non-installing variant.
 pub fn current() -> Reactor {
     Reactor::current()
+}
+
+/// Returns the current thread's default reactor, or `None` if no reactor is installed.
+///
+/// Unlike [`current`], this never installs one. Use it when landing on a fresh, unflushed graph
+/// would be a bug rather than a convenience — see [`Reactor::enter`].
+pub fn try_current() -> Option<Reactor> {
+    Reactor::try_current()
+}
+
+/// Restores the previous thread-default reactor when dropped.
+///
+/// Created by [`Reactor::enter`]. While alive, the guard holds a strong reference to the entered
+/// reactor, so it cannot expire and be silently replaced by a fresh graph.
+///
+/// The guard is not `Send`: a reactor and its default installation are thread-local.
+pub struct EnterGuard {
+    previous_default: Weak<ReactorInner>,
+    previous_anchor: Option<Rc<ReactorInner>>,
+}
+
+impl fmt::Debug for EnterGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnterGuard").finish_non_exhaustive()
+    }
+}
+
+impl Drop for EnterGuard {
+    fn drop(&mut self) {
+        CURRENT_REACTOR.replace(core::mem::take(&mut self.previous_default));
+        ANCHORED_REACTOR.replace(self.previous_anchor.take());
+        tracing::debug!(
+            target: trace_targets::GRAPH,
+            event = "reactor_exit",
+            "restored the previous thread default reactor"
+        );
+    }
 }
 
 /// Runs `f` with dependency tracking suspended.
@@ -310,26 +352,128 @@ impl Reactor {
         })
     }
 
-    /// Returns the current thread's default reactor.
+    /// Returns the current thread's default reactor, installing one if there is none.
+    ///
+    /// The free constructors ([`crate::signal`], [`crate::effect`], and friends) call this, so
+    /// this is the reactor that reactive state created outside any explicit reactor lands on.
+    ///
+    /// # Installation and lifetime
+    ///
+    /// The thread's default is cached weakly: it lives only as long as some node, `Reactor`
+    /// handle, or [`EnterGuard`] keeps it alive. When nothing does, the next call installs a
+    /// *fresh, unrelated* reactor — and nodes created before and after that point cannot observe
+    /// each other. Because writes to a node on an unflushed graph mark dependents stale without
+    /// ever scheduling anything, the symptom is "this value changes and nothing reacts", with no
+    /// panic and nothing pointing at the cause. A re-install therefore logs at `warn` level on
+    /// the `adaptite::graph` target.
+    ///
+    /// Applications that own a long-lived graph should not rely on that cache at all. Hold the
+    /// reactor alive explicitly with [`enter`](Self::enter), which anchors it as the thread
+    /// default for the guard's lifetime, and reach for [`try_current`](Self::try_current) where
+    /// a missing reactor should be an error rather than a new graph.
     pub fn current() -> Self {
-        if let Some(inner) = CURRENT_REACTOR.with(|r| r.borrow().upgrade()) {
+        if let Some(reactor) = Self::try_current() {
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::GRAPH,
                 event = "current_reactor_reuse",
                 "reusing current thread default reactor"
             );
-            return Self { inner };
+            return reactor;
         }
 
         let reactor = Self::new();
         CURRENT_REACTOR.replace(Rc::downgrade(&reactor.inner));
+        let installs = DEFAULT_INSTALL_COUNT.with(|count| {
+            let installs = count.get().wrapping_add(1);
+            count.set(installs);
+            installs
+        });
+        if installs > 1 {
+            // The previous default expired while this thread was still using the ambient
+            // constructors. Nothing is broken *yet* — but nodes created from here on are on a
+            // different graph than the ones created before, and the two can never interact.
+            tracing::warn!(
+                target: trace_targets::GRAPH,
+                event = "current_reactor_reinstall",
+                installs,
+                "the thread's default reactor expired and a fresh, unrelated one was installed; \
+                 nodes created before and after this point are on separate graphs. Hold the \
+                 reactor alive with Reactor::enter, or use try_current to make the absence an \
+                 error"
+            );
+        } else {
+            tracing::debug!(
+                target: trace_targets::GRAPH,
+                event = "current_reactor_install",
+                "installed current thread default reactor"
+            );
+        }
+        reactor
+    }
+
+    /// Returns the current thread's default reactor, or `None` if none is installed.
+    ///
+    /// Unlike [`current`](Self::current), this never installs one, so it distinguishes "the
+    /// application's reactor" from "a fresh graph nobody flushes" — a distinction the caller
+    /// otherwise cannot make.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::Reactor;
+    ///
+    /// let reactor = Reactor::new();
+    /// let _guard = reactor.enter();
+    /// let current = Reactor::try_current().expect("the entered reactor is the thread default");
+    /// assert_eq!(current.id(), reactor.id());
+    /// ```
+    pub fn try_current() -> Option<Self> {
+        CURRENT_REACTOR
+            .with(|r| r.borrow().upgrade())
+            .map(|inner| Self { inner })
+    }
+
+    /// Installs this reactor as the thread's default until the returned guard drops.
+    ///
+    /// The guard holds a *strong* reference, so "the current reactor" becomes a fact for its
+    /// lifetime rather than a race with whoever happens to hold the last handle. This is what a
+    /// host framework should do once, for the lifetime of the application: reactive state created
+    /// outside any component — a registry of long-lived signals, say — then provably joins the
+    /// same graph the framework flushes, instead of joining it by coincidence.
+    ///
+    /// Entering nests. Dropping the guard restores whatever default was installed before it,
+    /// including none. Guards must be dropped in reverse order of creation; dropping them out of
+    /// order restores an older default and is a bug, though not an unsound one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::{Reactor, signal};
+    ///
+    /// let reactor = Reactor::new();
+    /// let guard = reactor.enter();
+    ///
+    /// // Created far from any component, with no handle to the reactor in scope.
+    /// let title = signal(String::from("shell"));
+    /// title.set(String::from("editor"));
+    /// assert_eq!(title.with(|title| title.clone()), "editor");
+    ///
+    /// drop(guard);
+    /// ```
+    pub fn enter(&self) -> EnterGuard {
+        let previous_default = CURRENT_REACTOR.replace(Rc::downgrade(&self.inner));
+        let previous_anchor = ANCHORED_REACTOR.replace(Some(Rc::clone(&self.inner)));
         tracing::debug!(
             target: trace_targets::GRAPH,
-            event = "current_reactor_install",
-            "installed current thread default reactor"
+            event = "reactor_enter",
+            reactor_id = self.inner.id.get(),
+            "entered reactor as the thread default"
         );
-        reactor
+        EnterGuard {
+            previous_default,
+            previous_anchor,
+        }
     }
 
     /// Runs `f` in the dependency-tracking scope of `observer`.
@@ -806,6 +950,14 @@ impl Reactor {
         self.inner.diagnostics_active.get()
     }
 
+    /// Returns this reactor's process-local identifier.
+    ///
+    /// Two `Reactor` handles address the same graph exactly when their ids are equal — which is
+    /// how a caller confirms that ambient constructors landed on the reactor it expected.
+    pub fn id(&self) -> ReactorId {
+        self.inner.id
+    }
+
     pub(crate) fn diagnostic_id(&self) -> ReactorId {
         self.inner.id
     }
@@ -1018,6 +1170,87 @@ mod tests {
         let one = current();
         let two = current();
         assert!(Rc::ptr_eq(&one.inner, &two.inner));
+    }
+
+    #[test]
+    fn try_current_reports_absence_instead_of_installing_a_reactor() {
+        // The test harness gives each test a fresh thread, so nothing is installed yet.
+        assert!(
+            super::try_current().is_none(),
+            "try_current must not install a reactor"
+        );
+        assert!(
+            super::try_current().is_none(),
+            "and must still report absence after being asked once"
+        );
+
+        let installed = current();
+        let observed = super::try_current().expect("current installed a default");
+        assert_eq!(observed.id(), installed.id());
+    }
+
+    #[test]
+    fn entering_anchors_the_reactor_as_the_thread_default() {
+        let reactor = Reactor::new();
+        let expected = reactor.id();
+        let guard = reactor.enter();
+
+        // Drop every other handle: the guard alone must keep this reactor current. Without the
+        // strong anchor, `current()` here would install a fresh, unrelated graph.
+        drop(reactor);
+
+        assert_eq!(
+            current().id(),
+            expected,
+            "the entered reactor stays current with no other handle alive"
+        );
+
+        drop(guard);
+        assert!(
+            super::try_current().is_none(),
+            "dropping the guard restores the absent default"
+        );
+    }
+
+    #[test]
+    fn entering_nests_and_restores_the_previous_default() {
+        let outer = Reactor::new();
+        let inner = Reactor::new();
+        let (outer_id, inner_id) = (outer.id(), inner.id());
+
+        let outer_guard = outer.enter();
+        assert_eq!(current().id(), outer_id);
+
+        let inner_guard = inner.enter();
+        assert_eq!(current().id(), inner_id);
+
+        drop(inner_guard);
+        assert_eq!(
+            current().id(),
+            outer_id,
+            "leaving the inner reactor restores the outer one"
+        );
+
+        drop(outer_guard);
+        assert!(super::try_current().is_none());
+    }
+
+    #[test]
+    fn an_expired_default_is_replaced_by_an_unrelated_reactor() {
+        // This is the failure mode `current()` warns about, pinned so the warning keeps
+        // describing something real: nodes created on either side of the expiry cannot interact.
+        let first = current().id();
+        // No node, handle, or guard survives, so the weak cache expires.
+        let second = current().id();
+
+        assert_ne!(
+            first, second,
+            "an unanchored default is replaced once nothing keeps it alive"
+        );
+
+        // Holding any handle is enough to keep it stable.
+        let held = current();
+        assert_eq!(current().id(), held.id());
     }
 
     #[test]
