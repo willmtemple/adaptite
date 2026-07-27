@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- Adaptite now requires runite 0.2 (`runite = "0.2"`). Adaptite and the
+  application must resolve the same runite — they share its thread-local
+  microtask queue — so an application on runite 0.1 must move in lockstep. The
+  `^0.1` requirement adaptite 0.1.2 declared made runite 0.2 unreachable from
+  every application in the tree. No adaptite API changed: adaptite's library
+  code touches exactly `queue_microtask` and `spawn`, neither of which changed,
+  and no runite type appears in adaptite's public API. Applications that use
+  runite directly should read runite's
+  [0.1 → 0.2 migration guide](https://github.com/willmtemple/runite/blob/main/docs/MIGRATING-0.2.md);
+  the changes that need an audit there are fallible owned-resource adoption,
+  `run()` cancelling tasks still pending at quiescence, and `select!` no longer
+  polling in lexical order.
+
+### Changed
+
+- Documented the runite version contract: adaptite tracks one runite minor at a
+  time, and an application should take whatever runite adaptite resolves rather
+  than pinning its own. `mise run runite-current` reports when a newer runite
+  minor has shipped and is therefore unreachable downstream; CI runs it
+  advisory-only.
+
 ## [0.1.2] - 2026-07-25
 
 ### Added

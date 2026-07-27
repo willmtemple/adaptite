@@ -38,6 +38,14 @@ schedules work must run on a runtime-managed thread. (Pure signal, thunk, and
 memo graphs can be read and written without a runtime; nothing that *reacts*
 can.)
 
+Because that scheduling goes through runite's thread-local queues, adaptite and
+the application must resolve the **same** runite: two copies in one dependency
+tree means two queues, and adaptite's reactive work is flushed by a runtime
+nobody is driving. Adaptite therefore depends on a single runite minor at a time
+(`runite = "0.2"` for adaptite 0.2), and reaching a newer runite minor requires
+an adaptite release against it. An application should not pin runite itself; take
+whatever adaptite resolves.
+
 Adaptite does not function across thread boundaries. It tracks dependencies
 between entities on the same thread only. Async work feeds the graph from the
 edges by updating signals or emitting events.
