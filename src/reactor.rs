@@ -604,12 +604,18 @@ impl Reactor {
             .entry(observer)
             .or_default()
             .insert(observable, self.version(observable));
-        self.inner
-            .dependents
-            .borrow_mut()
-            .entry(observable)
-            .or_default()
-            .insert(observer);
+        let became_observed = {
+            let mut dependents = self.inner.dependents.borrow_mut();
+            let observers = dependents.entry(observable).or_default();
+            let was_unobserved = observers.is_empty();
+            observers.insert(observer);
+            was_unobserved
+        };
+        // Deliver the transition only after the graph maps are released: a hook is consumer code
+        // that may read or write the graph.
+        if became_observed {
+            self.note_observation_change(observable, true);
+        }
         Ok(())
     }
 
@@ -811,6 +817,7 @@ impl Reactor {
 
         self.inner.observers.borrow_mut().remove(&node);
         self.inner.meta.borrow_mut().remove(&node);
+        self.unregister_observation_hooks(node);
     }
 
     /// Schedules a job to run in the reactor's microtask-backed job queue.
@@ -1071,16 +1078,97 @@ impl Reactor {
             .map(|edges| edges.into_keys().collect::<Vec<_>>())
             .unwrap_or_default();
 
+        let mut unobserved = Vec::new();
         for observable in observed {
             let mut dependents = self.inner.dependents.borrow_mut();
             if let Some(observers) = dependents.get_mut(&observable) {
                 observers.remove(&observer);
                 if observers.is_empty() {
                     dependents.remove(&observable);
+                    unobserved.push(observable);
                 }
             }
         }
+
+        // This runs during an observer's rerun or disposal, with graph maps borrowed; the
+        // notification is deferred, so hooks never observe a half-updated graph.
+        for observable in unobserved {
+            self.note_observation_change(observable, false);
+        }
     }
+
+    /// Records that `node` gained its first observer or lost its last, and queues delivery of the
+    /// corresponding hook.
+    ///
+    /// Delivery is deferred to a reactor job for two reasons: the graph maps are borrowed at every
+    /// call site, and deferring lets a leave/arrive pair within one flush collapse to nothing.
+    fn note_observation_change(&self, node: NodeId, observed: bool) {
+        let hooks = self.inner.observation_hooks.borrow().get(&node).cloned();
+        let Some(hooks) = hooks else {
+            return;
+        };
+
+        hooks.observed.set(observed);
+        if hooks.queued.replace(true) {
+            return;
+        }
+
+        self.schedule(move || {
+            hooks.queued.set(false);
+            if hooks.cancelled.get() {
+                return;
+            }
+            let observed = hooks.observed.get();
+            // Coalesce: only an actual change from the last delivered state is worth a callback,
+            // so a source observed, dropped, and observed again within one flush stays quiet.
+            if hooks.delivered.replace(observed) == observed {
+                return;
+            }
+            if observed {
+                (hooks.on_watch)();
+            } else {
+                (hooks.on_unwatch)();
+            }
+        });
+    }
+
+    pub(crate) fn register_observation_hooks(
+        &self,
+        node: NodeId,
+        on_watch: impl Fn() + 'static,
+        on_unwatch: impl Fn() + 'static,
+    ) {
+        self.inner.observation_hooks.borrow_mut().insert(
+            node,
+            Rc::new(ObservationHooks {
+                on_watch: Box::new(on_watch),
+                on_unwatch: Box::new(on_unwatch),
+                observed: Cell::new(false),
+                delivered: Cell::new(false),
+                queued: Cell::new(false),
+                cancelled: Cell::new(false),
+            }),
+        );
+    }
+
+    pub(crate) fn unregister_observation_hooks(&self, node: NodeId) {
+        if let Some(hooks) = self.inner.observation_hooks.borrow_mut().remove(&node) {
+            // A delivery job may already be queued and holding its own reference.
+            hooks.cancelled.set(true);
+        }
+    }
+}
+
+/// Callbacks fired when a node gains its first observer or loses its last.
+struct ObservationHooks {
+    on_watch: Box<dyn Fn()>,
+    on_unwatch: Box<dyn Fn()>,
+    /// Latest observed state, updated synchronously at the edge transition.
+    observed: Cell<bool>,
+    /// State most recently delivered to the consumer, used to suppress no-op deliveries.
+    delivered: Cell<bool>,
+    queued: Cell<bool>,
+    cancelled: Cell<bool>,
 }
 
 impl Default for Reactor {
@@ -1121,6 +1209,7 @@ struct ReactorInner {
     next_diagnostic: Cell<u64>,
     diagnostics_active: Cell<bool>,
     diagnostics: RefCell<Vec<(u64, DiagnosticCallback)>>,
+    observation_hooks: RefCell<HashMap<NodeId, Rc<ObservationHooks>>>,
 }
 
 impl ReactorInner {
@@ -1141,6 +1230,7 @@ impl ReactorInner {
             next_diagnostic: Cell::new(1),
             diagnostics_active: Cell::new(false),
             diagnostics: RefCell::new(Vec::new()),
+            observation_hooks: RefCell::new(HashMap::new()),
         }
     }
 

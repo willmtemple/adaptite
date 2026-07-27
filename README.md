@@ -30,7 +30,9 @@ computation. Those primitives are:
   component APIs.
 - `Source`: a low-level observable node for building custom reactive data
   structures with sub-container granularity (per-key, per-field), including
-  `is_observed` for garbage-collecting dependency units nobody reads.
+  `is_observed` for garbage-collecting dependency units nobody reads, and
+  `source_with_hooks` for tying an external resource — a socket, a file watcher,
+  an upstream subscription — to whether anyone is actually observing the node.
 - `writable(get, set)`: a two-way bindable derived value — a memo bundled with a
   setter that translates assignments into upstream writes. `WritableObservable`
   (`Observable` + `set`) makes signals and writable computeds interchangeable in

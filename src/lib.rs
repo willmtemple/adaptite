@@ -41,7 +41,7 @@ pub use reactor::{EnterGuard, ReactCycleError, Reactor, current, try_current, un
 pub use resource::{Resource, resource, resource_in};
 pub use scope::{Owner, ScopeHandle, on_cleanup, owner, scope, unowned};
 pub use signal::{Signal, signal, signal_in};
-pub use source::{Source, source, source_in};
+pub use source::{Source, source, source_in, source_with_hooks, source_with_hooks_in};
 pub use thunk::{
     Memo, Thunk, memo, memo_by, memo_by_in, memo_by_with_prev, memo_by_with_prev_in, memo_in,
     memo_with_prev, memo_with_prev_in, thunk, thunk_in,

@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `source_with_hooks(on_watch, on_unwatch)` (plus `source_with_hooks_in` and
+  `Reactor::source_with_hooks`) fires when a source gains its first observer and
+  loses its last, so an external resource can be acquired and released promptly
+  rather than swept. `Source::is_observed` answers the same question by polling
+  and remains the right tool for GC sweeps. Delivery is deferred to a reactor
+  job — the "last observer left" transition occurs while the reactor holds its
+  graph maps borrowed — which also means a leave/arrive pair inside one flush
+  (an observer rerunning) collapses to nothing, and neither hook is ever
+  delivered twice in a row. "Observed" means any recorded dependency edge, so
+  `on_unwatch` can be late but never early; the finer TC39
+  `Signal.subtle.watched` notion of transitive liveness is deliberately not
+  implemented yet.
 - `writable(get, set)` (plus `writable_in`) creates a two-way bindable derived
   value: a normal memo bundled with a setter that translates an assignment into
   upstream writes, run untracked. No new dependency semantics — the upstream
