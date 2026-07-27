@@ -26,6 +26,7 @@ mod signal;
 mod source;
 mod thunk;
 mod watch;
+mod writable;
 
 pub use diagnostics::{
     DiagnosticEvent, DiagnosticSubscription, InvalidationCause, InvalidationLevel, ReactorId,
@@ -46,3 +47,4 @@ pub use thunk::{
     memo_with_prev, memo_with_prev_in, thunk, thunk_in,
 };
 pub use watch::{watch, watch_in};
+pub use writable::{Writable, WritableObservable, writable, writable_in};

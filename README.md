@@ -31,6 +31,11 @@ computation. Those primitives are:
 - `Source`: a low-level observable node for building custom reactive data
   structures with sub-container granularity (per-key, per-field), including
   `is_observed` for garbage-collecting dependency units nobody reads.
+- `writable(get, set)`: a two-way bindable derived value — a memo bundled with a
+  setter that translates assignments into upstream writes. `WritableObservable`
+  (`Observable` + `set`) makes signals and writable computeds interchangeable in
+  component APIs, so a form binding is one handle rather than a
+  `(memo, callback)` pair.
 
 Adaptite is built for the runite runtime: effects, draining subscriptions,
 and resources are flushed or spawned on runite's queues, so anything that
@@ -193,6 +198,28 @@ and `try_current()` returns `Option<Reactor>` without installing anything, for
 code where a missing reactor should be an error rather than a new graph. Two
 handles address the same graph exactly when `Reactor::id()` matches, which is
 how a consumer confirms its state landed where it expected.
+
+### Deriving without the clone dance
+
+Every closure over a reactive handle otherwise starts with `let x = x.clone();`.
+`Observable::map` internalizes that for the dominant case — deriving one value
+from another:
+
+```rust
+use adaptite::{Observable, signal};
+
+let base = signal(2);
+let doubled = base.map(|value| value * 2);   // no manual clone; `base` stays usable
+
+assert_eq!(doubled.get(), 4);
+base.set(5);
+assert_eq!(doubled.get(), 10);
+```
+
+The result is an ordinary `Memo`, equality-suppressed like any other, built on
+the receiver's own reactor rather than the thread default. It does not help an
+effect body that captures several handles; that case is still explicit, and a
+`clone!` macro is deliberately deferred until real usage shows it is needed.
 
 ### Untracked reads
 

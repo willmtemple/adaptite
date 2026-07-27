@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `writable(get, set)` (plus `writable_in`) creates a two-way bindable derived
+  value: a normal memo bundled with a setter that translates an assignment into
+  upstream writes, run untracked. No new dependency semantics — the upstream
+  write invalidates the getter through the ordinary graph, and a value-identical
+  round trip is absorbed by equality suppression. The new `WritableObservable`
+  trait (`Observable` + `set`) is implemented by both `Signal` and `Writable`,
+  so component APIs can accept either.
+- `Observable::map(f)` derives a `Memo` while cloning the receiver's handle
+  internally, removing the `let x = x.clone();` line before the closure in the
+  dominant derive-a-value case. The derived memo is built on the receiver's own
+  reactor, so mapping a node from an explicit reactor stays on that reactor.
+  (A `clone!` macro remains deliberately deferred.)
+- `Observable::reactor()` reports the reactor backing an observable, defaulting
+  to `None` for implementations with no graph node. `Signal::reactor`,
+  `Thunk::reactor`, and `Memo::reactor` expose the same on the concrete handles.
 - Consumer-defined effect scheduling. `effect_with(scheduler, f)` (plus
   `effect_with_in` and `Reactor::effect_with`) hands each ready run to an
   `EffectScheduler` — any `Fn(EffectRun)` — which decides when it runs. Marking,

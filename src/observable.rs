@@ -56,6 +56,50 @@ pub trait Observable {
         self.with_peek(Self::Item::clone)
     }
 
+    /// Returns the reactor this observable's node belongs to, when it has one.
+    ///
+    /// Implementations backed by a graph node report their reactor so that combinators like
+    /// [`map`](Self::map) build derived nodes on the *same* graph rather than on the thread
+    /// default. Observables with no node — [`DynObservable::constant`], for instance — return
+    /// `None`.
+    fn reactor(&self) -> Option<crate::Reactor> {
+        None
+    }
+
+    /// Derives a memo from this observable, cloning the receiver's handle internally.
+    ///
+    /// This removes the most common `let x = x.clone();` before a closure: the combinator
+    /// captures the handle for you, and the receiver stays usable.
+    ///
+    /// The memo is created on this observable's [`reactor`](Self::reactor), so mapping a node
+    /// from an explicit reactor stays on that reactor. As with any memo, an unchanged result is
+    /// equality-suppressed and does not propagate.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::{Observable, signal};
+    ///
+    /// let base = signal(2);
+    /// let doubled = base.map(|value| value * 2);
+    ///
+    /// assert_eq!(doubled.get(), 4);
+    ///
+    /// // `base` was not moved.
+    /// base.set(5);
+    /// assert_eq!(doubled.get(), 10);
+    /// ```
+    fn map<U, F>(&self, f: F) -> Memo<U>
+    where
+        Self: Clone + Sized + 'static,
+        U: PartialEq + 'static,
+        F: Fn(&Self::Item) -> U + 'static,
+    {
+        let reactor = self.reactor().unwrap_or_else(crate::current);
+        let source = self.clone();
+        crate::memo_in(&reactor, move || source.with(&f))
+    }
+
     /// Erases this observable's concrete type behind a cheaply-cloneable handle.
     fn into_dyn(self) -> DynObservable<Self::Item>
     where
@@ -77,6 +121,10 @@ impl<T: 'static> Observable for Signal<T> {
     fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         Signal::with_peek(self, f)
     }
+
+    fn reactor(&self) -> Option<crate::Reactor> {
+        Some(Signal::reactor(self))
+    }
 }
 
 impl<T: 'static> Observable for Thunk<T> {
@@ -88,6 +136,10 @@ impl<T: 'static> Observable for Thunk<T> {
 
     fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         Thunk::with_peek(self, f)
+    }
+
+    fn reactor(&self) -> Option<crate::Reactor> {
+        Some(Thunk::reactor(self))
     }
 }
 
@@ -101,12 +153,17 @@ impl<T: 'static> Observable for Memo<T> {
     fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         Memo::with_peek(self, f)
     }
+
+    fn reactor(&self) -> Option<crate::Reactor> {
+        Some(Memo::reactor(self))
+    }
 }
 
 /// Object-safe core used by [`DynObservable`] to erase a concrete [`Observable`].
 trait ErasedObservable<T> {
     fn with_erased(&self, f: &mut dyn FnMut(&T));
     fn with_peek_erased(&self, f: &mut dyn FnMut(&T));
+    fn reactor_erased(&self) -> Option<crate::Reactor>;
 }
 
 impl<O: Observable> ErasedObservable<O::Item> for O {
@@ -116,6 +173,10 @@ impl<O: Observable> ErasedObservable<O::Item> for O {
 
     fn with_peek_erased(&self, f: &mut dyn FnMut(&O::Item)) {
         self.with_peek(|value| f(value));
+    }
+
+    fn reactor_erased(&self) -> Option<crate::Reactor> {
+        self.reactor()
     }
 }
 
@@ -190,6 +251,12 @@ impl<T: 'static> Observable for DynObservable<T> {
         self
     }
 
+    // Forward to the erased observable so `map` on a type-erased handle still builds the derived
+    // memo on the underlying node's reactor.
+    fn reactor(&self) -> Option<crate::Reactor> {
+        self.inner.reactor_erased()
+    }
+
     fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let mut f = Some(f);
         let mut output = None;
@@ -244,6 +311,86 @@ mod tests {
         assert_eq!(read(&base), 7);
         assert_eq!(read(&doubled), 14);
         assert_eq!(read(&capped), 7);
+    }
+
+    #[test]
+    fn map_derives_a_memo_without_a_manual_clone() {
+        let reactor = Reactor::new();
+        let base = signal_in(&reactor, 2);
+
+        // No `let base = base.clone()` before the closure, and `base` stays usable after.
+        let doubled = base.map(|value| value * 2);
+        assert_eq!(doubled.get(), 4);
+
+        base.set(5);
+        assert_eq!(doubled.get(), 10);
+    }
+
+    #[test]
+    fn map_builds_on_the_receivers_reactor_not_the_thread_default() {
+        // Mapping a node from an explicit reactor must stay on that reactor; landing on the
+        // thread default would make the derived memo unreadable from its own source.
+        let reactor = Reactor::new();
+        let base = signal_in(&reactor, 1);
+        let mapped = base.map(|value| value + 1);
+
+        assert_eq!(mapped.reactor().id(), reactor.id());
+
+        // A memo on the same reactor can compose with it without tripping the cross-reactor check.
+        let composed = memo_in(&reactor, {
+            let mapped = mapped.clone();
+            move || mapped.get() * 10
+        });
+        assert_eq!(composed.get(), 20);
+    }
+
+    #[test]
+    fn map_suppresses_equal_results() {
+        let reactor = Reactor::new();
+        let base = signal_in(&reactor, 1);
+        let parity = base.map(|value| value % 2);
+
+        let recomputes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let downstream = memo_in(&reactor, {
+            let parity = parity.clone();
+            let recomputes = std::rc::Rc::clone(&recomputes);
+            move || {
+                recomputes.set(recomputes.get() + 1);
+                parity.get()
+            }
+        });
+        assert_eq!(downstream.get(), 1);
+        assert_eq!(recomputes.get(), 1);
+
+        // Same parity: the mapped memo's equality check absorbs the change.
+        base.set(3);
+        assert_eq!(downstream.get(), 1);
+        assert_eq!(recomputes.get(), 1);
+
+        base.set(4);
+        assert_eq!(downstream.get(), 0);
+        assert_eq!(recomputes.get(), 2);
+    }
+
+    #[test]
+    fn map_chains_and_works_through_erasure() {
+        let reactor = Reactor::new();
+        let base = signal_in(&reactor, 3);
+        let chained = base.map(|value| value * 2).map(|value| value + 1);
+        assert_eq!(chained.get(), 7);
+
+        let erased: DynObservable<i32> = base.clone().into_dyn();
+        let from_erased = erased.map(|value| value * 100);
+        assert_eq!(
+            from_erased.reactor().id(),
+            reactor.id(),
+            "erasure must not lose the reactor"
+        );
+        assert_eq!(from_erased.get(), 300);
+
+        base.set(4);
+        assert_eq!(chained.get(), 9);
+        assert_eq!(from_erased.get(), 400);
     }
 
     #[test]

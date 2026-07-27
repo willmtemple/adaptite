@@ -379,6 +379,11 @@ impl<T: 'static> Thunk<T> {
 }
 
 impl<T: 'static> Thunk<T> {
+    /// Returns the reactor this thunk's node belongs to.
+    pub fn reactor(&self) -> Reactor {
+        self.inner.reactor.clone()
+    }
+
     /// Runs `f` with a shared reference to the current computed value without recording a
     /// dependency. The thunk is still brought up to date before `f` runs.
     ///
@@ -462,6 +467,11 @@ impl<T: 'static> Memo<T> {
 }
 
 impl<T: 'static> Memo<T> {
+    /// Returns the reactor this memo's node belongs to.
+    pub fn reactor(&self) -> Reactor {
+        self.inner.reactor.clone()
+    }
+
     /// Runs `f` with a shared reference to the current computed value without recording a
     /// dependency. The memo is still brought up to date before `f` runs.
     ///
