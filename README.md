@@ -150,6 +150,24 @@ an `.await`, the original owner is no longer on the stack. Capture it first
 with `owner()` and re-enter with `Owner::run_in` so effects created after the
 suspension are still disposed with their scope.
 
+### Error boundaries
+
+One buggy widget's panicking effect otherwise unwinds out of the whole flush.
+`scope_catch(f, on_error)` is a scope that confines the blast radius: a panic
+from any effect it owns, at any depth, is delivered to the handler as an
+`ErrorInfo` — payload, message, and the failing effect's creation site — instead
+of propagating. The nearest enclosing boundary wins, and boundaries nest.
+
+The panicking effect is disposed before the handler runs: its dependency
+tracking was cut short mid-run, and a panic during dependency verification
+re-queues it, so leaving it live would re-run and re-panic immediately. The
+failure is terminal for that effect, and the handler decides what replaces it.
+Siblings and the rest of the scope keep running.
+
+Boundaries are for *bugs*. A fetch that 404s or a parse that fails should stay
+in the graph as a `Result` value so downstream nodes can react to it. Under
+`panic = "abort"` there is nothing to catch and the boundary is never invoked.
+
 ### Async data
 
 `resource(source, fetch)` connects the graph to runite's async side: `source`

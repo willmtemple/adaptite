@@ -39,7 +39,7 @@ pub use id::NodeId;
 pub use observable::{DynObservable, Observable};
 pub use reactor::{EnterGuard, ReactCycleError, Reactor, current, try_current, untrack};
 pub use resource::{Resource, resource, resource_in};
-pub use scope::{Owner, ScopeHandle, on_cleanup, owner, scope, unowned};
+pub use scope::{ErrorInfo, Owner, ScopeHandle, on_cleanup, owner, scope, scope_catch, unowned};
 pub use signal::{Signal, signal, signal_in};
 pub use source::{Source, source, source_in, source_with_hooks, source_with_hooks_in};
 pub use thunk::{

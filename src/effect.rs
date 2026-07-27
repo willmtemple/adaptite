@@ -2,8 +2,13 @@ use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak};
 use core::cell::{Cell, RefCell};
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use crate::reactor::{Mark, ObserverHook, State};
-use crate::scope::{OwnedDisposable, OwnerFrame, adopt_into_current, with_owner};
+use crate::scope::{
+    OwnedDisposable, OwnerFrame, adopt_into_current, build_error_info, error_handler_for,
+    with_owner,
+};
 use crate::{DiagnosticEvent, InvalidationCause, NodeId, Reactor, current, trace_targets};
 
 /// Maximum number of times a single effect may run within one job flush before the reactor
@@ -481,7 +486,41 @@ impl EffectInner {
         });
     }
 
+    /// Runs the effect, routing a panic to the nearest enclosing error boundary when there is one.
+    ///
+    /// The whole run is covered, not just the body: dependency verification executes upstream
+    /// computations, and a panic there is exactly the kind of failure a boundary exists to
+    /// contain.
     fn run_scheduled(self: &Rc<Self>) {
+        let Some(handler) = error_handler_for(&self.owner) else {
+            self.run_scheduled_inner();
+            return;
+        };
+
+        // `AssertUnwindSafe` is the honest choice here rather than a workaround: the reactor is
+        // already built to survive a panicking effect — the flush guard hands remaining jobs to a
+        // fresh flush, and computed nodes restore their dirty mark on unwind — and containing
+        // exactly that damage is what a boundary is for.
+        let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.run_scheduled_inner())) else {
+            return;
+        };
+
+        let origin = self.reactor.origin(self.id);
+        tracing::warn!(
+            target: trace_targets::EFFECT,
+            event = "effect_panicked",
+            node_id = self.id.0,
+            "effect panicked and was disposed by an enclosing error boundary"
+        );
+        // Dispose before reporting. A panicking effect had its dependency tracking cut short
+        // mid-run, and a panic during verification re-queues it, so leaving it live would re-run
+        // and re-panic immediately. Disposal makes the failure terminal for this effect and leaves
+        // the handler to decide what replaces it.
+        self.dispose();
+        handler(build_error_info(payload, self.id, origin));
+    }
+
+    fn run_scheduled_inner(self: &Rc<Self>) {
         if self.disposed.get() {
             self.scheduled.set(false);
             return;
@@ -600,6 +639,7 @@ impl EffectInner {
         // Run cleanups from the previous run and dispose nested effects it created, then run
         // with this effect as the innermost owner so new cleanups and children register here.
         self.owner.reset();
+
         with_owner(&self.owner, || {
             self.reactor.run_in_context(self.id, || (self.effect)())
         });

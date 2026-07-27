@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scope_catch(f, on_error)` creates an ownership scope that catches panics from
+  the effects it owns, at any depth, and delivers them to the handler as an
+  `ErrorInfo` (payload, message, failing node, and the effect's creation site)
+  instead of unwinding out of the flush. The nearest enclosing boundary wins and
+  boundaries nest; with no boundary above it, a panic propagates exactly as
+  before. The whole run is covered, including dependency verification, since
+  that executes upstream computations. The panicking effect is disposed before
+  the handler runs — its dependency tracking was cut short mid-run, and a panic
+  during verification re-queues it, so leaving it live would re-run and re-panic
+  immediately — which makes the failure terminal for that effect and leaves the
+  handler to decide what replaces it. Siblings are unaffected. Boundaries are
+  for bugs; recoverable failures still belong in the graph as `Result` values,
+  and under `panic = "abort"` there is nothing to catch.
 - `source_with_hooks(on_watch, on_unwatch)` (plus `source_with_hooks_in` and
   `Reactor::source_with_hooks`) fires when a source gains its first observer and
   loses its last, so an external resource can be acquired and released promptly
