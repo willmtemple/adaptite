@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adaptite"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "hashbrown",
@@ -325,9 +325,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "runite"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f11b25f8127bc01ab902a03bc12eb87c7396ce34e392fe97211c605ee09139ea"
+checksum = "bcc5838e00f848b2a5744c5175b7e8ec8c0acc5f7145ae275c49a94faeeb68cd"
 dependencies = [
  "libc",
  "runite-proc-macros",
@@ -337,9 +337,9 @@ dependencies = [
 
 [[package]]
 name = "runite-proc-macros"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0e8f7585a9ecb43ca39a0332654bcb7f3b915ec1344be31fb79c38a01dbce25"
+checksum = "a7cd726738010812a0377fda6aeaced615e363c8dc49365966c68e6bb282b5b9"
 dependencies = [
  "proc-macro2",
  "quote",

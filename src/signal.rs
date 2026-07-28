@@ -110,6 +110,11 @@ impl<T: 'static> Signal<T> {
         f(&value)
     }
 
+    /// Returns the reactor this signal's node belongs to.
+    pub fn reactor(&self) -> Reactor {
+        self.inner.reactor.clone()
+    }
+
     /// Replaces the current value and marks dependents stale, even when the new value equals
     /// the old one (compare [`set`](Signal::set)).
     #[track_caller]

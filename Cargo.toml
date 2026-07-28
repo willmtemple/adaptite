@@ -1,6 +1,6 @@
 [package]
 name = "adaptite"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Fine-grained reactivity (signals, thunks, memos, effects, events) for the runite runtime"
@@ -25,7 +25,12 @@ exclude = [
 ]
 
 [dependencies]
-runite = "0.1.0"
+# Adaptite is coupled to runite's *scheduler semantics* (microtask ordering,
+# quiescence, task terminalization), not merely to its API surface — and it must
+# resolve the same runite the application does, or reactive work lands on a
+# microtask queue nobody drains. Track one runite minor at a time and cut an
+# adaptite release for each; see `mise run runite-current` for the drift check.
+runite = "0.2"
 tracing = { version = "0.1", default-features = false }
 hashbrown = "0.17"
 

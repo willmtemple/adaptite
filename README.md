@@ -30,13 +30,28 @@ computation. Those primitives are:
   component APIs.
 - `Source`: a low-level observable node for building custom reactive data
   structures with sub-container granularity (per-key, per-field), including
-  `is_observed` for garbage-collecting dependency units nobody reads.
+  `is_observed` for garbage-collecting dependency units nobody reads, and
+  `source_with_hooks` for tying an external resource — a socket, a file watcher,
+  an upstream subscription — to whether anyone is actually observing the node.
+- `writable(get, set)`: a two-way bindable derived value — a memo bundled with a
+  setter that translates assignments into upstream writes. `WritableObservable`
+  (`Observable` + `set`) makes signals and writable computeds interchangeable in
+  component APIs, so a form binding is one handle rather than a
+  `(memo, callback)` pair.
 
 Adaptite is built for the runite runtime: effects, draining subscriptions,
 and resources are flushed or spawned on runite's queues, so anything that
 schedules work must run on a runtime-managed thread. (Pure signal, thunk, and
 memo graphs can be read and written without a runtime; nothing that *reacts*
 can.)
+
+Because that scheduling goes through runite's thread-local queues, adaptite and
+the application must resolve the **same** runite: two copies in one dependency
+tree means two queues, and adaptite's reactive work is flushed by a runtime
+nobody is driving. Adaptite therefore depends on a single runite minor at a time
+(`runite = "0.2"` for adaptite 0.2), and reaching a newer runite minor requires
+an adaptite release against it. An application should not pin runite itself; take
+whatever adaptite resolves.
 
 Adaptite does not function across thread boundaries. It tracks dependencies
 between entities on the same thread only. Async work feeds the graph from the
@@ -66,6 +81,54 @@ on the reactor's job queue and flushed on the runtime's microtask queue, so
 consecutive writes within one task coalesce into a single effect run — batching
 is implicit. Host integrations that need synchronous propagation (for example,
 native resize loops) can call `Reactor::flush_now`.
+
+That default lane is not the only one. `effect_with(scheduler, f)` hands each
+ready run to a consumer-supplied `EffectScheduler` — any `Fn(EffectRun)` — which
+decides when it runs. Marking, coalescing, and dependency verification stay in
+the reactor; only the *when* moves. Consumers build effect phases out of that:
+one queue per phase, drained in whatever order and at whatever moment suits the
+host, so a render lane can run inside a paint callback instead of on the
+microtask queue. Adaptite deliberately ships no opinion about what the phases
+are.
+
+```rust
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use adaptite::{EffectRun, Reactor, signal_in};
+
+let reactor = Reactor::new();
+let size = signal_in(&reactor, 1);
+let painted = Rc::new(RefCell::new(Vec::new()));
+
+// The render lane. Nothing in it runs until the host drains it.
+let lane: Rc<RefCell<Vec<EffectRun>>> = Rc::new(RefCell::new(Vec::new()));
+
+let effect = reactor.effect_with(
+    { let lane = Rc::clone(&lane); move |ready: EffectRun| lane.borrow_mut().push(ready) },
+    { let size = size.clone(); let painted = Rc::clone(&painted);
+      move || painted.borrow_mut().push(size.get()) },
+);
+
+// Later, inside the host's paint callback:
+reactor.external_flush(|| {
+    for ready in lane.borrow_mut().drain(..) {
+        ready.run();
+    }
+});
+assert_eq!(*painted.borrow(), [1]);
+# effect.dispose();
+```
+
+Draining inside `Reactor::external_flush` gives the whole drain one flush epoch,
+which keeps the debug divergence guard meaningful across it and reports the
+drain to diagnostic consumers as a single flush. A run executed outside any
+flush opens one of its own. `EffectRun::run` must happen on the reactor's
+thread — verification and the effect body always do.
+
+Discarding an `EffectRun` instead of running it is legal: the effect keeps its
+dirty mark and is scheduled again on its next invalidation, so a lane may drop
+work for a subtree that is no longer visible without stranding it.
 
 ### Feedback loops
 
@@ -100,6 +163,24 @@ an `.await`, the original owner is no longer on the stack. Capture it first
 with `owner()` and re-enter with `Owner::run_in` so effects created after the
 suspension are still disposed with their scope.
 
+### Error boundaries
+
+One buggy widget's panicking effect otherwise unwinds out of the whole flush.
+`scope_catch(f, on_error)` is a scope that confines the blast radius: a panic
+from any effect it owns, at any depth, is delivered to the handler as an
+`ErrorInfo` — payload, message, and the failing effect's creation site — instead
+of propagating. The nearest enclosing boundary wins, and boundaries nest.
+
+The panicking effect is disposed before the handler runs: its dependency
+tracking was cut short mid-run, and a panic during dependency verification
+re-queues it, so leaving it live would re-run and re-panic immediately. The
+failure is terminal for that effect, and the handler decides what replaces it.
+Siblings and the rest of the scope keep running.
+
+Boundaries are for *bugs*. A fetch that 404s or a parse that fails should stay
+in the graph as a `Result` value so downstream nodes can react to it. Under
+`panic = "abort"` there is nothing to catch and the boundary is never invoked.
+
 ### Async data
 
 `resource(source, fetch)` connects the graph to runite's async side: `source`
@@ -109,6 +190,69 @@ is called, a new fetch starts and the superseded one is aborted; a stale
 completion can never overwrite a newer value. The resource exposes the latest
 value (`None` until first completion) and a separately-tracked `loading` flag,
 so a UI can render stale data with a spinner during refetch.
+
+### The ambient reactor, and state that outlives a component
+
+The free constructors (`signal`, `memo`, `effect`, …) create nodes on the
+thread's *default* reactor, obtained from `current()`. Creating long-lived
+reactive state this way — outside any component, from a key handler or a
+registry that owns it for the life of the process — is **supported**: those
+nodes join the ambient reactor, which is the same graph a host framework
+running on that thread flushes. A pane registry owning a signal per process,
+read by components that come and go, is a correct use of the library.
+
+What is *not* guaranteed for free is that the ambient reactor stays the same
+one. The thread default is cached weakly, so it lives only as long as some
+node, `Reactor` handle, or guard keeps it alive. If everything referencing it
+is dropped, the next `current()` installs a fresh, unrelated reactor — and
+because writes to a node on an unflushed graph mark dependents stale without
+scheduling anything, the symptom is "this value changes and nothing reacts",
+with no panic to point at the cause. Adaptite logs that re-install at `warn`
+level on the `adaptite::graph` target.
+
+An application or framework that owns a graph should make it a fact rather
+than a coincidence:
+
+```rust
+// Once, for the lifetime of the application. The guard holds a *strong*
+// reference, so the reactor cannot expire and be replaced underneath you.
+let reactor = adaptite::Reactor::new();
+let guard = reactor.enter();
+
+// Anything created from here on joins that reactor, with no handle in scope.
+assert_eq!(adaptite::current().id(), reactor.id());
+let pane_title = adaptite::signal(String::from("shell"));
+assert_eq!(pane_title.get(), "shell");
+
+drop(guard);
+```
+
+and `try_current()` returns `Option<Reactor>` without installing anything, for
+code where a missing reactor should be an error rather than a new graph. Two
+handles address the same graph exactly when `Reactor::id()` matches, which is
+how a consumer confirms its state landed where it expected.
+
+### Deriving without the clone dance
+
+Every closure over a reactive handle otherwise starts with `let x = x.clone();`.
+`Observable::map` internalizes that for the dominant case — deriving one value
+from another:
+
+```rust
+use adaptite::{Observable, signal};
+
+let base = signal(2);
+let doubled = base.map(|value| value * 2);   // no manual clone; `base` stays usable
+
+assert_eq!(doubled.get(), 4);
+base.set(5);
+assert_eq!(doubled.get(), 10);
+```
+
+The result is an ordinary `Memo`, equality-suppressed like any other, built on
+the receiver's own reactor rather than the thread default. It does not help an
+effect body that captures several handles; that case is still explicit, and a
+`clone!` macro is deliberately deferred until real usage shows it is needed.
 
 ### Untracked reads
 

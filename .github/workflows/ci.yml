@@ -41,6 +41,13 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # Advisory: an application can only reach the runite minor adaptite
+      # declares, so a new runite minor is invisible downstream until adaptite
+      # releases against it. Non-blocking because it depends on the network and
+      # on runite's release timing, neither of which should red a PR.
+      - name: runite minor drift
+        continue-on-error: true
+        run: mise run runite-current
       # cop is an experimental external analyzer whose `rust` provider can be
       # auto-updated to a version the pinned cop binary cannot load. Keep these
       # steps advisory (non-blocking) so upstream tooling churn never reds CI.

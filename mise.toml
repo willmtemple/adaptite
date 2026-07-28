@@ -71,6 +71,32 @@ for ex in spreadsheet stock_ticker screen_router signal_thunk_showcase \
 done
 """
 
+[tasks.runite-current]
+description = "Check that the declared runite requirement tracks runite's latest minor"
+# adaptite must resolve the same runite as the application above it, so a runite
+# minor is unreachable to every RUIN application until adaptite releases against
+# it (issue #12). This drifted a whole minor unnoticed once; the check makes the
+# gap visible instead of waiting for a bug report. Network-dependent, so CI runs
+# it advisory-only.
+shell = "bash -c"
+run = """
+set -euo pipefail
+declared="$(cargo metadata --format-version 1 --no-deps \
+  | grep -o '"name":"runite","source":"[^"]*","req":"[^"]*"' \
+  | grep -o '"req":"[^"]*"' | cut -d'"' -f4)"
+latest="$(curl -sSf https://index.crates.io/ru/ni/runite \
+  | grep -o '"vers":"[^"]*"' | cut -d'"' -f4 | tail -1)"
+echo "declared: ${declared}   latest published: ${latest}"
+# Compare minors only: a patch release needs no manifest change.
+declared_minor="$(echo "${declared}" | tr -d '^~' | cut -d. -f1,2)"
+latest_minor="$(echo "${latest}" | cut -d. -f1,2)"
+if [ "${declared_minor}" != "${latest_minor}" ]; then
+  echo "error: adaptite declares runite ${declared_minor}, but runite ${latest_minor} is published." >&2
+  echo "       Until adaptite releases against it, no application in the tree can reach it." >&2
+  exit 1
+fi
+"""
+
 [tasks.cop]
 description = "Run Agent Cop static-analysis checks"
 run = "cop cop-checks/main.cop -t ."

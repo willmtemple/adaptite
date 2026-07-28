@@ -24,6 +24,13 @@ static NEXT_REACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static CURRENT_REACTOR: RefCell<Weak<ReactorInner>> = const { RefCell::new(Weak::new()) };
+    /// Strong reference held for the lifetime of an [`EnterGuard`], so an explicitly entered
+    /// reactor stays the thread default even when the caller holds no other handle.
+    static ANCHORED_REACTOR: RefCell<Option<Rc<ReactorInner>>> = const { RefCell::new(None) };
+    /// How many times a default reactor has been installed on this thread. A second install
+    /// means the previous default expired, so nodes created before and after it are on
+    /// different graphs — the silent failure [`Reactor::current`] warns about.
+    static DEFAULT_INSTALL_COUNT: Cell<u32> = const { Cell::new(0) };
     static UNTRACKED_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -34,14 +41,49 @@ thread_local! {
     static RUNNING_REACTOR: Cell<*const ()> = const { Cell::new(core::ptr::null()) };
 }
 
-/// Returns the current thread's default reactor.
+/// Returns the current thread's default reactor, installing one if there is none.
 ///
-/// The first call on a thread creates a new reactor for that thread and caches it in thread-local
-/// storage. The cache is weak: the default reactor lives only as long as some node or `Reactor`
-/// handle keeps it alive. If everything referencing it is dropped, the next call creates a
-/// fresh, unrelated reactor.
+/// See [`Reactor::current`] for the installation rules, and [`try_current`] for the
+/// non-installing variant.
 pub fn current() -> Reactor {
     Reactor::current()
+}
+
+/// Returns the current thread's default reactor, or `None` if no reactor is installed.
+///
+/// Unlike [`current`], this never installs one. Use it when landing on a fresh, unflushed graph
+/// would be a bug rather than a convenience — see [`Reactor::enter`].
+pub fn try_current() -> Option<Reactor> {
+    Reactor::try_current()
+}
+
+/// Restores the previous thread-default reactor when dropped.
+///
+/// Created by [`Reactor::enter`]. While alive, the guard holds a strong reference to the entered
+/// reactor, so it cannot expire and be silently replaced by a fresh graph.
+///
+/// The guard is not `Send`: a reactor and its default installation are thread-local.
+pub struct EnterGuard {
+    previous_default: Weak<ReactorInner>,
+    previous_anchor: Option<Rc<ReactorInner>>,
+}
+
+impl fmt::Debug for EnterGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnterGuard").finish_non_exhaustive()
+    }
+}
+
+impl Drop for EnterGuard {
+    fn drop(&mut self) {
+        CURRENT_REACTOR.replace(core::mem::take(&mut self.previous_default));
+        ANCHORED_REACTOR.replace(self.previous_anchor.take());
+        tracing::debug!(
+            target: trace_targets::GRAPH,
+            event = "reactor_exit",
+            "restored the previous thread default reactor"
+        );
+    }
 }
 
 /// Runs `f` with dependency tracking suspended.
@@ -310,26 +352,128 @@ impl Reactor {
         })
     }
 
-    /// Returns the current thread's default reactor.
+    /// Returns the current thread's default reactor, installing one if there is none.
+    ///
+    /// The free constructors ([`crate::signal`], [`crate::effect`], and friends) call this, so
+    /// this is the reactor that reactive state created outside any explicit reactor lands on.
+    ///
+    /// # Installation and lifetime
+    ///
+    /// The thread's default is cached weakly: it lives only as long as some node, `Reactor`
+    /// handle, or [`EnterGuard`] keeps it alive. When nothing does, the next call installs a
+    /// *fresh, unrelated* reactor — and nodes created before and after that point cannot observe
+    /// each other. Because writes to a node on an unflushed graph mark dependents stale without
+    /// ever scheduling anything, the symptom is "this value changes and nothing reacts", with no
+    /// panic and nothing pointing at the cause. A re-install therefore logs at `warn` level on
+    /// the `adaptite::graph` target.
+    ///
+    /// Applications that own a long-lived graph should not rely on that cache at all. Hold the
+    /// reactor alive explicitly with [`enter`](Self::enter), which anchors it as the thread
+    /// default for the guard's lifetime, and reach for [`try_current`](Self::try_current) where
+    /// a missing reactor should be an error rather than a new graph.
     pub fn current() -> Self {
-        if let Some(inner) = CURRENT_REACTOR.with(|r| r.borrow().upgrade()) {
+        if let Some(reactor) = Self::try_current() {
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::GRAPH,
                 event = "current_reactor_reuse",
                 "reusing current thread default reactor"
             );
-            return Self { inner };
+            return reactor;
         }
 
         let reactor = Self::new();
         CURRENT_REACTOR.replace(Rc::downgrade(&reactor.inner));
+        let installs = DEFAULT_INSTALL_COUNT.with(|count| {
+            let installs = count.get().wrapping_add(1);
+            count.set(installs);
+            installs
+        });
+        if installs > 1 {
+            // The previous default expired while this thread was still using the ambient
+            // constructors. Nothing is broken *yet* — but nodes created from here on are on a
+            // different graph than the ones created before, and the two can never interact.
+            tracing::warn!(
+                target: trace_targets::GRAPH,
+                event = "current_reactor_reinstall",
+                installs,
+                "the thread's default reactor expired and a fresh, unrelated one was installed; \
+                 nodes created before and after this point are on separate graphs. Hold the \
+                 reactor alive with Reactor::enter, or use try_current to make the absence an \
+                 error"
+            );
+        } else {
+            tracing::debug!(
+                target: trace_targets::GRAPH,
+                event = "current_reactor_install",
+                "installed current thread default reactor"
+            );
+        }
+        reactor
+    }
+
+    /// Returns the current thread's default reactor, or `None` if none is installed.
+    ///
+    /// Unlike [`current`](Self::current), this never installs one, so it distinguishes "the
+    /// application's reactor" from "a fresh graph nobody flushes" — a distinction the caller
+    /// otherwise cannot make.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::Reactor;
+    ///
+    /// let reactor = Reactor::new();
+    /// let _guard = reactor.enter();
+    /// let current = Reactor::try_current().expect("the entered reactor is the thread default");
+    /// assert_eq!(current.id(), reactor.id());
+    /// ```
+    pub fn try_current() -> Option<Self> {
+        CURRENT_REACTOR
+            .with(|r| r.borrow().upgrade())
+            .map(|inner| Self { inner })
+    }
+
+    /// Installs this reactor as the thread's default until the returned guard drops.
+    ///
+    /// The guard holds a *strong* reference, so "the current reactor" becomes a fact for its
+    /// lifetime rather than a race with whoever happens to hold the last handle. This is what a
+    /// host framework should do once, for the lifetime of the application: reactive state created
+    /// outside any component — a registry of long-lived signals, say — then provably joins the
+    /// same graph the framework flushes, instead of joining it by coincidence.
+    ///
+    /// Entering nests. Dropping the guard restores whatever default was installed before it,
+    /// including none. Guards must be dropped in reverse order of creation; dropping them out of
+    /// order restores an older default and is a bug, though not an unsound one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::{Reactor, signal};
+    ///
+    /// let reactor = Reactor::new();
+    /// let guard = reactor.enter();
+    ///
+    /// // Created far from any component, with no handle to the reactor in scope.
+    /// let title = signal(String::from("shell"));
+    /// title.set(String::from("editor"));
+    /// assert_eq!(title.with(|title| title.clone()), "editor");
+    ///
+    /// drop(guard);
+    /// ```
+    pub fn enter(&self) -> EnterGuard {
+        let previous_default = CURRENT_REACTOR.replace(Rc::downgrade(&self.inner));
+        let previous_anchor = ANCHORED_REACTOR.replace(Some(Rc::clone(&self.inner)));
         tracing::debug!(
             target: trace_targets::GRAPH,
-            event = "current_reactor_install",
-            "installed current thread default reactor"
+            event = "reactor_enter",
+            reactor_id = self.inner.id.get(),
+            "entered reactor as the thread default"
         );
-        reactor
+        EnterGuard {
+            previous_default,
+            previous_anchor,
+        }
     }
 
     /// Runs `f` in the dependency-tracking scope of `observer`.
@@ -460,12 +604,18 @@ impl Reactor {
             .entry(observer)
             .or_default()
             .insert(observable, self.version(observable));
-        self.inner
-            .dependents
-            .borrow_mut()
-            .entry(observable)
-            .or_default()
-            .insert(observer);
+        let became_observed = {
+            let mut dependents = self.inner.dependents.borrow_mut();
+            let observers = dependents.entry(observable).or_default();
+            let was_unobserved = observers.is_empty();
+            observers.insert(observer);
+            was_unobserved
+        };
+        // Deliver the transition only after the graph maps are released: a hook is consumer code
+        // that may read or write the graph.
+        if became_observed {
+            self.note_observation_change(observable, true);
+        }
         Ok(())
     }
 
@@ -667,6 +817,7 @@ impl Reactor {
 
         self.inner.observers.borrow_mut().remove(&node);
         self.inner.meta.borrow_mut().remove(&node);
+        self.unregister_observation_hooks(node);
     }
 
     /// Schedules a job to run in the reactor's microtask-backed job queue.
@@ -725,6 +876,94 @@ impl Reactor {
     /// ```
     pub fn flush_now(&self) {
         Rc::clone(&self.inner).flush_jobs();
+    }
+
+    /// Runs `f` as one flush of this reactor, for consumers draining their own effect lane.
+    ///
+    /// A custom [`crate::EffectScheduler`] decides *when* its effects run, so adaptite cannot see
+    /// where one drain ends and the next begins. Wrapping a drain in `external_flush` supplies
+    /// that boundary: every [`crate::EffectRun`] executed inside `f` shares one flush epoch, so
+    /// the debug divergence guard — which counts an effect's runs within a flush — keeps working
+    /// across the drain, and diagnostic consumers see one `FlushStarted`/`FlushFinished` pair
+    /// rather than one per effect.
+    ///
+    /// Without it, each externally scheduled run opens and closes its own single-run flush. That
+    /// is correct but blind: an effect that re-schedules itself into the same drain forever is
+    /// then a livelock the guard cannot see. Draining inside `external_flush` is therefore the
+    /// recommended shape.
+    ///
+    /// Nesting is permitted: a nested call (or a [`flush_now`](Self::flush_now) from inside `f`)
+    /// joins the enclosing flush rather than starting one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    ///
+    /// use adaptite::{EffectRun, Reactor, signal_in};
+    ///
+    /// // A render lane: the consumer decides when queued effects run.
+    /// let lane: Rc<RefCell<Vec<EffectRun>>> = Rc::new(RefCell::new(Vec::new()));
+    ///
+    /// let reactor = Reactor::new();
+    /// let value = signal_in(&reactor, 1);
+    /// let seen = Rc::new(RefCell::new(Vec::new()));
+    ///
+    /// let effect = reactor.effect_with(
+    ///     {
+    ///         let lane = Rc::clone(&lane);
+    ///         move |ready: EffectRun| lane.borrow_mut().push(ready)
+    ///     },
+    ///     {
+    ///         let value = value.clone();
+    ///         let seen = Rc::clone(&seen);
+    ///         move || seen.borrow_mut().push(value.get())
+    ///     },
+    /// );
+    ///
+    /// // Nothing runs until the lane is drained — not even the initial run.
+    /// reactor.flush_now();
+    /// assert!(seen.borrow().is_empty());
+    ///
+    /// value.set(2);
+    /// reactor.external_flush(|| {
+    ///     for ready in lane.borrow_mut().drain(..) {
+    ///         ready.run();
+    ///     }
+    /// });
+    /// assert_eq!(*seen.borrow(), [2]);
+    /// # effect.dispose();
+    /// ```
+    pub fn external_flush<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.inner.begin_flush();
+
+        struct Guard<'a>(&'a ReactorInner);
+
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.end_flush();
+            }
+        }
+
+        let _guard = Guard(&self.inner);
+        f()
+    }
+
+    /// Returns `true` while a flush of this reactor is in progress, including a drain opened by
+    /// [`external_flush`](Self::external_flush).
+    pub(crate) fn in_flush(&self) -> bool {
+        self.inner.flush_depth.get() > 0
+    }
+
+    /// Opens a flush this reactor is not itself driving. Pair with [`end_flush`](Self::end_flush).
+    pub(crate) fn begin_flush(&self) {
+        self.inner.begin_flush();
+    }
+
+    /// Closes a flush opened by [`begin_flush`](Self::begin_flush).
+    pub(crate) fn end_flush(&self) {
+        self.inner.end_flush();
     }
 
     #[track_caller]
@@ -806,6 +1045,14 @@ impl Reactor {
         self.inner.diagnostics_active.get()
     }
 
+    /// Returns this reactor's process-local identifier.
+    ///
+    /// Two `Reactor` handles address the same graph exactly when their ids are equal — which is
+    /// how a caller confirms that ambient constructors landed on the reactor it expected.
+    pub fn id(&self) -> ReactorId {
+        self.inner.id
+    }
+
     pub(crate) fn diagnostic_id(&self) -> ReactorId {
         self.inner.id
     }
@@ -833,16 +1080,97 @@ impl Reactor {
             .map(|edges| edges.into_keys().collect::<Vec<_>>())
             .unwrap_or_default();
 
+        let mut unobserved = Vec::new();
         for observable in observed {
             let mut dependents = self.inner.dependents.borrow_mut();
             if let Some(observers) = dependents.get_mut(&observable) {
                 observers.remove(&observer);
                 if observers.is_empty() {
                     dependents.remove(&observable);
+                    unobserved.push(observable);
                 }
             }
         }
+
+        // This runs during an observer's rerun or disposal, with graph maps borrowed; the
+        // notification is deferred, so hooks never observe a half-updated graph.
+        for observable in unobserved {
+            self.note_observation_change(observable, false);
+        }
     }
+
+    /// Records that `node` gained its first observer or lost its last, and queues delivery of the
+    /// corresponding hook.
+    ///
+    /// Delivery is deferred to a reactor job for two reasons: the graph maps are borrowed at every
+    /// call site, and deferring lets a leave/arrive pair within one flush collapse to nothing.
+    fn note_observation_change(&self, node: NodeId, observed: bool) {
+        let hooks = self.inner.observation_hooks.borrow().get(&node).cloned();
+        let Some(hooks) = hooks else {
+            return;
+        };
+
+        hooks.observed.set(observed);
+        if hooks.queued.replace(true) {
+            return;
+        }
+
+        self.schedule(move || {
+            hooks.queued.set(false);
+            if hooks.cancelled.get() {
+                return;
+            }
+            let observed = hooks.observed.get();
+            // Coalesce: only an actual change from the last delivered state is worth a callback,
+            // so a source observed, dropped, and observed again within one flush stays quiet.
+            if hooks.delivered.replace(observed) == observed {
+                return;
+            }
+            if observed {
+                (hooks.on_watch)();
+            } else {
+                (hooks.on_unwatch)();
+            }
+        });
+    }
+
+    pub(crate) fn register_observation_hooks(
+        &self,
+        node: NodeId,
+        on_watch: impl Fn() + 'static,
+        on_unwatch: impl Fn() + 'static,
+    ) {
+        self.inner.observation_hooks.borrow_mut().insert(
+            node,
+            Rc::new(ObservationHooks {
+                on_watch: Box::new(on_watch),
+                on_unwatch: Box::new(on_unwatch),
+                observed: Cell::new(false),
+                delivered: Cell::new(false),
+                queued: Cell::new(false),
+                cancelled: Cell::new(false),
+            }),
+        );
+    }
+
+    pub(crate) fn unregister_observation_hooks(&self, node: NodeId) {
+        if let Some(hooks) = self.inner.observation_hooks.borrow_mut().remove(&node) {
+            // A delivery job may already be queued and holding its own reference.
+            hooks.cancelled.set(true);
+        }
+    }
+}
+
+/// Callbacks fired when a node gains its first observer or loses its last.
+struct ObservationHooks {
+    on_watch: Box<dyn Fn()>,
+    on_unwatch: Box<dyn Fn()>,
+    /// Latest observed state, updated synchronously at the edge transition.
+    observed: Cell<bool>,
+    /// State most recently delivered to the consumer, used to suppress no-op deliveries.
+    delivered: Cell<bool>,
+    queued: Cell<bool>,
+    cancelled: Cell<bool>,
 }
 
 impl Default for Reactor {
@@ -876,9 +1204,14 @@ struct ReactorInner {
     pending_jobs: RefCell<VecDeque<Job>>,
     flush_scheduled: Cell<bool>,
     flush_epoch: Cell<u64>,
+    /// Nesting depth of active flushes, including drains a consumer opened with
+    /// [`Reactor::external_flush`]. Non-zero means the current `flush_epoch` is live, so an
+    /// externally scheduled effect run joins it instead of opening one of its own.
+    flush_depth: Cell<u32>,
     next_diagnostic: Cell<u64>,
     diagnostics_active: Cell<bool>,
     diagnostics: RefCell<Vec<(u64, DiagnosticCallback)>>,
+    observation_hooks: RefCell<HashMap<NodeId, Rc<ObservationHooks>>>,
 }
 
 impl ReactorInner {
@@ -895,9 +1228,11 @@ impl ReactorInner {
             pending_jobs: RefCell::new(VecDeque::new()),
             flush_scheduled: Cell::new(false),
             flush_epoch: Cell::new(0),
+            flush_depth: Cell::new(0),
             next_diagnostic: Cell::new(1),
             diagnostics_active: Cell::new(false),
             diagnostics: RefCell::new(Vec::new()),
+            observation_hooks: RefCell::new(HashMap::new()),
         }
     }
 
@@ -919,6 +1254,49 @@ impl ReactorInner {
         drop(callbacks);
         for callback in snapshot {
             callback(event);
+        }
+    }
+
+    /// Opens a flush that adaptite is not itself driving, bumping the epoch only when this is
+    /// the outermost one so a nested drain joins the flush already in progress.
+    fn begin_flush(&self) {
+        let depth = self.flush_depth.get();
+        self.flush_depth.set(depth + 1);
+        if depth > 0 {
+            return;
+        }
+
+        self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
+        let epoch = self.flush_epoch.get();
+        #[cfg(debug_assertions)]
+        tracing::trace!(
+            target: trace_targets::GRAPH,
+            event = "begin_external_flush",
+            flush_epoch = epoch,
+            "opened an externally driven flush"
+        );
+        if self.diagnostics_active.get() {
+            self.emit(DiagnosticEvent::FlushStarted {
+                reactor: self.id,
+                flush_epoch: epoch,
+                pending_jobs: self.pending_jobs.borrow().len(),
+            });
+        }
+    }
+
+    fn end_flush(&self) {
+        let depth = self.flush_depth.get().saturating_sub(1);
+        self.flush_depth.set(depth);
+        if depth > 0 {
+            return;
+        }
+
+        if self.diagnostics_active.get() {
+            self.emit(DiagnosticEvent::FlushFinished {
+                reactor: self.id,
+                flush_epoch: self.flush_epoch.get(),
+                remaining_jobs: self.pending_jobs.borrow().len(),
+            });
         }
     }
 
@@ -967,6 +1345,9 @@ impl ReactorInner {
 
         impl Drop for FlushGuard {
             fn drop(&mut self) {
+                self.inner
+                    .flush_depth
+                    .set(self.inner.flush_depth.get().saturating_sub(1));
                 if self.inner.diagnostics_active.get() {
                     self.inner.emit(DiagnosticEvent::FlushFinished {
                         reactor: self.inner.id,
@@ -981,6 +1362,7 @@ impl ReactorInner {
             }
         }
 
+        self.flush_depth.set(self.flush_depth.get() + 1);
         let guard = FlushGuard {
             inner: Rc::clone(&self),
             epoch,
@@ -1018,6 +1400,87 @@ mod tests {
         let one = current();
         let two = current();
         assert!(Rc::ptr_eq(&one.inner, &two.inner));
+    }
+
+    #[test]
+    fn try_current_reports_absence_instead_of_installing_a_reactor() {
+        // The test harness gives each test a fresh thread, so nothing is installed yet.
+        assert!(
+            super::try_current().is_none(),
+            "try_current must not install a reactor"
+        );
+        assert!(
+            super::try_current().is_none(),
+            "and must still report absence after being asked once"
+        );
+
+        let installed = current();
+        let observed = super::try_current().expect("current installed a default");
+        assert_eq!(observed.id(), installed.id());
+    }
+
+    #[test]
+    fn entering_anchors_the_reactor_as_the_thread_default() {
+        let reactor = Reactor::new();
+        let expected = reactor.id();
+        let guard = reactor.enter();
+
+        // Drop every other handle: the guard alone must keep this reactor current. Without the
+        // strong anchor, `current()` here would install a fresh, unrelated graph.
+        drop(reactor);
+
+        assert_eq!(
+            current().id(),
+            expected,
+            "the entered reactor stays current with no other handle alive"
+        );
+
+        drop(guard);
+        assert!(
+            super::try_current().is_none(),
+            "dropping the guard restores the absent default"
+        );
+    }
+
+    #[test]
+    fn entering_nests_and_restores_the_previous_default() {
+        let outer = Reactor::new();
+        let inner = Reactor::new();
+        let (outer_id, inner_id) = (outer.id(), inner.id());
+
+        let outer_guard = outer.enter();
+        assert_eq!(current().id(), outer_id);
+
+        let inner_guard = inner.enter();
+        assert_eq!(current().id(), inner_id);
+
+        drop(inner_guard);
+        assert_eq!(
+            current().id(),
+            outer_id,
+            "leaving the inner reactor restores the outer one"
+        );
+
+        drop(outer_guard);
+        assert!(super::try_current().is_none());
+    }
+
+    #[test]
+    fn an_expired_default_is_replaced_by_an_unrelated_reactor() {
+        // This is the failure mode `current()` warns about, pinned so the warning keeps
+        // describing something real: nodes created on either side of the expiry cannot interact.
+        let first = current().id();
+        // No node, handle, or guard survives, so the weak cache expires.
+        let second = current().id();
+
+        assert_ne!(
+            first, second,
+            "an unanchored default is replaced once nothing keeps it alive"
+        );
+
+        // Holding any handle is enough to keep it stable.
+        let held = current();
+        assert_eq!(current().id(), held.id());
     }
 
     #[test]

@@ -1,15 +1,20 @@
 use alloc::boxed::Box;
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
+use core::any::Any;
 use core::cell::{Cell, RefCell};
+use core::panic::Location;
 
-use crate::trace_targets;
+use crate::{NodeId, trace_targets};
 
 thread_local! {
     /// `None` entries are barriers pushed by [`unowned`]: they shadow any enclosing owner
     /// without establishing a new one.
     static OWNER_STACK: RefCell<Vec<Option<Rc<OwnerFrame>>>> = const { RefCell::new(Vec::new()) };
 }
+
+/// Handler installed by [`scope_catch`], invoked for panics from the effects a scope owns.
+type ErrorHandler = Rc<dyn Fn(ErrorInfo)>;
 
 /// A reactive resource that an owner can dispose when it is itself disposed or re-run.
 pub(crate) trait OwnedDisposable {
@@ -23,11 +28,33 @@ pub(crate) struct OwnerFrame {
     children: RefCell<Vec<Rc<dyn OwnedDisposable>>>,
     cleanups: RefCell<Vec<Box<dyn FnOnce()>>>,
     disposed: Cell<bool>,
+    /// The owner that was innermost when this frame was created.
+    ///
+    /// The thread-local owner stack describes the *dynamic* chain, which is empty by the time a
+    /// scheduled effect actually runs. An error boundary has to be found from the effect's
+    /// *lexical* ownership instead, so the link is recorded at construction. Weak, because the
+    /// parent owns the child.
+    parent: RefCell<Option<Weak<OwnerFrame>>>,
+    error_handler: RefCell<Option<ErrorHandler>>,
 }
 
 impl OwnerFrame {
     pub(crate) fn new() -> Rc<Self> {
-        Rc::new(Self::default())
+        let frame = Rc::new(Self::default());
+        *frame.parent.borrow_mut() = current_owner().as_ref().map(Rc::downgrade);
+        frame
+    }
+
+    /// Returns the nearest error handler at or above this frame.
+    fn error_handler(self: &Rc<Self>) -> Option<ErrorHandler> {
+        let mut frame = Rc::clone(self);
+        loop {
+            if let Some(handler) = frame.error_handler.borrow().as_ref() {
+                return Some(Rc::clone(handler));
+            }
+            let parent = frame.parent.borrow().as_ref().and_then(Weak::upgrade);
+            frame = parent?;
+        }
     }
 
     /// Takes ownership of `child`, disposing it when this owner is reset or disposed. If the
@@ -399,6 +426,208 @@ pub fn on_cleanup(cleanup: impl FnOnce() + 'static) {
     owner.add_cleanup(Box::new(cleanup));
 }
 
+/// A panic caught by an error boundary, delivered to the handler registered with [`scope_catch`].
+pub struct ErrorInfo {
+    payload: Box<dyn Any + Send>,
+    node: NodeId,
+    origin: Option<&'static Location<'static>>,
+}
+
+impl ErrorInfo {
+    /// Returns the panic payload.
+    pub fn payload(&self) -> &(dyn Any + Send) {
+        &*self.payload
+    }
+
+    /// Consumes this value and returns the panic payload, for re-raising with
+    /// [`std::panic::resume_unwind`].
+    pub fn into_payload(self) -> Box<dyn Any + Send> {
+        self.payload
+    }
+
+    /// Returns the panic message when the payload is a string, which covers `panic!` with a
+    /// format string and every panic the standard library raises.
+    pub fn message(&self) -> Option<&str> {
+        if let Some(message) = self.payload.downcast_ref::<&'static str>() {
+            return Some(message);
+        }
+        self.payload
+            .downcast_ref::<alloc::string::String>()
+            .map(alloc::string::String::as_str)
+    }
+
+    /// Returns the node id of the effect that panicked.
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// Returns the source location where the failing effect was created, which is usually more
+    /// useful than the panic site for finding the buggy subtree.
+    pub fn origin(&self) -> Option<&'static Location<'static>> {
+        self.origin
+    }
+}
+
+impl core::fmt::Debug for ErrorInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ErrorInfo")
+            .field("node", &self.node)
+            .field("message", &self.message())
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Display for ErrorInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "effect {} panicked", self.node.get())?;
+        if let Some(origin) = self.origin {
+            write!(f, " (created at {origin})")?;
+        }
+        if let Some(message) = self.message() {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn build_error_info(
+    payload: Box<dyn Any + Send>,
+    node: NodeId,
+    origin: Option<&'static Location<'static>>,
+) -> ErrorInfo {
+    ErrorInfo {
+        payload,
+        node,
+        origin,
+    }
+}
+
+/// Finds the error handler governing `frame`, if any.
+pub(crate) fn error_handler_for(frame: &Rc<OwnerFrame>) -> Option<ErrorHandler> {
+    frame.error_handler()
+}
+
+/// Creates an ownership scope that catches panics from the effects it owns.
+///
+/// One buggy widget's panicking effect otherwise unwinds out of the whole flush. A boundary
+/// confines the blast radius: a panic from any effect owned by this scope — at any depth — is
+/// delivered to `on_error` instead of propagating, and the rest of the application keeps running.
+///
+/// # What happens on a panic
+///
+/// The panicking effect is **disposed** before `on_error` runs: its cleanups run, the children it
+/// owns are torn down, and it is unhooked from the graph. This is deliberate. An effect that
+/// panicked has already had its dependency tracking cut short, and leaving it live would re-run
+/// and re-panic on the next invalidation — or immediately, since a panic during dependency
+/// verification re-queues the effect. Disposing it makes the failure terminal for that effect and
+/// leaves the handler to decide what replaces it, which is the same shape as Solid's
+/// `ErrorBoundary`. The rest of the scope survives.
+///
+/// The nearest enclosing handler wins; boundaries nest. With no handler anywhere above the
+/// effect, the panic propagates exactly as it does today.
+///
+/// # Caveats
+///
+/// - This catches *panics*, which are bugs. Recoverable failures — a fetch that 404s, a parse that
+///   fails — belong in the graph as `Result` values so that downstream nodes can react to them;
+///   an error boundary is not a substitute for that.
+/// - Under `panic = "abort"` there is nothing to catch and the process aborts. The boundary
+///   compiles and is simply never invoked.
+/// - The handler runs on the reactor's thread, inside the flush that ran the failing effect. It
+///   should tear down or replace the subtree, not do lengthy work.
+/// - A panic raised by `f` itself — the scope's own body, run synchronously — is *not* caught.
+///   Only effects owned by the scope are covered.
+/// - Coverage follows ownership, so an effect created inside [`unowned`] is outside every
+///   boundary above it and its panics propagate as usual. That is the same opt-out `unowned`
+///   already applies to disposal; take an [`Owner`] and [`run_in`](Owner::run_in) to keep async
+///   work under the boundary that created it.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// use adaptite::{Reactor, scope_catch, signal_in};
+///
+/// let reactor = Reactor::new();
+/// let errors = Rc::new(RefCell::new(Vec::new()));
+/// let healthy_runs = Rc::new(RefCell::new(0));
+///
+/// let value = signal_in(&reactor, 1);
+/// let (boundary, ()) = scope_catch(
+///     {
+///         let reactor = reactor.clone();
+///         let value = value.clone();
+///         let healthy_runs = Rc::clone(&healthy_runs);
+///         move || {
+///             // A buggy widget...
+///             reactor.effect({
+///                 let value = value.clone();
+///                 move || {
+///                     if value.get() == 2 {
+///                         panic!("widget exploded");
+///                     }
+///                 }
+///             }).leak();
+///
+///             // ...and a healthy sibling that must survive it.
+///             reactor.effect({
+///                 let value = value.clone();
+///                 let healthy_runs = Rc::clone(&healthy_runs);
+///                 move || {
+///                     value.get();
+///                     *healthy_runs.borrow_mut() += 1;
+///                 }
+///             }).leak();
+///         }
+///     },
+///     {
+///         let errors = Rc::clone(&errors);
+///         move |error: adaptite::ErrorInfo| {
+///             errors.borrow_mut().push(error.message().unwrap_or("?").to_string());
+///         }
+///     },
+/// );
+///
+/// reactor.flush_now();
+/// assert!(errors.borrow().is_empty());
+/// assert_eq!(*healthy_runs.borrow(), 1);
+///
+/// // The panic is contained: reported, not propagated.
+/// value.set(2);
+/// reactor.flush_now();
+/// assert_eq!(*errors.borrow(), ["widget exploded"]);
+/// assert_eq!(*healthy_runs.borrow(), 2, "the sibling still ran");
+///
+/// // And the application keeps working afterwards.
+/// value.set(3);
+/// reactor.flush_now();
+/// assert_eq!(*healthy_runs.borrow(), 3);
+/// # boundary.dispose();
+/// ```
+pub fn scope_catch<T>(
+    f: impl FnOnce() -> T,
+    on_error: impl Fn(ErrorInfo) + 'static,
+) -> (ScopeHandle, T) {
+    let frame = OwnerFrame::new();
+    *frame.error_handler.borrow_mut() = Some(Rc::new(on_error));
+    tracing::debug!(
+        target: trace_targets::SCOPE,
+        event = "create_scope",
+        catching = true,
+        "created reactive scope with an error boundary"
+    );
+    let result = with_owner(&frame, f);
+    let handle = ScopeHandle {
+        inner: Rc::new(ScopeInner { frame }),
+    };
+    let inner: Rc<dyn OwnedDisposable> = handle.inner.clone();
+    let _ = adopt_into_current(inner);
+    (handle, result)
+}
+
 /// Runs `f` inside a new ownership scope and returns its result along with a handle to the
 /// scope.
 ///
@@ -522,8 +751,413 @@ mod tests {
 
     use runite::{queue_macrotask, run};
 
-    use super::{ScopeHandle, on_cleanup, scope};
+    use super::{ErrorInfo, ScopeHandle, on_cleanup, scope, scope_catch, unowned};
     use crate::{Reactor, signal_in};
+
+    /// Collects the messages a boundary reports.
+    fn error_log() -> (Rc<RefCell<Vec<String>>>, impl Fn(ErrorInfo) + 'static) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let handler = {
+            let log = Rc::clone(&log);
+            move |error: ErrorInfo| {
+                log.borrow_mut()
+                    .push(error.message().unwrap_or("<opaque>").to_string());
+            }
+        };
+        (log, handler)
+    }
+
+    #[test]
+    fn a_boundary_contains_a_panicking_effect_and_spares_its_siblings() {
+        let reactor = Reactor::new();
+        let (errors, handler) = error_log();
+        let value = signal_in(&reactor, 1);
+        let sibling_runs = Rc::new(RefCell::new(0));
+
+        let (boundary, ()) = scope_catch(
+            {
+                let reactor = reactor.clone();
+                let value = value.clone();
+                let sibling_runs = Rc::clone(&sibling_runs);
+                move || {
+                    reactor
+                        .effect({
+                            let value = value.clone();
+                            move || {
+                                if value.get() == 2 {
+                                    panic!("boom");
+                                }
+                            }
+                        })
+                        .leak();
+                    reactor
+                        .effect({
+                            let value = value.clone();
+                            let sibling_runs = Rc::clone(&sibling_runs);
+                            move || {
+                                value.get();
+                                *sibling_runs.borrow_mut() += 1;
+                            }
+                        })
+                        .leak();
+                }
+            },
+            handler,
+        );
+
+        reactor.flush_now();
+        assert!(errors.borrow().is_empty());
+        assert_eq!(*sibling_runs.borrow(), 1);
+
+        value.set(2);
+        reactor.flush_now();
+        assert_eq!(*errors.borrow(), ["boom"]);
+        assert_eq!(
+            *sibling_runs.borrow(),
+            2,
+            "the sibling ran despite the panic"
+        );
+
+        // The graph keeps working, and the failed effect stays down rather than re-panicking.
+        value.set(3);
+        reactor.flush_now();
+        assert_eq!(*sibling_runs.borrow(), 3);
+        assert_eq!(
+            *errors.borrow(),
+            ["boom"],
+            "reported once, not on every run"
+        );
+
+        boundary.dispose();
+    }
+
+    #[test]
+    fn the_panicking_effect_is_disposed_and_its_cleanups_run() {
+        let reactor = Reactor::new();
+        let (errors, handler) = error_log();
+        let value = signal_in(&reactor, 1);
+        let torn_down = Rc::new(RefCell::new(false));
+
+        let (boundary, ()) = scope_catch(
+            {
+                let reactor = reactor.clone();
+                let value = value.clone();
+                let torn_down = Rc::clone(&torn_down);
+                move || {
+                    reactor
+                        .effect({
+                            let value = value.clone();
+                            let torn_down = Rc::clone(&torn_down);
+                            move || {
+                                on_cleanup({
+                                    let torn_down = Rc::clone(&torn_down);
+                                    move || *torn_down.borrow_mut() = true
+                                });
+                                if value.get() == 2 {
+                                    panic!("boom");
+                                }
+                            }
+                        })
+                        .leak();
+                }
+            },
+            handler,
+        );
+
+        reactor.flush_now();
+        assert!(!*torn_down.borrow());
+
+        value.set(2);
+        reactor.flush_now();
+        assert_eq!(*errors.borrow(), ["boom"]);
+        assert!(
+            *torn_down.borrow(),
+            "disposal must run the failed effect's cleanups"
+        );
+
+        boundary.dispose();
+    }
+
+    #[test]
+    fn without_a_boundary_a_panic_still_propagates() {
+        let reactor = Reactor::new();
+        let value = signal_in(&reactor, 1);
+
+        let effect = reactor.effect({
+            let value = value.clone();
+            move || {
+                if value.get() == 2 {
+                    panic!("boom");
+                }
+            }
+        });
+        reactor.flush_now();
+
+        value.set(2);
+        let result = catch_unwind(AssertUnwindSafe(|| reactor.flush_now()));
+        assert!(result.is_err(), "an uncaught panic must not be swallowed");
+
+        effect.dispose();
+    }
+
+    #[test]
+    fn the_nearest_boundary_wins_and_boundaries_nest() {
+        let reactor = Reactor::new();
+        let (outer_errors, outer_handler) = error_log();
+        let (inner_errors, inner_handler) = error_log();
+        let value = signal_in(&reactor, 1);
+
+        let (boundary, ()) = scope_catch(
+            {
+                let reactor = reactor.clone();
+                let value = value.clone();
+                move || {
+                    // An effect governed by the outer boundary only.
+                    reactor
+                        .effect({
+                            let value = value.clone();
+                            move || {
+                                if value.get() == 3 {
+                                    panic!("outer child");
+                                }
+                            }
+                        })
+                        .leak();
+
+                    let (inner, ()) = scope_catch(
+                        {
+                            let reactor = reactor.clone();
+                            let value = value.clone();
+                            move || {
+                                reactor
+                                    .effect({
+                                        let value = value.clone();
+                                        move || {
+                                            if value.get() == 2 {
+                                                panic!("inner child");
+                                            }
+                                        }
+                                    })
+                                    .leak();
+                            }
+                        },
+                        inner_handler,
+                    );
+                    inner.leak();
+                }
+            },
+            outer_handler,
+        );
+
+        reactor.flush_now();
+
+        value.set(2);
+        reactor.flush_now();
+        assert_eq!(*inner_errors.borrow(), ["inner child"]);
+        assert!(
+            outer_errors.borrow().is_empty(),
+            "the inner boundary caught it"
+        );
+
+        value.set(3);
+        reactor.flush_now();
+        assert_eq!(*outer_errors.borrow(), ["outer child"]);
+        assert_eq!(*inner_errors.borrow(), ["inner child"], "unchanged");
+
+        boundary.dispose();
+    }
+
+    #[test]
+    fn a_boundary_catches_effects_nested_below_it() {
+        // The handler is found through the *lexical* owner chain, which must survive the effect
+        // being run later from an empty owner stack.
+        let reactor = Reactor::new();
+        let (errors, handler) = error_log();
+        let value = signal_in(&reactor, 1);
+
+        let (boundary, ()) = scope_catch(
+            {
+                let reactor = reactor.clone();
+                let value = value.clone();
+                move || {
+                    let (nested, ()) = scope({
+                        let reactor = reactor.clone();
+                        let value = value.clone();
+                        move || {
+                            reactor
+                                .effect({
+                                    let value = value.clone();
+                                    move || {
+                                        if value.get() == 2 {
+                                            panic!("deep");
+                                        }
+                                    }
+                                })
+                                .leak();
+                        }
+                    });
+                    nested.leak();
+                }
+            },
+            handler,
+        );
+
+        reactor.flush_now();
+        value.set(2);
+        reactor.flush_now();
+        assert_eq!(
+            *errors.borrow(),
+            ["deep"],
+            "a plain scope between the effect and the boundary is transparent"
+        );
+
+        boundary.dispose();
+    }
+
+    #[test]
+    fn error_info_reports_the_effects_creation_site() {
+        let reactor = Reactor::new();
+        type Captured = Rc<RefCell<Option<(u64, Option<String>, Option<u32>)>>>;
+        let captured: Captured = Rc::new(RefCell::new(None));
+        let value = signal_in(&reactor, 1);
+
+        let (boundary, creation_line) = scope_catch(
+            {
+                let reactor = reactor.clone();
+                let value = value.clone();
+                move || {
+                    // Hoisted so the creation call below is a single short statement: it keeps
+                    // the panic site on a different line from the `#[track_caller]` call site,
+                    // which is the distinction this test exists to check.
+                    let body = move || {
+                        if value.get() == 2 {
+                            panic!("located");
+                        }
+                    };
+                    let creation_line = line!() + 1;
+                    reactor.effect(body).leak();
+                    creation_line
+                }
+            },
+            {
+                let captured = Rc::clone(&captured);
+                move |error: ErrorInfo| {
+                    *captured.borrow_mut() = Some((
+                        error.node().get(),
+                        // `Location::file` uses the host's path separator, so compare the file
+                        // name rather than a hardcoded path.
+                        error.origin().and_then(|origin| {
+                            origin
+                                .file()
+                                .rsplit(['/', '\\'])
+                                .next()
+                                .map(alloc::string::ToString::to_string)
+                        }),
+                        error.origin().map(core::panic::Location::line),
+                    ));
+                }
+            },
+        );
+
+        reactor.flush_now();
+        value.set(2);
+        reactor.flush_now();
+
+        let captured = captured.borrow();
+        let (node, file, line) = captured.as_ref().expect("the handler ran");
+        assert!(*node > 0);
+        assert_eq!(file.as_deref(), Some("scope.rs"));
+        assert_eq!(
+            *line,
+            Some(creation_line),
+            "the origin points at the effect's creation site, not where it panicked"
+        );
+
+        boundary.dispose();
+    }
+
+    #[test]
+    fn a_panic_during_dependency_verification_reaches_the_boundary() {
+        // Verification executes upstream computations, so it is a distinct failure path from the
+        // effect body — and one an unguarded effect recovers from by re-queueing, which would
+        // spin forever behind a boundary if disposal did not stop it.
+        let reactor = Reactor::new();
+        let (errors, handler) = error_log();
+        let value = signal_in(&reactor, 1);
+
+        let upstream = reactor.memo({
+            let value = value.clone();
+            move || {
+                if value.get() == 2 {
+                    panic!("upstream exploded");
+                }
+                value.get()
+            }
+        });
+
+        let (boundary, ()) = scope_catch(
+            {
+                let reactor = reactor.clone();
+                let upstream = upstream.clone();
+                move || {
+                    reactor
+                        .effect(move || {
+                            upstream.get();
+                        })
+                        .leak();
+                }
+            },
+            handler,
+        );
+
+        reactor.flush_now();
+        assert!(errors.borrow().is_empty());
+
+        value.set(2);
+        reactor.flush_now();
+        assert_eq!(*errors.borrow(), ["upstream exploded"]);
+
+        // Crucially, it does not spin: the effect was disposed rather than re-queued.
+        reactor.flush_now();
+        assert_eq!(*errors.borrow(), ["upstream exploded"]);
+
+        boundary.dispose();
+    }
+
+    #[test]
+    fn an_unowned_effect_is_outside_every_boundary() {
+        // Coverage follows ownership, and `unowned` opts out of it. Pinned because the escape is
+        // surprising enough to be worth a deliberate decision rather than an accident.
+        let reactor = Reactor::new();
+        let (errors, handler) = error_log();
+        let value = signal_in(&reactor, 1);
+
+        let (boundary, effect) = scope_catch(
+            {
+                let reactor = reactor.clone();
+                let value = value.clone();
+                move || {
+                    unowned(|| {
+                        reactor.effect(move || {
+                            if value.get() == 2 {
+                                panic!("escaped");
+                            }
+                        })
+                    })
+                }
+            },
+            handler,
+        );
+        reactor.flush_now();
+
+        value.set(2);
+        let result = catch_unwind(AssertUnwindSafe(|| reactor.flush_now()));
+        assert!(result.is_err(), "the panic propagates past the boundary");
+        assert!(errors.borrow().is_empty(), "the handler was not consulted");
+
+        effect.dispose();
+        boundary.dispose();
+    }
 
     #[test]
     fn on_cleanup_outside_an_owner_panics() {
