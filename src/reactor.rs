@@ -1223,6 +1223,14 @@ impl Reactor {
         }
     }
 
+    /// Returns whether `observer`'s computation is currently on the call stack.
+    ///
+    /// Used to defer a run rather than re-enter one: re-entry cannot be tracked coherently, so a
+    /// nested flush that reaches an already-running effect must leave it for afterwards.
+    pub(crate) fn is_computation_active(&self, observer: NodeId) -> bool {
+        self.inner.active_computations.borrow().contains(&observer)
+    }
+
     pub(crate) fn counters(&self) -> &GraphCounters {
         &self.inner.counters
     }
@@ -1524,10 +1532,15 @@ impl ReactorInner {
             "opened an externally driven flush"
         );
         if self.diagnostics_active.get() {
+            // Bind the count before emitting: written inline it is a temporary whose borrow lives
+            // until the end of the statement, i.e. across the subscriber call. A subscriber that
+            // schedules reactor work — an entirely reasonable thing to do from `FlushStarted` —
+            // would then hit a bare `BorrowMutError` from inside adaptite.
+            let pending_jobs = self.pending_jobs.borrow().len();
             self.emit(DiagnosticEvent::FlushStarted {
                 reactor: self.id,
                 flush_epoch: epoch,
-                pending_jobs: self.pending_jobs.borrow().len(),
+                pending_jobs,
             });
         }
     }
@@ -1608,10 +1621,15 @@ impl ReactorInner {
             self.flushes.open_flush(self.pending_jobs.borrow().len());
         }
         if self.diagnostics_active.get() {
+            // Bind the count before emitting: written inline it is a temporary whose borrow lives
+            // until the end of the statement, i.e. across the subscriber call. A subscriber that
+            // schedules reactor work — an entirely reasonable thing to do from `FlushStarted` —
+            // would then hit a bare `BorrowMutError` from inside adaptite.
+            let pending_jobs = self.pending_jobs.borrow().len();
             self.emit(DiagnosticEvent::FlushStarted {
                 reactor: self.id,
                 flush_epoch: epoch,
-                pending_jobs: self.pending_jobs.borrow().len(),
+                pending_jobs,
             });
         }
 

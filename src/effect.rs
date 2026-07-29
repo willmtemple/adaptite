@@ -324,6 +324,7 @@ impl EffectHandle {
             scheduler,
             state: Cell::new(State::Dirty),
             scheduled: Cell::new(false),
+            rerun_after_current: Cell::new(false),
             disposed: Cell::new(false),
             self_ref: RefCell::new(Weak::new()),
             owner: OwnerFrame::new(),
@@ -462,6 +463,9 @@ struct EffectInner {
     scheduler: Option<Rc<dyn EffectScheduler>>,
     state: Cell<State>,
     scheduled: Cell<bool>,
+    /// Set when a run was requested while this effect was already running, so the run can be
+    /// re-queued once the current one finishes instead of re-entering it.
+    rerun_after_current: Cell<bool>,
     disposed: Cell<bool>,
     self_ref: RefCell<Weak<EffectInner>>,
     /// Ownership frame for cleanups and nested effects created during this effect's runs.
@@ -606,6 +610,18 @@ impl EffectInner {
         }
 
         self.unlatch_scheduled();
+
+        // A nested flush can reach an effect that is already running — an effect that writes a
+        // dependency and then calls `flush_now` does exactly that, and both halves of it are
+        // documented as legal. Re-entering cannot be tracked coherently, because the inner run
+        // clears the dependency set the outer run is still recording. So defer: remember that a
+        // run is owed and re-queue it once the current run finishes. The state mark is left
+        // alone, so the deferred run still sees why it was scheduled.
+        if self.reactor.is_computation_active(self.id) {
+            self.rerun_after_current.set(true);
+            return;
+        }
+
         let state = self.state.get();
         self.state.set(State::Clean);
 
@@ -727,6 +743,13 @@ impl EffectInner {
         with_owner(&self.owner, || {
             self.reactor.run_in_context(self.id, || (self.effect)())
         });
+
+        // A run requested while this one was in progress was deferred rather than re-entered.
+        // Queue it now. `schedule` coalesces, so a write that also scheduled normally does not
+        // produce two runs.
+        if self.rerun_after_current.replace(false) && !self.disposed.get() {
+            self.schedule();
+        }
     }
 
     /// Panics when this effect keeps re-running within a single drain, which indicates a
