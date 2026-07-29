@@ -536,7 +536,7 @@ impl Reactor {
              recording. This usually means a computation, or a callback it invoked, wrote state \
              it depends on and then forced a synchronous flush"
         );
-        self.clear_observer_dependencies(observer);
+        self.clear_observer_dependencies(observer, true);
         self.inner.stack.borrow_mut().push(observer);
 
         // Entering a computation starts a fresh tracking scope. `untrack` says "do not record
@@ -672,6 +672,11 @@ impl Reactor {
             observers.insert(observer);
             was_unobserved
         };
+        if became_observed {
+            self.inner
+                .observed_nodes
+                .set(self.inner.observed_nodes.get() + 1);
+        }
         // Deliver the transition only after the graph maps are released: a hook is consumer code
         // that may read or write the graph.
         if became_observed {
@@ -769,13 +774,22 @@ impl Reactor {
         mark: Mark,
         cause: Option<InvalidationCause>,
     ) {
-        let dependents = self
-            .inner
-            .dependents
-            .borrow()
-            .get(&observable)
-            .map(|nodes| nodes.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
+        // The set must be copied out before delivering: `deliver_mark` re-enters the graph, and
+        // the borrow could not be held across it. The copy comes from a pool rather than a fresh
+        // allocation — this runs once per node per propagation step, so a write reaching depth D
+        // used to allocate D times whether or not anything ever read the result.
+        let mut dependents;
+        {
+            let map = self.inner.dependents.borrow();
+            let Some(nodes) = map.get(&observable).filter(|nodes| !nodes.is_empty()) else {
+                // The common case for a leaf signal. Returning before touching the pool keeps
+                // this path exactly as cheap as it was when it allocated nothing either.
+                return;
+            };
+            // Borrows `node_scratch`, not `dependents`, so this is safe inside the borrow.
+            dependents = self.take_node_buffer();
+            dependents.extend(nodes.iter().copied());
+        }
 
         #[cfg(debug_assertions)]
         tracing::trace!(
@@ -792,9 +806,10 @@ impl Reactor {
         // with no counter and no drop obligation. (Measured: adding an unconditional depth guard
         // here cost 15% on a bare signal write.)
         if !self.inner.diagnostics_active.get() {
-            for dependent in dependents {
+            for &dependent in &dependents {
                 self.deliver_mark(dependent, mark, cause);
             }
+            self.give_node_buffer(dependents);
             return;
         }
 
@@ -813,7 +828,7 @@ impl Reactor {
 
         let _depth_guard = DepthGuard(&self.inner.mark_depth);
 
-        for dependent in dependents {
+        for &dependent in &dependents {
             if self.deliver_mark(dependent, mark, cause) {
                 self.record_flush(|stats| {
                     match mark {
@@ -883,13 +898,30 @@ impl Reactor {
     /// Computed dependencies are refreshed before comparison, so unchanged memos suppress
     /// downstream recomputation.
     pub(crate) fn dependencies_changed(&self, observer: NodeId) -> bool {
-        for recorded in self.dependencies_of(observer) {
-            self.refresh_node(recorded.node);
-            if self.version(recorded.node) != recorded.version {
-                return true;
+        // Deliberately not `dependencies_of`: that is the public inspection API and allocates a
+        // fresh Vec, and this runs on every verification of every Check-marked node. The copy is
+        // still required — `refresh_node` recomputes user code, which may re-enter the graph.
+        let mut recorded = self.take_edge_buffer();
+        if let Some(edges) = self.inner.dependencies.borrow().get(&observer) {
+            recorded.extend(
+                edges
+                    .iter()
+                    .map(|(node, version)| crate::RecordedDependency {
+                        node: *node,
+                        version: *version,
+                    }),
+            );
+        }
+        let mut changed = false;
+        for &entry in &recorded {
+            self.refresh_node(entry.node);
+            if self.version(entry.node) != entry.version {
+                changed = true;
+                break;
             }
         }
-        false
+        self.give_edge_buffer(recorded);
+        changed
     }
 
     /// Disposes all graph bookkeeping for `node`.
@@ -923,13 +955,18 @@ impl Reactor {
             None
         };
 
-        self.clear_observer_dependencies(node);
+        self.clear_observer_dependencies(node, false);
 
-        let incoming = self
-            .inner
-            .dependents
-            .borrow_mut()
-            .remove(&node)
+        let removed_dependents = self.inner.dependents.borrow_mut().remove(&node);
+        if removed_dependents
+            .as_ref()
+            .is_some_and(|nodes| !nodes.is_empty())
+        {
+            self.inner
+                .observed_nodes
+                .set(self.inner.observed_nodes.get().saturating_sub(1));
+        }
+        let incoming = removed_dependents
             .map(|nodes| nodes.into_iter().collect::<Vec<_>>())
             .unwrap_or_default();
         self.inner.counters.edges_removed(incoming.len());
@@ -1241,6 +1278,21 @@ impl Reactor {
     /// Returns `(from dependencies, from dependents)`. The two must agree with each other and
     /// with `GraphStats::live_edges`; a maintained counter is only as good as the assertion that
     /// it has not drifted.
+    /// Recounts observed nodes by walking `dependents`, for the same reason as
+    /// [`walk_edge_counts`](Self::walk_edge_counts).
+    ///
+    /// `observed_nodes` stopped being `dependents.len()` when emptied entries began to be
+    /// retained, so it is now a maintained counter with the drift risk that implies.
+    #[cfg(test)]
+    pub(crate) fn walk_observed_nodes(&self) -> usize {
+        self.inner
+            .dependents
+            .borrow()
+            .values()
+            .filter(|observers| !observers.is_empty())
+            .count()
+    }
+
     #[cfg(test)]
     pub(crate) fn walk_edge_counts(&self) -> (usize, usize) {
         let outgoing = self
@@ -1290,36 +1342,102 @@ impl Reactor {
         });
     }
 
-    fn clear_observer_dependencies(&self, observer: NodeId) {
-        let observed = self
-            .inner
-            .dependencies
-            .borrow_mut()
-            .remove(&observer)
-            .map(|edges| edges.into_keys().collect::<Vec<_>>())
-            .unwrap_or_default();
+    /// Drops every edge `observer` recorded during its last run.
+    ///
+    /// `retain_table` keeps the emptied dependency table allocated, which is what a rerunning
+    /// observer wants: it is about to refill exactly that table, and removing it returned the
+    /// allocation only for `try_observe` to build a new one immediately afterwards. A node being
+    /// disposed never reruns, so disposal passes `false` and gets the memory back.
+    fn clear_observer_dependencies(&self, observer: NodeId, retain_table: bool) {
+        let mut observed;
+        {
+            let mut map = self.inner.dependencies.borrow_mut();
+            let Some(edges) = map.get_mut(&observer) else {
+                return;
+            };
+            if edges.is_empty() {
+                // An observer that recorded nothing — a fresh node, or one that read nothing on
+                // its last run. Returning here keeps it off the scratch pool entirely.
+                if !retain_table {
+                    map.remove(&observer);
+                }
+                return;
+            }
+            // Borrows `node_scratch`, not `dependencies`, so this is safe inside the borrow.
+            observed = self.take_node_buffer();
+            observed.extend(edges.keys().copied());
+            if retain_table {
+                edges.clear();
+            } else {
+                map.remove(&observer);
+            }
+        }
         self.inner.counters.edges_removed(observed.len());
         let removed = observed.len();
         self.record_flush(|stats| {
             stats.edges_removed = stats.edges_removed.saturating_add(removed as u32);
         });
 
-        let mut unobserved = Vec::new();
-        for observable in observed {
+        let mut unobserved = self.take_node_buffer();
+        for &observable in &observed {
             let mut dependents = self.inner.dependents.borrow_mut();
             if let Some(observers) = dependents.get_mut(&observable) {
                 observers.remove(&observer);
                 if observers.is_empty() {
-                    dependents.remove(&observable);
+                    // The emptied set is retained for the same reason the dependency table is:
+                    // an observable that loses its last observer during a rerun is usually about
+                    // to regain one. `observed_nodes` is therefore a maintained counter rather
+                    // than `dependents.len()`.
+                    self.inner
+                        .observed_nodes
+                        .set(self.inner.observed_nodes.get().saturating_sub(1));
                     unobserved.push(observable);
                 }
             }
         }
+        self.give_node_buffer(observed);
 
         // This runs during an observer's rerun or disposal, with graph maps borrowed; the
         // notification is deferred, so hooks never observe a half-updated graph.
-        for observable in unobserved {
+        for &observable in &unobserved {
             self.note_observation_change(observable, false);
+        }
+        self.give_node_buffer(unobserved);
+    }
+
+    /// Takes a reusable node-id buffer from the pool.
+    ///
+    /// A pool rather than one buffer because both users nest: `mark_dependents` recurses through
+    /// `ObserverHook::mark`, and `clear_observer_dependencies` holds two at once.
+    fn take_node_buffer(&self) -> Vec<NodeId> {
+        self.inner
+            .node_scratch
+            .borrow_mut()
+            .pop()
+            .unwrap_or_default()
+    }
+
+    fn give_node_buffer(&self, mut buffer: Vec<NodeId>) {
+        buffer.clear();
+        let mut pool = self.inner.node_scratch.borrow_mut();
+        if pool.len() < SCRATCH_POOL_LIMIT {
+            pool.push(buffer);
+        }
+    }
+
+    fn take_edge_buffer(&self) -> Vec<crate::RecordedDependency> {
+        self.inner
+            .edge_scratch
+            .borrow_mut()
+            .pop()
+            .unwrap_or_default()
+    }
+
+    fn give_edge_buffer(&self, mut buffer: Vec<crate::RecordedDependency>) {
+        buffer.clear();
+        let mut pool = self.inner.edge_scratch.borrow_mut();
+        if pool.len() < SCRATCH_POOL_LIMIT {
+            pool.push(buffer);
         }
     }
 
@@ -1417,12 +1535,28 @@ pub(crate) struct NodeMeta {
     pub(crate) kind: NodeKind,
 }
 
+/// Upper bound on retained scratch buffers.
+///
+/// The pool must be at least as deep as the graph nests, or the excess silently reverts to
+/// allocating; this is set far above any plausible nesting depth rather than tuned.
+const SCRATCH_POOL_LIMIT: usize = 512;
+
 pub(crate) struct ReactorInner {
     pub(crate) id: ReactorId,
     next_node: Cell<u64>,
     pub(crate) meta: RefCell<HashMap<NodeId, NodeMeta>>,
     pub(crate) dependencies: RefCell<HashMap<NodeId, HashMap<NodeId, u64>>>,
     pub(crate) dependents: RefCell<HashMap<NodeId, HashSet<NodeId>>>,
+    /// Nodes with at least one observer.
+    ///
+    /// Maintained rather than read off `dependents.len()`: emptied entries are retained across an
+    /// observer's rerun, so the map's length counts nodes that *have ever been* observed.
+    pub(crate) observed_nodes: Cell<usize>,
+    /// Reusable node-id buffers. Both users must copy a set out of a borrowed map before calling
+    /// code that may re-enter the graph, and both nest, so this is a pool rather than one buffer.
+    node_scratch: RefCell<Vec<Vec<NodeId>>>,
+    /// Reusable recorded-edge buffers, for dependency verification.
+    edge_scratch: RefCell<Vec<Vec<crate::RecordedDependency>>>,
     pub(crate) observers: RefCell<HashMap<NodeId, Weak<dyn ObserverHook>>>,
     stack: RefCell<Vec<NodeId>>,
     active_computations: RefCell<HashSet<NodeId>>,
@@ -1466,6 +1600,9 @@ impl ReactorInner {
             meta: RefCell::new(HashMap::new()),
             dependencies: RefCell::new(HashMap::new()),
             dependents: RefCell::new(HashMap::new()),
+            observed_nodes: Cell::new(0),
+            node_scratch: RefCell::new(Vec::new()),
+            edge_scratch: RefCell::new(Vec::new()),
             observers: RefCell::new(HashMap::new()),
             stack: RefCell::new(Vec::new()),
             active_computations: RefCell::new(HashSet::new()),

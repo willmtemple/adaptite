@@ -468,6 +468,11 @@ mod tests {
         let stats = reactor.graph_stats();
         assert_eq!(outgoing, incoming, "the two indexes disagree");
         assert_eq!(
+            stats.observed_nodes,
+            reactor.walk_observed_nodes(),
+            "the maintained observed-node counter drifted from the graph"
+        );
+        assert_eq!(
             stats.live_edges, outgoing,
             "the maintained edge counter drifted from the graph"
         );

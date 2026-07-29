@@ -433,9 +433,7 @@ impl Reactor {
         self.inner.counters.snapshot(
             self.inner.id,
             self.inner.meta.borrow().len(),
-            // Entries are removed as soon as a node's last observer leaves, so the map's length
-            // *is* the observed-node count.
-            self.inner.dependents.borrow().len(),
+            self.inner.observed_nodes.get(),
             self.inner.pending_jobs.borrow().len(),
             self.inner.flush_depth.get(),
             self.inner.flush_epoch.get(),

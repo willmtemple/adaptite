@@ -145,20 +145,38 @@ impl OwnerFrame {
         // Both taken up front: teardown of the children must not depend on the cleanups
         // surviving, and the ownership gauges must not depend on reaching the end of a loop that
         // may unwind partway through.
-        let cleanups = core::mem::take(&mut *self.cleanups.borrow_mut());
-        let children = core::mem::take(&mut *self.children.borrow_mut());
+        let mut cleanups = core::mem::take(&mut *self.cleanups.borrow_mut());
+        let mut children = core::mem::take(&mut *self.children.borrow_mut());
         ownership::cleanups_taken(cleanups.len());
         ownership::children_taken(children.len());
 
         let mut first_panic: Option<Box<dyn Any + Send>> = None;
         crate::untrack(|| {
-            for cleanup in cleanups.into_iter().rev() {
+            for cleanup in cleanups.drain(..).rev() {
                 capture_panic(&mut first_panic, cleanup);
             }
-            for child in children.into_iter().rev() {
+            for child in children.drain(..).rev() {
                 capture_panic(&mut first_panic, || child.dispose_owned());
             }
         });
+
+        // Both lists are empty now — `drain` was used rather than `into_iter` precisely so the
+        // capacity survives. An effect that registers cleanups on every run would otherwise
+        // allocate a fresh Vec on every run. Only adopted when the slot has not already been
+        // refilled with something larger, which a cleanup that re-registered during teardown can
+        // have done.
+        {
+            let mut slot = self.cleanups.borrow_mut();
+            if slot.is_empty() && slot.capacity() < cleanups.capacity() {
+                *slot = cleanups;
+            }
+        }
+        {
+            let mut slot = self.children.borrow_mut();
+            if slot.is_empty() && slot.capacity() < children.capacity() {
+                *slot = children;
+            }
+        }
 
         let Some(payload) = first_panic else {
             return;
