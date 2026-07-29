@@ -18,6 +18,7 @@ mod diagnostics;
 mod effect;
 mod event;
 mod id;
+mod inspect;
 mod observable;
 mod reactor;
 mod resource;
