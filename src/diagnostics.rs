@@ -76,6 +76,22 @@ pub struct InvalidationCause {
     pub write_origin: &'static Location<'static>,
 }
 
+/// How a computed node's recomputation ended.
+///
+/// A dependency cycle discovered during a computation surfaces as [`Panicked`](Self::Panicked),
+/// because that is what it is — the cycle check panics with a [`crate::ReactCycleError`] message
+/// naming the path, and it unwinds through the computation like any other panic. The enum is
+/// `#[non_exhaustive]` so a distinguishable outcome can be added without a break; variants that
+/// adaptite cannot actually produce are deliberately absent.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputeOutcome {
+    /// The computation returned a value.
+    Completed,
+    /// The computation unwound. The node keeps its stale mark and the next read retries.
+    Panicked,
+}
+
 /// Strength of an invalidation propagated to an observer.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +155,91 @@ pub enum DiagnosticEvent {
         reactor: ReactorId,
         /// Root mutation and its source locations.
         cause: InvalidationCause,
+    },
+    /// A root mutation reached a computed node.
+    ///
+    /// Emitted for every mark delivered to the node, including one that coalesces into staleness
+    /// it already had — the event reports propagation *reaching* the node, which is what makes
+    /// the path from a write to an effect visible rather than only its endpoints.
+    #[non_exhaustive]
+    ComputedInvalidated {
+        /// Graph containing the node.
+        reactor: ReactorId,
+        /// Invalidated computed node.
+        node: NodeId,
+        /// Whether the node is a thunk or a memo.
+        kind: NodeKind,
+        /// Location at which the node was created.
+        node_origin: &'static Location<'static>,
+        /// Root mutation responsible for this invalidation.
+        cause: InvalidationCause,
+        /// Whether the node is definitely dirty or must verify its own inputs.
+        level: InvalidationLevel,
+    },
+    /// A check-marked computed node verified its inputs.
+    ///
+    /// This is the event that distinguishes a verification resolved from cache from one that
+    /// forced work: `recomputed` is `false` when every input turned out to be unchanged, so the
+    /// node returned to clean without running its computation. Nodes that were definitely dirty
+    /// do not verify and so do not appear here — they go straight to a recomputation.
+    #[non_exhaustive]
+    ComputedVerified {
+        /// Graph containing the node.
+        reactor: ReactorId,
+        /// Verified computed node.
+        node: NodeId,
+        /// Whether the node is a thunk or a memo.
+        kind: NodeKind,
+        /// Flush that performed the verification, or the most recent one.
+        flush_epoch: u64,
+        /// Whether verification found a changed input and forced a recomputation.
+        recomputed: bool,
+    },
+    /// A computed node's computation is about to run.
+    #[non_exhaustive]
+    ComputedRecomputeStarted {
+        /// Graph containing the node.
+        reactor: ReactorId,
+        /// Recomputing node.
+        node: NodeId,
+        /// Whether the node is a thunk or a memo.
+        kind: NodeKind,
+        /// Flush the recomputation belongs to, or the most recent one.
+        flush_epoch: u64,
+        /// Dependencies recorded by the previous run.
+        dependencies_before: usize,
+    },
+    /// A computed node's computation returned or unwound.
+    ///
+    /// Always paired with a [`ComputedRecomputeStarted`](Self::ComputedRecomputeStarted), including
+    /// on the unwind path, where `outcome` is [`ComputeOutcome::Panicked`].
+    ///
+    /// Comparing `dependencies_before` with `dependencies_after` is how a consumer finds a
+    /// computation whose reactive read set grows or churns. Adaptite deliberately does **not**
+    /// report individual edge additions and removals: edge recording is the hottest path in the
+    /// graph — one call per tracked read — and a wide node would emit more diagnostic events than
+    /// it does reactive work, for a question these two counts already answer.
+    #[non_exhaustive]
+    ComputedRecomputeFinished {
+        /// Graph containing the node.
+        reactor: ReactorId,
+        /// Recomputed node.
+        node: NodeId,
+        /// Whether the node is a thunk or a memo.
+        kind: NodeKind,
+        /// Flush the recomputation belonged to.
+        flush_epoch: u64,
+        /// Dependencies recorded by this run.
+        dependencies_after: usize,
+        /// Whether the new value propagated.
+        ///
+        /// `false` means a memo's comparator judged the value unchanged and suppressed
+        /// propagation, so downstream observers were spared. A thunk has no comparator and always
+        /// reports `true`. Always `false` when `outcome` is not
+        /// [`Completed`](ComputeOutcome::Completed), since nothing was published.
+        changed: bool,
+        /// How the computation ended.
+        outcome: ComputeOutcome,
     },
     /// A root mutation reached an effect, directly or through computed nodes.
     #[non_exhaustive]
@@ -399,6 +500,222 @@ mod tests {
             event,
             DiagnosticEvent::EffectDisposed { effect, .. } if *effect == effect_id
         )));
+    }
+
+    #[test]
+    fn a_write_is_followed_through_equality_suppressed_verification_to_the_effect() {
+        use crate::{ComputeOutcome, NodeKind};
+
+        let reactor = Reactor::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = reactor.subscribe_diagnostics({
+            let events = Rc::clone(&events);
+            move |event| events.borrow_mut().push(event)
+        });
+
+        // signal -> parity -> label -> effect. A write that flips the signal without flipping the
+        // parity must be visible end to end: both memos verify, the first recomputes and reports
+        // `changed: false`, the second never runs, and the effect is skipped.
+        let source = signal_in(&reactor, 1_u32);
+        let parity = memo_in(&reactor, {
+            let source = source.clone();
+            move || source.get() % 2
+        });
+        let label = memo_in(&reactor, {
+            let parity = parity.clone();
+            move || parity.get() * 10
+        });
+        let _effect = reactor.effect({
+            let label = label.clone();
+            move || {
+                let _ = label.get();
+            }
+        });
+        reactor.flush_now();
+        events.borrow_mut().clear();
+
+        source.set(3);
+        reactor.flush_now();
+
+        let events = events.borrow();
+        let write = events
+            .iter()
+            .find_map(|event| match event {
+                DiagnosticEvent::ReactiveWrite { cause, .. } => Some(*cause),
+                _ => None,
+            })
+            .expect("the write opens the causal chain");
+        assert_eq!(write.node, source.id());
+
+        // The middle of the chain is now visible, and each link still names the original write.
+        let invalidated = events
+            .iter()
+            .filter_map(|event| match event {
+                DiagnosticEvent::ComputedInvalidated {
+                    node, kind, cause, ..
+                } => Some((*node, *kind, *cause)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            invalidated
+                .iter()
+                .any(|(node, kind, cause)| *node == parity.id()
+                    && *kind == NodeKind::Memo
+                    && *cause == write),
+            "the first memo reports the write that reached it"
+        );
+        assert!(
+            invalidated
+                .iter()
+                .any(|(node, _, cause)| *node == label.id() && *cause == write),
+            "and so does the second, rather than blaming the memo above it"
+        );
+
+        // The equality-suppressed recomputation is reported as such.
+        let suppressed = events
+            .iter()
+            .find_map(|event| match event {
+                DiagnosticEvent::ComputedRecomputeFinished {
+                    node,
+                    changed,
+                    outcome,
+                    ..
+                } if *node == parity.id() => Some((*changed, *outcome)),
+                _ => None,
+            })
+            .expect("the parity memo recomputes");
+        assert_eq!(suppressed, (false, ComputeOutcome::Completed));
+
+        // The downstream memo verifies and resolves from cache — no recomputation at all.
+        let label_verified = events
+            .iter()
+            .find_map(|event| match event {
+                DiagnosticEvent::ComputedVerified {
+                    node, recomputed, ..
+                } if *node == label.id() => Some(*recomputed),
+                _ => None,
+            })
+            .expect("the label memo verifies its inputs");
+        assert!(!label_verified, "verification resolved from cache");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                DiagnosticEvent::ComputedRecomputeStarted { node, .. } if *node == label.id()
+            )),
+            "so it must not have recomputed"
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DiagnosticEvent::EffectRunSkipped { .. })),
+            "and the effect body is spared"
+        );
+    }
+
+    #[test]
+    fn a_panicking_computation_closes_its_pair() {
+        use crate::{ComputeOutcome, thunk_in};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let reactor = Reactor::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = reactor.subscribe_diagnostics({
+            let events = Rc::clone(&events);
+            move |event| events.borrow_mut().push(event)
+        });
+
+        let boom = thunk_in(&reactor, || -> u32 { panic!("compute failed") });
+        let id = boom.id();
+        let result = catch_unwind(AssertUnwindSafe(|| boom.get()));
+        assert!(result.is_err());
+
+        let events = events.borrow();
+        let started = events
+            .iter()
+            .filter(|event| {
+                matches!(event, DiagnosticEvent::ComputedRecomputeStarted { node, .. } if *node == id)
+            })
+            .count();
+        let finished = events
+            .iter()
+            .filter_map(|event| match event {
+                DiagnosticEvent::ComputedRecomputeFinished {
+                    node,
+                    outcome,
+                    changed,
+                    ..
+                } if *node == id => Some((*outcome, *changed)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(started, 1);
+        assert_eq!(
+            finished,
+            [(ComputeOutcome::Panicked, false)],
+            "an unwinding computation still closes its pair, and publishes nothing"
+        );
+    }
+
+    #[test]
+    fn dependency_counts_show_a_computation_whose_read_set_grows() {
+        let reactor = Reactor::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = reactor.subscribe_diagnostics({
+            let events = Rc::clone(&events);
+            move |event| events.borrow_mut().push(event)
+        });
+
+        let width = signal_in(&reactor, 1_usize);
+        let inputs = (0..4)
+            .map(|i| signal_in(&reactor, i as u32))
+            .collect::<Vec<_>>();
+        let sum = memo_in(&reactor, {
+            let width = width.clone();
+            let inputs = inputs.clone();
+            move || {
+                inputs
+                    .iter()
+                    .take(width.get())
+                    .map(|s| s.get())
+                    .sum::<u32>()
+            }
+        });
+        assert_eq!(sum.get(), 0);
+        events.borrow_mut().clear();
+
+        // The read set widens: this is the shape behind a component that gets slower the longer
+        // it lives, and the before/after counts are what make it visible without per-edge events.
+        width.set(4);
+        assert_eq!(sum.get(), 6);
+
+        let span = events
+            .borrow()
+            .iter()
+            .find_map(|event| match event {
+                DiagnosticEvent::ComputedRecomputeFinished {
+                    node,
+                    dependencies_after,
+                    ..
+                } if *node == sum.id() => Some(*dependencies_after),
+                _ => None,
+            })
+            .expect("the memo recomputes");
+        let before = events
+            .borrow()
+            .iter()
+            .find_map(|event| match event {
+                DiagnosticEvent::ComputedRecomputeStarted {
+                    node,
+                    dependencies_before,
+                    ..
+                } if *node == sum.id() => Some(*dependencies_before),
+                _ => None,
+            })
+            .expect("and reports what it started from");
+        assert_eq!(before, 2, "width plus the first input");
+        assert_eq!(span, 5, "width plus all four inputs");
     }
 
     #[test]

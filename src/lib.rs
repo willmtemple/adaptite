@@ -31,8 +31,8 @@ mod watch;
 mod writable;
 
 pub use diagnostics::{
-    DiagnosticEvent, DiagnosticSubscription, InvalidationCause, InvalidationLevel, NodeKind,
-    ReactorId,
+    ComputeOutcome, DiagnosticEvent, DiagnosticSubscription, InvalidationCause, InvalidationLevel,
+    NodeKind, ReactorId,
 };
 pub use effect::{
     EffectHandle, EffectRun, EffectScheduler, effect, effect_in, effect_with, effect_with_in,

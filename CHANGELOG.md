@@ -20,6 +20,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its documented "late, never early" semantics. `node_origin` exposes the
   `#[track_caller]` creation site that until now surfaced only inside a
   `ReactCycleError`, the divergence panic, or a diagnostic event.
+- Computed-work diagnostics. Four new events make the middle of a propagation visible, where
+  before only its endpoints were: `ComputedInvalidated` (every mark that reaches a thunk
+  or memo, still carrying the original root write rather than blaming the node above
+  it), `ComputedVerified` (whether a check-marked node resolved from cache or was forced
+  to recompute), and the `ComputedRecomputeStarted`/`ComputedRecomputeFinished` pair. The
+  pair closes even when a computation unwinds, reporting `ComputeOutcome::Panicked`; a
+  dependency cycle surfaces as `Panicked`, because that is what it is. `changed` on the
+  finish event distinguishes a memo whose comparator suppressed propagation from one that
+  published, and `dependencies_before`/`dependencies_after` show a computation whose
+  reactive read set grows or churns.
+  Adaptite deliberately does **not** report individual edge additions and removals.
+  Edge recording is the hottest path in the graph — one call per tracked read — so a
+  wide node would emit more diagnostic events than it does reactive work, to answer a
+  question the two dependency counts already answer at `O(1)`.
+  The first implementation of this cost about 9% on the recompute-heavy benchmarks *with
+  diagnostics off*, because the paired-event guard put a drop obligation on the
+  recomputation path whether or not anything was listening. Moving the guard behind the
+  subscription check, so the dormant path constructs nothing, brought that back inside
+  run-to-run noise: the without-the-feature build now measures 0.7–3.1% *slower* on three
+  of the four benchmarks, which is the noise floor rather than a real difference.
+- `Reactor::dependency_count(node)` — the `O(1)`, allocation-free counterpart to
+  `dependencies_of`.
 - `Reactor::graph_stats()` returns a `GraphStats`: an `O(1)`, `Copy` account of what a
   reactor is holding. Current gauges (live nodes, live nodes per kind, live edges,
   observed nodes, queued effects, pending jobs, flush depth and epoch), peaks (nodes,

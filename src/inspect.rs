@@ -61,6 +61,20 @@ impl Reactor {
             .map_or(0, |observers| observers.len())
     }
 
+    /// Returns how many dependencies `node` recorded during its last run.
+    ///
+    /// The `O(1)`, allocation-free counterpart to
+    /// [`dependencies_of`](Self::dependencies_of). A computation whose count climbs run over run
+    /// is reading more of the graph each time, which is the shape behind a component that gets
+    /// slower the longer it lives.
+    pub fn dependency_count(&self, node: NodeId) -> usize {
+        self.inner
+            .dependencies
+            .borrow()
+            .get(&node)
+            .map_or(0, hashbrown::HashMap::len)
+    }
+
     /// Returns the observers that currently record a dependency on `node`.
     ///
     /// The enumerating counterpart to [`observer_count`](Self::observer_count), for an inspector
