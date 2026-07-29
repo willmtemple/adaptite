@@ -42,6 +42,26 @@ pub enum NodeKind {
     Effect,
 }
 
+impl NodeKind {
+    /// Number of kinds currently defined.
+    ///
+    /// Deliberately not public: the enum is `#[non_exhaustive]`, and a public count would make
+    /// adding a kind a breaking change for anyone who sized an array by it.
+    pub(crate) const COUNT: usize = 6;
+
+    /// Dense index into the per-kind counter arrays.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Source => 0,
+            Self::Signal => 1,
+            Self::Event => 2,
+            Self::Thunk => 3,
+            Self::Memo => 4,
+            Self::Effect => 5,
+        }
+    }
+}
+
 /// Root mutation that caused reactive invalidation.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

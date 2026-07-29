@@ -12,6 +12,7 @@ use hashbrown::{HashMap, HashSet};
 
 use runite::queue_microtask;
 
+use crate::stats::{GraphCounters, GraphStats};
 use crate::{
     DiagnosticEvent, DiagnosticSubscription, InvalidationCause, InvalidationLevel, NodeId,
     NodeKind, ReactorId, trace_targets,
@@ -598,12 +599,16 @@ impl Reactor {
             "recording reactive dependency"
         );
 
-        self.inner
+        let existing = self
+            .inner
             .dependencies
             .borrow_mut()
             .entry(observer)
             .or_default()
             .insert(observable, self.version(observable));
+        if existing.is_none() {
+            self.inner.counters.edge_added();
+        }
         let became_observed = {
             let mut dependents = self.inner.dependents.borrow_mut();
             let observers = dependents.entry(observable).or_default();
@@ -906,6 +911,43 @@ impl Reactor {
         self.inner.meta.borrow().get(&node).map(|meta| meta.version)
     }
 
+    /// Returns an `O(1)` account of what this reactor is currently holding.
+    ///
+    /// See [`GraphStats`] for the cost contract and the intended before/after use. Nothing here
+    /// walks the graph, so this is safe to call every frame.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::{Reactor, memo_in, signal_in};
+    ///
+    /// let reactor = Reactor::new();
+    /// let value = signal_in(&reactor, 1_u32);
+    /// let doubled = memo_in(&reactor, {
+    ///     let value = value.clone();
+    ///     move || value.get() * 2
+    /// });
+    /// assert_eq!(doubled.get(), 2);
+    ///
+    /// let stats = reactor.graph_stats();
+    /// assert_eq!(stats.live_nodes, 2);
+    /// assert_eq!(stats.live_edges, 1, "the memo reads the signal");
+    /// assert_eq!(stats.observed_nodes, 1, "only the signal has an observer");
+    /// assert_eq!(stats.reactor, reactor.id());
+    /// ```
+    pub fn graph_stats(&self) -> GraphStats {
+        self.inner.counters.snapshot(
+            self.inner.id,
+            self.inner.meta.borrow().len(),
+            // Entries are removed as soon as a node's last observer leaves, so the map's length
+            // *is* the observed-node count.
+            self.inner.dependents.borrow().len(),
+            self.inner.pending_jobs.borrow().len(),
+            self.inner.flush_depth.get(),
+            self.inner.flush_epoch.get(),
+        )
+    }
+
     /// Disposes all graph bookkeeping for `node`.
     ///
     /// Idempotent: a node that is already gone is a silent no-op, and the
@@ -918,24 +960,21 @@ impl Reactor {
             "disposing reactive node bookkeeping"
         );
         // Sampled before anything is torn down: the counts a leak report wants are the ones the
-        // node died holding, and both maps are emptied below.
-        let epitaph = if self.diagnostics_enabled() {
-            self.inner.meta.borrow().get(&node).map(|meta| {
-                (
-                    meta.kind,
-                    meta.origin,
-                    self.inner
-                        .dependencies
-                        .borrow()
-                        .get(&node)
-                        .map_or(0, hashbrown::HashMap::len),
-                    self.inner
-                        .dependents
-                        .borrow()
-                        .get(&node)
-                        .map_or(0, hashbrown::HashSet::len),
-                )
-            })
+        // node died holding, and both maps are emptied below. Only the diagnostic needs them —
+        // the counters ride on the removals themselves — so the two extra lookups stay gated.
+        let edges_held = if self.diagnostics_enabled() {
+            Some((
+                self.inner
+                    .dependencies
+                    .borrow()
+                    .get(&node)
+                    .map_or(0, hashbrown::HashMap::len),
+                self.inner
+                    .dependents
+                    .borrow()
+                    .get(&node)
+                    .map_or(0, hashbrown::HashSet::len),
+            ))
         } else {
             None
         };
@@ -949,6 +988,7 @@ impl Reactor {
             .remove(&node)
             .map(|nodes| nodes.into_iter().collect::<Vec<_>>())
             .unwrap_or_default();
+        self.inner.counters.edges_removed(incoming.len());
         for observer in incoming {
             let mut dependencies = self.inner.dependencies.borrow_mut();
             if let Some(observed) = dependencies.get_mut(&observer) {
@@ -960,17 +1000,22 @@ impl Reactor {
         }
 
         self.inner.observers.borrow_mut().remove(&node);
-        let was_live = self.inner.meta.borrow_mut().remove(&node).is_some();
+        // The removed metadata is both the "was it live" answer and the kind, so neither costs a
+        // second lookup. Disposal is idempotent and is reached from several `Drop` impls; gating
+        // on it is what keeps the gauge and the event from counting a node twice.
+        let removed = self.inner.meta.borrow_mut().remove(&node);
         self.unregister_observation_hooks(node);
 
-        // Gated on `was_live` rather than on the sample: disposal is idempotent and is reached
-        // from several `Drop` impls, so without this a node could be reported dead twice.
-        if was_live && let Some((kind, origin, dependencies, dependents)) = epitaph {
+        let Some(meta) = removed else {
+            return;
+        };
+        self.inner.counters.node_disposed(meta.kind);
+        if let Some((dependencies, dependents)) = edges_held {
             self.inner.emit(DiagnosticEvent::NodeDisposed {
                 reactor: self.inner.id,
                 node,
-                kind,
-                origin,
+                kind: meta.kind,
+                origin: meta.origin,
                 dependencies,
                 dependents,
             });
@@ -979,10 +1024,12 @@ impl Reactor {
 
     /// Schedules a job to run in the reactor's microtask-backed job queue.
     pub fn schedule(&self, job: impl FnOnce() + 'static) {
-        self.inner
-            .pending_jobs
-            .borrow_mut()
-            .push_back(Box::new(job));
+        let pending = {
+            let mut jobs = self.inner.pending_jobs.borrow_mut();
+            jobs.push_back(Box::new(job));
+            jobs.len()
+        };
+        self.inner.counters.job_queued(pending);
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::GRAPH,
@@ -1137,6 +1184,9 @@ impl Reactor {
                 kind,
             },
         );
+        self.inner
+            .counters
+            .node_created(kind, self.inner.meta.borrow().len());
         #[cfg(debug_assertions)]
         tracing::trace!(
             target: trace_targets::GRAPH,
@@ -1192,6 +1242,35 @@ impl Reactor {
         self.inner.emit(event);
     }
 
+    pub(crate) fn counters(&self) -> &GraphCounters {
+        &self.inner.counters
+    }
+
+    /// Counts live edges by walking both indexes, for tests that check the maintained counter
+    /// against the graph it claims to describe.
+    ///
+    /// Returns `(from dependencies, from dependents)`. The two must agree with each other and
+    /// with `GraphStats::live_edges`; a maintained counter is only as good as the assertion that
+    /// it has not drifted.
+    #[cfg(test)]
+    pub(crate) fn walk_edge_counts(&self) -> (usize, usize) {
+        let outgoing = self
+            .inner
+            .dependencies
+            .borrow()
+            .values()
+            .map(HashMap::len)
+            .sum();
+        let incoming = self
+            .inner
+            .dependents
+            .borrow()
+            .values()
+            .map(HashSet::len)
+            .sum();
+        (outgoing, incoming)
+    }
+
     pub(crate) fn diagnostics_enabled(&self) -> bool {
         self.inner.diagnostics_active.get()
     }
@@ -1230,6 +1309,7 @@ impl Reactor {
             .remove(&observer)
             .map(|edges| edges.into_keys().collect::<Vec<_>>())
             .unwrap_or_default();
+        self.inner.counters.edges_removed(observed.len());
 
         let mut unobserved = Vec::new();
         for observable in observed {
@@ -1364,6 +1444,7 @@ struct ReactorInner {
     diagnostics_active: Cell<bool>,
     diagnostics: RefCell<Vec<(u64, DiagnosticCallback)>>,
     observation_hooks: RefCell<HashMap<NodeId, Rc<ObservationHooks>>>,
+    counters: GraphCounters,
 }
 
 impl ReactorInner {
@@ -1385,6 +1466,7 @@ impl ReactorInner {
             diagnostics_active: Cell::new(false),
             diagnostics: RefCell::new(Vec::new()),
             observation_hooks: RefCell::new(HashMap::new()),
+            counters: GraphCounters::default(),
         }
     }
 
@@ -1419,6 +1501,7 @@ impl ReactorInner {
         }
 
         self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
+        self.counters.flush_opened();
         let epoch = self.flush_epoch.get();
         #[cfg(debug_assertions)]
         tracing::trace!(
@@ -1477,6 +1560,7 @@ impl ReactorInner {
         )
         .entered();
         self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
+        self.counters.flush_opened();
         let epoch = self.flush_epoch.get();
         if self.diagnostics_active.get() {
             self.emit(DiagnosticEvent::FlushStarted {

@@ -218,7 +218,7 @@ impl Drop for EffectRun {
     /// invalidation schedules it afresh and the missed change is not lost.
     fn drop(&mut self) {
         if let Some(effect) = self.effect.upgrade() {
-            effect.scheduled.set(false);
+            effect.unlatch_scheduled();
         }
     }
 }
@@ -472,8 +472,28 @@ struct EffectInner {
 }
 
 impl EffectInner {
+    /// Claims the "a run is pending" latch, returning `true` if one already was.
+    ///
+    /// The latch and the reactor's queued-effect gauge are the same fact, so they move together
+    /// here rather than at each of the four sites that touch the latch — the gauge cannot drift
+    /// from the thing it reports.
+    fn latch_scheduled(&self) -> bool {
+        let already = self.scheduled.replace(true);
+        if !already {
+            self.reactor.counters().effect_queued();
+        }
+        already
+    }
+
+    /// Releases the latch, whether the pending run was executed or discarded.
+    fn unlatch_scheduled(&self) {
+        if self.scheduled.replace(false) {
+            self.reactor.counters().effect_unqueued();
+        }
+    }
+
     fn schedule(&self) {
-        let skipped = self.disposed.get() || self.scheduled.replace(true);
+        let skipped = self.disposed.get() || self.latch_scheduled();
         if self.reactor.diagnostics_enabled()
             && let Some(effect_origin) = self.reactor.node_origin(self.id)
         {
@@ -573,11 +593,11 @@ impl EffectInner {
 
     fn run_scheduled_inner(self: &Rc<Self>) {
         if self.disposed.get() {
-            self.scheduled.set(false);
+            self.unlatch_scheduled();
             return;
         }
 
-        self.scheduled.set(false);
+        self.unlatch_scheduled();
         let state = self.state.get();
         self.state.set(State::Clean);
 

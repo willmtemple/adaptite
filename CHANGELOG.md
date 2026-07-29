@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its documented "late, never early" semantics. `node_origin` exposes the
   `#[track_caller]` creation site that until now surfaced only inside a
   `ReactCycleError`, the divergence panic, or a diagnostic event.
+- `Reactor::graph_stats()` returns a `GraphStats`: an `O(1)`, `Copy` account of what a
+  reactor is holding. Current gauges (live nodes, live nodes per kind, live edges,
+  observed nodes, queued effects, pending jobs, flush depth and epoch), peaks (nodes,
+  edges, pending jobs), and cumulative totals (nodes created and disposed, edges added
+  and removed, flushes). Taking a snapshot never walks the graph and never evaluates a
+  reactive computation, so it is safe to call every frame; the intended use is the
+  difference between two snapshots, which turns a leak into an assertion.
+  **Every counter is maintained in ordinary builds, always** — there is no capture to
+  start and no mode in which the numbers are absent. That was a deliberate choice over
+  scoping peaks and cumulative counts to an active diagnostic session, on the grounds
+  that one mode is cheaper to document than two modes are to explain, and it is defended
+  by `benches/graph.rs` rather than by assertion: against the same benchmarks without
+  the counters, the difference sits inside run-to-run noise (`signal_write_read` and
+  `wide_fanout` show no change at p > 0.05, `deep_chain` -0.5%, and `layered_diamonds`
+  measures the *uncounted* build as 3.9% slower, which is the noise floor talking).
+  `graph_stats` itself measures 7.1 ns over a 1,000-node graph.
+  Per-kind counts are read with `live_nodes_of_kind(NodeKind)` rather than a public
+  array, so that adding a `NodeKind` stays additive.
 - Node kinds and node lifecycle diagnostics. The public `NodeKind` names the primitive a
   node was allocated as — `Source`, `Signal`, `Event`, `Thunk`, `Memo`, `Effect` — and
   `Reactor::node_kind` reports it for any live node. Two new diagnostic events,
