@@ -182,8 +182,15 @@ impl GraphStats {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FlushStats {
-    /// Writes and explicit triggers on source nodes.
+    /// Writes and explicit triggers on source nodes that reached the graph.
     pub root_writes: u32,
+    /// Writes discarded by a source's own equality check before reaching the graph.
+    ///
+    /// Work that happened and produced nothing. `root_writes + writes_suppressed` is how often
+    /// something tried to write; `root_writes` alone is how often it mattered. A large ratio
+    /// between them is a producer running more often than it needs to, which is invisible from
+    /// the propagation side because a suppressed write propagates nothing by definition.
+    pub writes_suppressed: u32,
     /// Marks delivered to observers saying a computed input *may* have changed.
     pub nodes_marked_check: u32,
     /// Marks delivered to observers saying a direct dependency definitely changed.
@@ -239,6 +246,7 @@ impl FlushStats {
     /// [`jobs_at_finish`](Self::jobs_at_finish), which describe the queue rather than work done.
     pub fn is_empty(&self) -> bool {
         self.root_writes == 0
+            && self.writes_suppressed == 0
             && self.nodes_marked_check == 0
             && self.nodes_marked_dirty == 0
             && self.effects_queued == 0

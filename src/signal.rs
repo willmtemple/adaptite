@@ -1,7 +1,9 @@
 use alloc::rc::Rc;
 use core::cell::RefCell;
 
-use crate::{NodeId, NodeKind, Reactor, current, trace_targets};
+use core::panic::Location;
+
+use crate::{DiagnosticEvent, NodeId, NodeKind, Reactor, current, trace_targets};
 
 /// Creates a [`Signal`] in the current thread's default reactor.
 ///
@@ -63,6 +65,32 @@ impl Reactor {
     pub fn signal<T: 'static>(&self, initial: T) -> Signal<T> {
         Signal::new(self.clone(), initial)
     }
+}
+
+/// Reports a write a source's equality check threw away.
+///
+/// Cold, and called behind a [`Reactor::diagnostics_enabled`] check at the site, so a suppressed
+/// write pays one cell load when nothing is listening.
+#[cold]
+#[inline(never)]
+fn report_suppressed_write(
+    reactor: &Reactor,
+    node: NodeId,
+    write_origin: &'static Location<'static>,
+) {
+    reactor.record_flush(|stats| {
+        stats.writes_suppressed = stats.writes_suppressed.saturating_add(1);
+    });
+    let Some(node_origin) = reactor.node_origin(node) else {
+        return;
+    };
+    reactor.emit_diagnostic(DiagnosticEvent::WriteSuppressed {
+        reactor: reactor.diagnostic_id(),
+        node,
+        kind: NodeKind::Signal,
+        node_origin,
+        write_origin,
+    });
 }
 
 impl<T: 'static> Signal<T> {
@@ -194,6 +222,13 @@ impl<T: PartialEq + 'static> Signal<T> {
             crate::untrack(|| *current == value)
         };
         if unchanged {
+            // Reported in ordinary builds, not only under `debug_assertions`: the producer ran
+            // and its output was discarded, and that is exactly the work an optimized build needs
+            // to be able to see. A signal written eighty times and changed fourteen is a sampler
+            // running too fast, and the propagation stream cannot show it — nothing propagated.
+            if self.inner.reactor.diagnostics_enabled() {
+                report_suppressed_write(&self.inner.reactor, self.inner.id, Location::caller());
+            }
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::SIGNAL,

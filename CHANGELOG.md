@@ -78,6 +78,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   propagation-depth tracking. An earlier cut that tracked depth unconditionally cost 15.7%
   there, for the same reason the first computed-work cut was expensive: a drop obligation
   on a hot path.
+- `DiagnosticEvent::WriteSuppressed` and `FlushStats::writes_suppressed` report a write a
+  source's own equality check threw away. Such a write never reaches the graph — no version
+  bump, no propagation, no flush — so it appears nowhere in the propagation stream by
+  construction, and until now the only record was a `tracing` event behind
+  `debug_assertions`, absent from exactly the builds worth measuring. But the producer still
+  ran: something computed a value and discarded it. Kiln's case is the argument — a sampler
+  whose signal changed 14 times had *run* about 80, and only the second number says to slow
+  the sampler down. `root_writes + writes_suppressed` is how often something tried to write;
+  `root_writes` alone is how often it mattered. The event carries the write's origin, so the
+  discarded work is attributable to the call site that produced it. Reported in ordinary
+  builds; measured cost with diagnostics off is unmeasurable — a suppressed write is 4.33 ns
+  and the build *without* the reporting benchmarks 5.1% slower, which is the noise floor.
 - Computed-work diagnostics. Four new events make the middle of a propagation visible, where
   before only its endpoints were: `ComputedInvalidated` (every mark that reaches a thunk
   or memo, still carrying the original root write rather than blaming the node above

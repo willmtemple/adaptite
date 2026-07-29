@@ -23,6 +23,17 @@ fn signal_write_read(c: &mut Criterion) {
     });
 }
 
+/// Writing a signal the value it already holds: the suppressed path, which returns before
+/// touching the graph and now also reports the discarded write when anyone is listening.
+fn signal_write_suppressed(c: &mut Criterion) {
+    let reactor = Reactor::new();
+    let signal = signal_in(&reactor, 7u64);
+
+    c.bench_function("signal_write_suppressed", |b| {
+        b.iter(|| signal.set(black_box(7u64)));
+    });
+}
+
 /// A linear chain of memos: invalidation and verification walk the full depth.
 fn deep_chain(c: &mut Criterion) {
     const DEPTH: usize = 100;
@@ -173,6 +184,7 @@ fn graph_stats_snapshot(c: &mut Criterion) {
 criterion_group!(
     benches,
     signal_write_read,
+    signal_write_suppressed,
     deep_chain,
     wide_fanout,
     layered_diamonds,

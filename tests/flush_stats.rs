@@ -343,6 +343,93 @@ fn a_settled_graph_reports_an_empty_flush() {
 }
 
 #[test]
+fn a_producer_that_runs_more_often_than_it_publishes_is_visible() {
+    // Kiln's case: a sampler wrote its signal ~80 times and changed it 14. The equality gate
+    // saves the re-render and hides the work, so the propagation stream — which by construction
+    // only sees writes that propagated — reports the 14 and nothing else. `writes_suppressed` and
+    // `WriteSuppressed` are what make the other 66 attributable to the site that made them.
+    let reactor = Reactor::new();
+    let (capture, _subscription) = Capture::install(&reactor);
+
+    // Starts outside the sampled range, so each of the four groups genuinely changes it.
+    let sampled = signal_in(&reactor, 99_u32);
+    let effect = reactor.effect({
+        let sampled = sampled.clone();
+        move || {
+            let _ = sampled.get();
+        }
+    });
+    reactor.flush_now();
+    capture.borrow_mut().flushes.clear();
+    capture.borrow_mut().events.clear();
+
+    // Twenty attempts, four of which actually change the value.
+    for step in 0..20 {
+        sampled.set(step / 5);
+        reactor.flush_now();
+    }
+
+    let tally = |capture: &std::cell::RefMut<'_, Capture>| {
+        (
+            capture.flushes.iter().map(|s| s.root_writes).sum::<u32>(),
+            capture
+                .flushes
+                .iter()
+                .map(|s| s.writes_suppressed)
+                .sum::<u32>(),
+        )
+    };
+
+    let (published, discarded) = tally(&capture.borrow_mut());
+    assert_eq!(published, 4, "only four attempts moved the value");
+    assert_eq!(
+        discarded, 12,
+        "twelve of the sixteen discarded writes have been carried by a flush; the last four \
+         happened after the final flush and are still pending, because a suppressed write \
+         schedules nothing and a drain with an empty queue is not a flush"
+    );
+
+    // They are not lost, only waiting: the next flush that happens for any reason carries them.
+    sampled.set(1_000);
+    reactor.flush_now();
+    let (published, discarded) = tally(&capture.borrow_mut());
+    assert_eq!(published, 5);
+    assert_eq!(discarded, 16, "and now all sixteen are accounted for");
+
+    let capture = capture.borrow();
+
+    // Every discarded write names the site that made it, which is what turns the number into an
+    // action rather than a mystery.
+    let sites = capture
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            DiagnosticEvent::WriteSuppressed {
+                node, write_origin, ..
+            } if *node == sampled.id() => Some(write_origin.line()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 16);
+    assert!(
+        sites.windows(2).all(|pair| pair[0] == pair[1]),
+        "all attributed to the one call site"
+    );
+
+    // A suppressed write is not a `ReactiveWrite`: nothing propagated, and claiming otherwise
+    // would double-count the graph's actual work.
+    let propagated = capture
+        .events
+        .iter()
+        .filter(|event| matches!(event, DiagnosticEvent::ReactiveWrite { .. }))
+        .count();
+    assert_eq!(propagated, 5);
+
+    drop(capture);
+    effect.dispose();
+}
+
+#[test]
 fn propagation_depth_counts_the_chain() {
     let reactor = Reactor::new();
     let (capture, _subscription) = Capture::install(&reactor);

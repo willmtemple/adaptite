@@ -97,6 +97,21 @@ the pair itself — `FlushStarted`/`FlushFinished`, `EffectRunStarted`/`EffectRu
 `ComputedRecomputeStarted`/`ComputedRecomputeFinished`. Every field of `FlushStats` and
 `GraphStats` is a count.
 
+## Work that produces nothing is still work
+
+Two places where adaptite does something and then throws the result away, both reported, because
+in each case the *producer ran* and the propagation stream cannot show it — nothing propagated:
+
+| | Reported by | Says |
+|---|---|---|
+| A source write the value did not change | `WriteSuppressed`, `FlushStats::writes_suppressed` | Something is writing more often than the value moves |
+| A recomputation the comparator suppressed | `ComputedRecomputeFinished { changed: false }`, `FlushStats::computed_suppressed` | A computation is running more often than its result moves |
+
+Both are cheap by design — that is the point of the equality checks — but cheap is not free, and a
+gate that saves the downstream work also hides the upstream work from anything watching
+propagation. `root_writes + writes_suppressed` is how often something *tried*; `root_writes` alone
+is how often it mattered.
+
 ## What adaptite does not report
 
 - Application or renderer memory. adaptite accounts for the structures it owns; a consumer

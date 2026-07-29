@@ -149,6 +149,31 @@ pub enum DiagnosticEvent {
         /// Observers still recording an edge on this node at the moment of disposal.
         dependents: usize,
     },
+    /// A write to a source node was suppressed because the value had not changed.
+    ///
+    /// The write never reached the graph — no version bump, no propagation, no flush — so it does
+    /// **not** also appear as a [`ReactiveWrite`](Self::ReactiveWrite). It is reported anyway
+    /// because the producer still ran: something computed a value and threw it away, and a
+    /// producer running far more often than it publishes is invisible from the propagation side
+    /// by construction. That gap is the difference between "this signal changed 14 times" and
+    /// "the thing writing it ran 80 times", and only the second says to slow the producer down.
+    ///
+    /// Suppression here is the *source's* equality check. A memo whose comparator suppresses
+    /// propagation reports [`ComputedRecomputeFinished`](Self::ComputedRecomputeFinished) with
+    /// `changed: false` instead.
+    #[non_exhaustive]
+    WriteSuppressed {
+        /// Graph containing the node.
+        reactor: ReactorId,
+        /// Node that was written.
+        node: NodeId,
+        /// Primitive the node was created as.
+        kind: NodeKind,
+        /// Location at which the node was created.
+        node_origin: &'static Location<'static>,
+        /// Location of the write that was discarded — the site worth attributing this to.
+        write_origin: &'static Location<'static>,
+    },
     /// A source node changed.
     #[non_exhaustive]
     ReactiveWrite {
@@ -896,7 +921,9 @@ mod tests {
         source.set(2); // changes parity: recompute publishes
         source.set(4); // coalesces into the pending run
         reactor.flush_now();
-        source.set(6); // parity unchanged: suppressed, effect skipped
+        source.set(6); // parity unchanged: memo suppresses, effect skipped
+        reactor.flush_now();
+        source.set(6); // value unchanged: the *source* suppresses, nothing reaches the graph
         reactor.flush_now();
         effect.dispose();
         drop(doubled);
@@ -924,6 +951,7 @@ mod tests {
                 .map(|event| match event {
                     DiagnosticEvent::NodeCreated { .. } => "NodeCreated",
                     DiagnosticEvent::NodeDisposed { .. } => "NodeDisposed",
+                    DiagnosticEvent::WriteSuppressed { .. } => "WriteSuppressed",
                     DiagnosticEvent::ReactiveWrite { .. } => "ReactiveWrite",
                     DiagnosticEvent::ComputedInvalidated { .. } => "ComputedInvalidated",
                     DiagnosticEvent::ComputedVerified { .. } => "ComputedVerified",
@@ -947,6 +975,7 @@ mod tests {
         for expected in [
             "NodeCreated",
             "NodeDisposed",
+            "WriteSuppressed",
             "ReactiveWrite",
             "ComputedInvalidated",
             "ComputedVerified",
