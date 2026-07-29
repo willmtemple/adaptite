@@ -13,8 +13,109 @@
 use alloc::vec::Vec;
 use core::panic::Location;
 
+use crate::reactor::State;
 use crate::stats::GraphStats;
-use crate::{NodeId, NodeKind, Reactor};
+use crate::{NodeId, NodeKind, Reactor, ReactorId};
+
+/// How stale a node is.
+///
+/// Sources are never stale — they *are* the truth — so only computed nodes and effects report
+/// one.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeState {
+    /// Up to date.
+    Clean,
+    /// A computed dependency may have changed; the node must verify its inputs before deciding
+    /// whether to recompute.
+    Check,
+    /// A direct dependency definitely changed.
+    Dirty,
+}
+
+impl From<State> for NodeState {
+    fn from(state: State) -> Self {
+        match state {
+            State::Clean => Self::Clean,
+            State::Check => Self::Check,
+            State::Dirty => Self::Dirty,
+        }
+    }
+}
+
+/// One node in a [`GraphSnapshot`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphNode {
+    /// Process-local identity, unique within this reactor.
+    pub id: NodeId,
+    /// The primitive the node was created as.
+    pub kind: NodeKind,
+    /// Where it was created.
+    pub origin: &'static Location<'static>,
+    /// Current version. Increments whenever the node's value changes.
+    pub version: u64,
+    /// How stale the node is, or `None` for a node that is never stale — a source, a signal, an
+    /// event: anything with no computation to bring up to date.
+    pub state: Option<NodeState>,
+    /// Dependencies recorded during this node's last run.
+    pub dependencies: usize,
+    /// Observers currently recording a dependency on this node.
+    pub dependents: usize,
+}
+
+/// A recorded dependency: `observer` read `observable`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GraphEdge {
+    /// The node that performed the read.
+    pub observer: NodeId,
+    /// The node that was read.
+    pub observable: NodeId,
+}
+
+/// Everything a reactor is holding, walked.
+///
+/// The counterpart to [`GraphStats`], and the distinction between them is the point:
+/// `graph_stats` is `O(1)` and answers *how much*, safe to call every frame; this walks every
+/// node and edge and answers *what*, for a human, an inspector, or a post-mortem. Calling this
+/// one per frame is a mistake.
+///
+/// Reading a snapshot never refreshes a computed node or evaluates a computation, so an
+/// inspection cannot perturb the graph it is inspecting — including the `state` field, which
+/// reports staleness rather than resolving it.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct GraphSnapshot {
+    /// Graph this describes.
+    pub reactor: ReactorId,
+    /// Every live node, ordered by id, so two snapshots can be diffed directly.
+    pub nodes: Vec<GraphNode>,
+    /// Every recorded dependency, ordered.
+    pub edges: Vec<GraphEdge>,
+    /// The `O(1)` account, taken at the same moment.
+    pub stats: GraphStats,
+}
+
+impl GraphSnapshot {
+    /// Returns the node with `id`, if it is live.
+    pub fn node(&self, id: NodeId) -> Option<&GraphNode> {
+        self.nodes
+            .binary_search_by_key(&id, |node| node.id)
+            .ok()
+            .map(|index| &self.nodes[index])
+    }
+
+    /// Returns the nodes that are not [`Clean`](NodeState::Clean).
+    ///
+    /// On a settled graph this is empty. When it is not, and nothing is scheduled, something is
+    /// holding staleness nobody will resolve.
+    pub fn stale(&self) -> impl Iterator<Item = &GraphNode> {
+        self.nodes
+            .iter()
+            .filter(|node| !matches!(node.state, None | Some(NodeState::Clean)))
+    }
+}
 
 impl Reactor {
     /// Returns `true` if any live observer currently records a dependency on `node`.
@@ -59,6 +160,87 @@ impl Reactor {
             .borrow()
             .get(&node)
             .map_or(0, |observers| observers.len())
+    }
+
+    /// Walks the whole graph and returns everything in it.
+    ///
+    /// See [`GraphSnapshot`]. This is `O(nodes + edges)` and allocates — the tool for a human, an
+    /// inspector, or a post-mortem, not for a per-frame assertion. Reach for
+    /// [`graph_stats`](Self::graph_stats) when the question is *how much* rather than *what*.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::{NodeKind, Reactor, memo_in, signal_in};
+    ///
+    /// let reactor = Reactor::new();
+    /// let value = signal_in(&reactor, 1_u32);
+    /// let doubled = memo_in(&reactor, {
+    ///     let value = value.clone();
+    ///     move || value.get() * 2
+    /// });
+    /// assert_eq!(doubled.get(), 2);
+    ///
+    /// let snapshot = reactor.debug_graph();
+    /// assert_eq!(snapshot.nodes.len(), 2);
+    /// assert_eq!(snapshot.edges.len(), 1);
+    /// assert_eq!(snapshot.edges[0].observer, doubled.id());
+    /// assert_eq!(snapshot.edges[0].observable, value.id());
+    ///
+    /// // A source is never stale; a memo that has been read is clean.
+    /// assert_eq!(snapshot.node(value.id()).unwrap().kind, NodeKind::Signal);
+    /// assert!(snapshot.node(value.id()).unwrap().state.is_none());
+    /// assert_eq!(snapshot.stale().count(), 0);
+    ///
+    /// // Writing leaves the memo stale until something reads it again.
+    /// value.set(2);
+    /// let snapshot = reactor.debug_graph();
+    /// assert_eq!(snapshot.stale().count(), 1);
+    /// ```
+    pub fn debug_graph(&self) -> GraphSnapshot {
+        let meta = self.inner.meta.borrow();
+        let dependencies = self.inner.dependencies.borrow();
+        let dependents = self.inner.dependents.borrow();
+        let observers = self.inner.observers.borrow();
+
+        let mut nodes = Vec::with_capacity(meta.len());
+        let mut edges = Vec::new();
+        for (id, entry) in meta.iter() {
+            let outgoing = dependencies.get(id);
+            if let Some(outgoing) = outgoing {
+                edges.extend(outgoing.keys().map(|observable| GraphEdge {
+                    observer: *id,
+                    observable: *observable,
+                }));
+            }
+            nodes.push(GraphNode {
+                id: *id,
+                kind: entry.kind,
+                origin: entry.origin,
+                version: entry.version,
+                // Absent for anything with no computation to bring up to date, and for an
+                // observer whose hook has been dropped but whose metadata is still live.
+                state: observers
+                    .get(id)
+                    .and_then(|weak| weak.upgrade())
+                    .map(|hook| hook.state().into()),
+                dependencies: outgoing.map_or(0, hashbrown::HashMap::len),
+                dependents: dependents.get(id).map_or(0, hashbrown::HashSet::len),
+            });
+        }
+
+        // Hash-map iteration order is arbitrary and varies run to run; sorting is what lets two
+        // snapshots be compared, diffed, or asserted against.
+        nodes.sort_unstable_by_key(|node| node.id);
+        edges.sort_unstable();
+
+        drop((meta, dependencies, dependents, observers));
+        GraphSnapshot {
+            reactor: self.inner.id,
+            nodes,
+            edges,
+            stats: self.graph_stats(),
+        }
     }
 
     /// Returns how many dependencies `node` recorded during its last run.
@@ -198,5 +380,139 @@ impl Reactor {
             self.inner.flush_depth.get(),
             self.inner.flush_epoch.get(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use crate::{NodeKind, NodeState, Reactor, memo_in, signal_in, source_in};
+
+    #[test]
+    fn a_snapshot_describes_the_whole_graph_and_is_ordered() {
+        let reactor = Reactor::new();
+        let left = signal_in(&reactor, 1_u32);
+        let right = signal_in(&reactor, 2_u32);
+        let total = memo_in(&reactor, {
+            let left = left.clone();
+            let right = right.clone();
+            move || left.get() + right.get()
+        });
+        let effect = reactor.effect({
+            let total = total.clone();
+            move || {
+                let _ = total.get();
+            }
+        });
+        reactor.flush_now();
+
+        let snapshot = reactor.debug_graph();
+        assert_eq!(snapshot.reactor, reactor.id());
+        assert_eq!(snapshot.nodes.len(), 4);
+        assert_eq!(snapshot.stats.live_nodes, 4);
+
+        let ids = snapshot
+            .nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            ids, sorted,
+            "nodes must be ordered so snapshots can be diffed"
+        );
+
+        let memo = snapshot.node(total.id()).expect("the memo is live");
+        assert_eq!(memo.kind, NodeKind::Memo);
+        assert_eq!(memo.dependencies, 2);
+        assert_eq!(memo.dependents, 1);
+        assert_eq!(memo.state, Some(NodeState::Clean));
+        assert!(memo.origin.file().ends_with("inspect.rs"));
+
+        // Sources have no computation to bring up to date, so they report no staleness at all
+        // rather than a misleading "clean".
+        assert_eq!(snapshot.node(left.id()).expect("live").state, None);
+
+        // memo->left, memo->right, effect->memo.
+        assert_eq!(snapshot.edges.len(), 3);
+        assert_eq!(snapshot.stats.live_edges, 3);
+        assert!(
+            snapshot
+                .edges
+                .iter()
+                .any(|edge| edge.observer == total.id() && edge.observable == left.id())
+        );
+
+        effect.dispose();
+    }
+
+    #[test]
+    fn staleness_is_reported_without_being_resolved() {
+        let reactor = Reactor::new();
+        let source = signal_in(&reactor, 1_u32);
+        let doubled = memo_in(&reactor, {
+            let source = source.clone();
+            move || source.get() * 2
+        });
+        assert_eq!(doubled.get(), 2);
+        assert_eq!(reactor.debug_graph().stale().count(), 0);
+
+        source.set(5);
+
+        // Twice: an inspection that recomputed on the way past would answer its own question and
+        // hide the thing being investigated.
+        for _ in 0..2 {
+            let snapshot = reactor.debug_graph();
+            let stale = snapshot.stale().collect::<Vec<_>>();
+            assert_eq!(stale.len(), 1);
+            assert_eq!(stale[0].id, doubled.id());
+            assert_eq!(stale[0].state, Some(NodeState::Dirty));
+        }
+
+        assert_eq!(doubled.get(), 10);
+        assert_eq!(reactor.debug_graph().stale().count(), 0);
+    }
+
+    #[test]
+    fn a_graph_nobody_flushes_is_visible_as_a_graph_nobody_flushes() {
+        // Kiln's second bug: signals created outside a render landed on a reactor nobody
+        // flushed, so reads and writes worked and nothing re-rendered. From inside that reactor
+        // the failure is invisible; from outside, the whole graph is one unobserved node.
+        let application = Reactor::new();
+        let stranded = Reactor::new();
+
+        let held = signal_in(&stranded, 0_u32);
+        let effect = application.effect(|| {});
+        application.flush_now();
+
+        let orphan = stranded.debug_graph();
+        assert_eq!(orphan.nodes.len(), 1);
+        assert_eq!(orphan.edges.len(), 0);
+        assert_eq!(orphan.stats.observed_nodes, 0);
+        assert_eq!(
+            orphan.stats.flushes, 0,
+            "the telltale: this graph has never been flushed"
+        );
+        assert_ne!(orphan.reactor, application.debug_graph().reactor);
+
+        drop(held);
+        effect.dispose();
+    }
+
+    #[test]
+    fn an_unobserved_source_still_appears() {
+        let reactor = Reactor::new();
+        let node = source_in(&reactor);
+
+        let snapshot = reactor.debug_graph();
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(
+            snapshot.node(node.id()).expect("live").kind,
+            NodeKind::Source
+        );
+        assert_eq!(snapshot.node(node.id()).expect("live").dependents, 0);
+        assert!(snapshot.edges.is_empty());
     }
 }

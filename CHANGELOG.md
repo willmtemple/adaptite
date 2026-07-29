@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its documented "late, never early" semantics. `node_origin` exposes the
   `#[track_caller]` creation site that until now surfaced only inside a
   `ReactCycleError`, the divergence panic, or a diagnostic event.
+- `Reactor::debug_graph()` returns a `GraphSnapshot`: every live node with its id, kind,
+  creation origin, version, staleness and edge counts, plus every recorded edge, plus a
+  `GraphStats` taken at the same moment. The walking counterpart to `graph_stats()`, and
+  the distinction is the point — `graph_stats` is `O(1)` and answers *how much*, safe to
+  call every frame; this walks the graph and answers *what*, for a human, an inspector, or
+  a post-mortem. Nodes and edges are sorted, so two snapshots can be diffed directly.
+  Reading a snapshot never refreshes a computed node, so `state` reports staleness rather
+  than resolving it and an inspection cannot perturb what it is inspecting; `stale()`
+  filters to the nodes that are not clean. Sources report `state: None` rather than a
+  misleading `Clean`, since they have no computation to bring up to date. Node naming and
+  a `serde` export remain deferred — no consumer has asked, and `#[track_caller]` origins
+  already give the human anchor at no runtime cost.
 - Per-flush work totals. `DiagnosticEvent::FlushFinished` now carries a `FlushStats`:
   root writes, nodes marked (split check/dirty), maximum propagation depth, effects
   queued/coalesced/run/skipped/disposed/pending, computed nodes

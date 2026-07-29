@@ -812,6 +812,10 @@ impl ObserverHook for EffectInner {
         }
         self.schedule();
     }
+
+    fn state(&self) -> State {
+        self.state.get()
+    }
 }
 
 impl Drop for EffectInner {

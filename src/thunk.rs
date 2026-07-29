@@ -832,6 +832,10 @@ impl<T: 'static> ObserverHook for ThunkInner<T> {
     fn refresh(&self) {
         ThunkInner::refresh(self);
     }
+
+    fn state(&self) -> State {
+        self.state.get()
+    }
 }
 
 impl<T> Drop for ThunkInner<T> {
@@ -863,6 +867,10 @@ impl<T: 'static> ObserverHook for MemoInner<T> {
 
     fn refresh(&self) {
         MemoInner::refresh(self);
+    }
+
+    fn state(&self) -> State {
+        self.state.get()
     }
 }
 

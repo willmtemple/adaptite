@@ -206,6 +206,13 @@ pub(crate) trait ObserverHook {
     /// The default implementation is a no-op; it is used by observers that are never read as
     /// dependencies (effects).
     fn refresh(&self) {}
+
+    /// Reports how stale this observer currently is, for [`Reactor::debug_graph`].
+    ///
+    /// Staleness lives on each node's own inner struct rather than in the reactor's maps, so a
+    /// snapshot has to ask. Read-only, and must not recompute: an inspection that brought nodes
+    /// up to date would change the thing it is inspecting.
+    fn state(&self) -> State;
 }
 
 /// Error type for cycles detected in the reactive graph. Contains the path of nodes that form the cycle.
@@ -1360,7 +1367,7 @@ pub(crate) struct ReactorInner {
     pub(crate) meta: RefCell<HashMap<NodeId, NodeMeta>>,
     pub(crate) dependencies: RefCell<HashMap<NodeId, HashMap<NodeId, u64>>>,
     pub(crate) dependents: RefCell<HashMap<NodeId, HashSet<NodeId>>>,
-    observers: RefCell<HashMap<NodeId, Weak<dyn ObserverHook>>>,
+    pub(crate) observers: RefCell<HashMap<NodeId, Weak<dyn ObserverHook>>>,
     stack: RefCell<Vec<NodeId>>,
     active_computations: RefCell<HashSet<NodeId>>,
     pub(crate) pending_jobs: RefCell<VecDeque<Job>>,
