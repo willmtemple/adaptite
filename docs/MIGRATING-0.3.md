@@ -73,6 +73,26 @@ Making a flush happen because diagnostics are subscribed would break the rule
 that subscribing never changes behaviour, so this is the honest trade. In an
 application, where flushes keep coming, it is invisible.
 
+## Behaviour change: a divergent loop now panics in release
+
+An effect that writes state it depends on without converging used to panic in debug builds and
+**hang forever** in release. The guard is now enforced in every build, so a release build panics
+with the same message debug always gave:
+
+```
+adaptite: effect created at src/ui.rs:9:16 ran more than 100 times in a single drain; this
+suggests a divergent reactive feedback loop (the effect writes state it depends on without
+converging)
+```
+
+Convergent feedback is unaffected and settles far below the limit — this only fires on a loop
+that was never going to terminate. If a shipped application starts panicking here, it was
+previously freezing at the same point.
+
+The measured cost is below the noise floor of an effect run, so this is not a performance
+trade. It is the same argument the crate makes against `cfg`-gated diagnostics generally: the
+build that omits the safety net is the build that has the problem.
+
 ## Behaviour change: teardown is total
 
 `OwnerFrame::reset` documented that a panicking cleanup does not strand its

@@ -195,6 +195,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maintained counter rather than the length of the dependents index, because emptied entries
   are retained across an observer's rerun. The value is unchanged and is asserted against a
   walk of the graph in the test suite.
+- The divergence guard is now enforced in **every** build, not only debug. A non-convergent
+  feedback loop used to panic with a precise diagnosis in debug and hang `flush_now` forever in
+  release — no panic, no log, nothing for a user to report, and for a GUI host a permanently
+  frozen application. The builds were backwards relative to where the failure hurts: the
+  configuration that said nothing was the one shipped to users. Release now produces the same
+  panic as debug, naming the effect and its origin. Cost is below the noise floor of a 235 ns
+  effect run (two `Cell` reads, a compare and a branch); the A/B measured the guarded build
+  marginally *faster* than the baseline. The regression test was itself `cfg(debug_assertions)`,
+  which is how the hang survived unnoticed — it now runs in both profiles.
 - An effect that writes state it depends on and then calls `flush_now` no longer re-enters
   itself. Both halves are documented as legal — convergent self-feedback, and synchronous
   propagation for host integrations — but together the nested flush found the job the write

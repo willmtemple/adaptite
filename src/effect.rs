@@ -15,8 +15,9 @@ use crate::{
 };
 
 /// Maximum number of times a single effect may run within one job flush before the reactor
-/// assumes it is caught in a divergent feedback loop (debug builds only).
-#[cfg(debug_assertions)]
+/// assumes it is caught in a divergent feedback loop.
+///
+/// Enforced in every build. Convergent feedback settles far below this.
 const MAX_RUNS_PER_FLUSH: u32 = 100;
 
 /// Creates an effect in the current thread's default reactor.
@@ -328,9 +329,7 @@ impl EffectHandle {
             disposed: Cell::new(false),
             self_ref: RefCell::new(Weak::new()),
             owner: OwnerFrame::new(),
-            #[cfg(debug_assertions)]
             last_drain_epoch: Cell::new(u64::MAX),
-            #[cfg(debug_assertions)]
             runs_this_drain: Cell::new(0),
         });
         *inner.self_ref.borrow_mut() = Rc::downgrade(&inner);
@@ -470,9 +469,10 @@ struct EffectInner {
     self_ref: RefCell<Weak<EffectInner>>,
     /// Ownership frame for cleanups and nested effects created during this effect's runs.
     owner: Rc<OwnerFrame>,
-    #[cfg(debug_assertions)]
+    /// Divergence guard state. Deliberately *not* `cfg(debug_assertions)`: a runaway loop in a
+    /// release build is a frozen application with no output, which is the worst failure mode a UI
+    /// host can have and the one configuration where adaptite used to say nothing.
     last_drain_epoch: Cell<u64>,
-    #[cfg(debug_assertions)]
     runs_this_drain: Cell<u32>,
 }
 
@@ -687,7 +687,6 @@ impl EffectInner {
             return;
         }
 
-        #[cfg(debug_assertions)]
         self.check_divergence();
 
         let _span = tracing::debug_span!(
@@ -758,7 +757,10 @@ impl EffectInner {
     ///
     /// Convergent feedback (for example clamping, where the rewritten value is suppressed by the
     /// signal's equality check on the next round) is legal and settles well below this limit.
-    #[cfg(debug_assertions)]
+    ///
+    /// Checked in **every** build. The alternative to panicking here is not "the application
+    /// carries on" — it is `flush_now` never returning, with no panic, no log and nothing for the
+    /// user to report. A panic is strictly more recoverable and more attributable than a freeze.
     fn check_divergence(&self) {
         // Drain rather than flush: a re-entrant `flush_now` opens a new diagnostic epoch but must
         // not reset this counter, or an effect that re-flushes could evade the guard entirely.
@@ -1570,7 +1572,8 @@ mod tests {
         assert_eq!(&*seen.borrow(), &[25, 10]);
     }
 
-    #[cfg(debug_assertions)]
+    /// Not `cfg(debug_assertions)`: the guard is enforced in every build, and a test gated to
+    /// debug is exactly how the release hang survived unnoticed in the first place.
     #[test]
     fn divergent_feedback_loops_panic_instead_of_hanging() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
