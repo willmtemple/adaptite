@@ -95,9 +95,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # Block scalar, so YAML does no escaping of its own: the quoting needed to pull a
+      # double-quoted TOML value apart does not survive a plain scalar.
       - name: Read the declared MSRV
         id: msrv
-        run: echo "version=$(grep '^rust-version' Cargo.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(grep '^rust-version' Cargo.toml | cut -d'"' -f2)
+          if [ -z "$version" ]; then
+            echo "could not read rust-version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "declared MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Install it
         run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal --no-self-update
       - name: Rust cache
