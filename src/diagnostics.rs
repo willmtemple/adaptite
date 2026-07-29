@@ -46,10 +46,16 @@ pub enum InvalidationLevel {
 /// Events are delivered synchronously on the reactor thread. A callback must
 /// not mutate the same reactive graph or add/remove diagnostic subscriptions;
 /// it should copy the fields it needs into an external trace sink.
+///
+/// Both the enum and every variant are `#[non_exhaustive]`, so a `match` needs a
+/// wildcard arm *and* each variant pattern needs a trailing `..`. Adding a variant and
+/// adding a field to an existing variant are then both additive changes, which matters
+/// because these payloads grow as the graph learns to report more about itself.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticEvent {
     /// A source node changed.
+    #[non_exhaustive]
     ReactiveWrite {
         /// Graph containing the node.
         reactor: ReactorId,
@@ -57,6 +63,7 @@ pub enum DiagnosticEvent {
         cause: InvalidationCause,
     },
     /// A root mutation reached an effect, directly or through computed nodes.
+    #[non_exhaustive]
     EffectInvalidated {
         /// Graph containing the effect.
         reactor: ReactorId,
@@ -70,6 +77,7 @@ pub enum DiagnosticEvent {
         level: InvalidationLevel,
     },
     /// An attempt to place an effect in the next reactive flush.
+    #[non_exhaustive]
     EffectScheduled {
         /// Graph containing the effect.
         reactor: ReactorId,
@@ -84,6 +92,7 @@ pub enum DiagnosticEvent {
         flush_epoch: u64,
     },
     /// An effect body is about to execute.
+    #[non_exhaustive]
     EffectRunStarted {
         /// Graph containing the effect.
         reactor: ReactorId,
@@ -95,6 +104,7 @@ pub enum DiagnosticEvent {
         flush_epoch: u64,
     },
     /// An effect body returned or unwound.
+    #[non_exhaustive]
     EffectRunFinished {
         /// Graph containing the effect.
         reactor: ReactorId,
@@ -104,6 +114,7 @@ pub enum DiagnosticEvent {
         flush_epoch: u64,
     },
     /// Verification proved that a check-marked effect did not need to run.
+    #[non_exhaustive]
     EffectRunSkipped {
         /// Graph containing the effect.
         reactor: ReactorId,
@@ -113,6 +124,7 @@ pub enum DiagnosticEvent {
         flush_epoch: u64,
     },
     /// An effect was disposed and will never run again.
+    #[non_exhaustive]
     EffectDisposed {
         /// Graph containing the effect.
         reactor: ReactorId,
@@ -120,6 +132,7 @@ pub enum DiagnosticEvent {
         effect: NodeId,
     },
     /// A reactor began draining its queued jobs.
+    #[non_exhaustive]
     FlushStarted {
         /// Graph being flushed.
         reactor: ReactorId,
@@ -129,6 +142,7 @@ pub enum DiagnosticEvent {
         pending_jobs: usize,
     },
     /// A reactor stopped draining jobs, including unwind paths.
+    #[non_exhaustive]
     FlushFinished {
         /// Graph that was flushed.
         reactor: ReactorId,

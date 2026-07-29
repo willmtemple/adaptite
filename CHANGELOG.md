@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- Every variant of `DiagnosticEvent` is now `#[non_exhaustive]`, not just the enum
+  itself. `#[non_exhaustive]` on an enum forbids exhaustive matching of *variants*; the
+  fields of a struct variant still matched exhaustively, so
+  `DiagnosticEvent::FlushFinished { reactor, flush_epoch, remaining_jobs } => …`
+  compiled and would have broken the moment a field was added. Variant patterns now
+  need a trailing `..`, which is the whole fix. Done first in this release because the
+  diagnostics work that follows adds fields to existing variants; without it each of
+  those additions would be a separate breaking change.
+
 ## [0.2.0] - 2026-07-28
 
 This release moves adaptite onto runite 0.2, makes the ambient reactor an
