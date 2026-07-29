@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `EffectHandle::id()` and `EffectHandle::reactor_id()` report an effect's node identity
+  and the graph it belongs to. `EffectRun::id()` already exposed the same `NodeId`, but
+  only from the first *scheduled* run — one run later than a consumer that wants to key
+  a retained structure by effect at creation. Node ids are process-local and never
+  reused (the allocator is a monotonic counter and disposal does not return an id), so
+  an id kept past disposal dangles but can never come to mean a different node; pair it
+  with `is_disposed` when liveness matters. `reactor_id` completes the
+  `(ReactorId, NodeId)` pair that every diagnostic payload is scoped by.
+
 ### Breaking
 
 - Every variant of `DiagnosticEvent` is now `#[non_exhaustive]`, not just the enum

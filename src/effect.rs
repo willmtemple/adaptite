@@ -9,7 +9,9 @@ use crate::scope::{
     OwnedDisposable, OwnerFrame, adopt_into_current, build_error_info, error_handler_for,
     with_owner,
 };
-use crate::{DiagnosticEvent, InvalidationCause, NodeId, Reactor, current, trace_targets};
+use crate::{
+    DiagnosticEvent, InvalidationCause, NodeId, Reactor, ReactorId, current, trace_targets,
+};
 
 /// Maximum number of times a single effect may run within one job flush before the reactor
 /// assumes it is caught in a divergent feedback loop (debug builds only).
@@ -396,6 +398,49 @@ impl EffectHandle {
     pub fn is_disposed(&self) -> bool {
         self.inner.disposed.get()
     }
+
+    /// Returns the effect's node identity, stable for as long as the effect exists.
+    ///
+    /// This is the same id [`EffectRun::id`] reports, available from the moment the effect is
+    /// created rather than from its first scheduled run — which is what lets a consumer key a
+    /// retained structure by effect without bookkeeping around the initial run.
+    ///
+    /// Node ids are process-local and **never reused**: the allocator is a monotonic counter and
+    /// disposal does not return an id to it. An id kept past disposal therefore dangles, but it
+    /// can never come to mean a different node. Pair it with [`is_disposed`](Self::is_disposed)
+    /// when liveness matters. The id grants no access to the graph.
+    ///
+    /// [`NodeId`] is unique only within one reactor, so aggregate on
+    /// `(`[`reactor_id`](Self::reactor_id)`, id)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::Reactor;
+    ///
+    /// let reactor = Reactor::new();
+    /// let effect = reactor.effect(|| {});
+    ///
+    /// // Stable across runs and across disposal.
+    /// let id = effect.id();
+    /// reactor.flush_now();
+    /// assert_eq!(effect.id(), id);
+    /// effect.dispose();
+    /// assert_eq!(effect.id(), id);
+    ///
+    /// assert_eq!(effect.reactor_id(), reactor.id());
+    /// ```
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
+    /// Returns the identity of the reactor this effect belongs to.
+    ///
+    /// Diagnostic payloads are scoped `(ReactorId, NodeId)`; this is the half a handle could not
+    /// supply before.
+    pub fn reactor_id(&self) -> ReactorId {
+        self.inner.reactor.id()
+    }
 }
 
 impl core::fmt::Debug for EffectHandle {
@@ -774,6 +819,63 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn effect_identity_is_the_same_from_the_handle_the_lane_and_the_diagnostics() {
+        use crate::DiagnosticEvent;
+
+        let reactor = Reactor::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = reactor.subscribe_diagnostics({
+            let events = Rc::clone(&events);
+            move |event| events.borrow_mut().push(event)
+        });
+
+        let lane = Lane::default();
+        let value = signal_in(&reactor, 1);
+        let effect = reactor.effect_with(lane.scheduler(), {
+            let value = value.clone();
+            move || {
+                let _ = value.get();
+            }
+        });
+
+        // The point of the addition: the id is known before anything has run, so a consumer can
+        // key a retained structure by effect at creation rather than at first run.
+        let id = effect.id();
+        assert_eq!(effect.reactor_id(), reactor.id());
+
+        let queued = lane.0.borrow().first().and_then(|run| run.id());
+        assert_eq!(queued, Some(id), "the lane sees the same node");
+
+        lane.drain(&reactor);
+        assert_eq!(effect.id(), id, "running does not change identity");
+
+        value.set(2);
+        lane.drain(&reactor);
+        effect.dispose();
+        assert_eq!(
+            effect.id(),
+            id,
+            "a disposed effect keeps its id; ids are never reused"
+        );
+
+        // Every effect-shaped event in the stream is attributable to the handle without any
+        // private access — RUIN's acceptance criterion for this pair.
+        let effect_events = events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                DiagnosticEvent::EffectScheduled { effect, .. }
+                | DiagnosticEvent::EffectRunStarted { effect, .. }
+                | DiagnosticEvent::EffectRunFinished { effect, .. }
+                | DiagnosticEvent::EffectDisposed { effect, .. } => Some(*effect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!effect_events.is_empty());
+        assert!(effect_events.iter().all(|reported| *reported == id));
     }
 
     #[test]
