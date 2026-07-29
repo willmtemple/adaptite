@@ -87,6 +87,30 @@ jobs:
       - name: Smoke-run benchmarks
         run: mise run bench-smoke
 
+  # `rust-version` in Cargo.toml is a promise to downstream users, and nothing else in this
+  # workflow checks it — the pinned toolchain tracks stable. Without this the MSRV can be broken
+  # by a language feature nobody noticed using, and the first report comes from a user.
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read the declared MSRV
+        id: msrv
+        run: echo "version=$(grep '^rust-version' Cargo.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Install it
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal --no-self-update
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+      # Build and test rather than clippy: lint output legitimately differs between toolchains,
+      # and what downstream cares about is whether the crate compiles and behaves.
+      - name: Build
+        run: cargo +${{ steps.msrv.outputs.version }} build --workspace --all-targets --locked
+      - name: Test
+        run: cargo +${{ steps.msrv.outputs.version }} test --workspace --locked
+
   test-macos:
     name: Test (macOS aarch64)
     runs-on: macos-14
