@@ -5,7 +5,7 @@
 //! to do every frame. This module maintains the counts as the graph changes, so a snapshot is a
 //! handful of loads.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 use crate::{NodeKind, ReactorId};
 
@@ -135,6 +135,164 @@ impl GraphStats {
     }
 }
 
+/// What one flush did.
+///
+/// Delivered on [`DiagnosticEvent::FlushFinished`](crate::DiagnosticEvent::FlushFinished). An
+/// idle window's flush should be all zeroes, and that is the point: without this, "a flush
+/// happened" and "a flush did work" are indistinguishable, and an idle application's cost is a
+/// CPU percentage rather than a number.
+///
+/// # Availability
+///
+/// Unlike [`GraphStats`], these counters are maintained **only while a diagnostic subscription is
+/// active**. The distinction is not arbitrary: `GraphStats` backs a query that can be called at
+/// any moment, so it must always be true, whereas `FlushStats` is only ever observed by being
+/// delivered in an event, and an event nobody subscribed to is not delivered. Counters that back
+/// a query are always maintained; counters that back an event follow the event.
+///
+/// # Attribution
+///
+/// Work is attributed to **the next flush that closes**, and counted exactly once.
+///
+/// - Work performed during a flush belongs to the innermost flush open at the time. Flushes nest
+///   — a re-entrant [`Reactor::flush_now`](crate::Reactor::flush_now) from inside a job opens a
+///   genuine inner epoch — and an inner flush's totals are *not* rolled up into the enclosing
+///   one, so summing the flushes in a capture double-counts nothing.
+/// - Work performed outside any flush — most importantly the writes that scheduled it — is
+///   handed to the flush that drains it. A write and the effect run it causes therefore appear
+///   in the same totals, which is what makes `root_writes` answer "what set this flush off".
+///
+/// # No durations
+///
+/// Adaptite reads no clock. Every field here is a count. A consumer that wants a duration
+/// timestamps the `FlushStarted`/`FlushFinished` pair itself.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FlushStats {
+    /// Writes and explicit triggers on source nodes.
+    pub root_writes: u32,
+    /// Marks delivered to observers saying a computed input *may* have changed.
+    pub nodes_marked_check: u32,
+    /// Marks delivered to observers saying a direct dependency definitely changed.
+    pub nodes_marked_dirty: u32,
+    /// Deepest chain of marking walked in one propagation.
+    ///
+    /// One write reaching an effect directly is depth 1; through two memos, depth 3.
+    pub max_propagation_depth: u32,
+    /// Effects that acquired a pending run.
+    pub effects_queued: u32,
+    /// Invalidations absorbed by an effect that already had a run pending.
+    pub effects_coalesced: u32,
+    /// Effect bodies executed.
+    pub effects_run: u32,
+    /// Effects whose verification proved their inputs unchanged, so the body was skipped.
+    pub effects_skipped: u32,
+    /// Effects disposed.
+    pub effects_disposed: u32,
+    /// Effects still holding a pending run when the flush closed.
+    pub effects_pending: u32,
+    /// Check-marked computed nodes that verified their inputs.
+    pub computed_verified: u32,
+    /// Computations that ran.
+    ///
+    /// `computed_changed + computed_suppressed` is **at most** this, not equal to it: a
+    /// computation that unwound published nothing and is neither. The difference is the number
+    /// that failed.
+    pub computed_recomputed: u32,
+    /// Computations that published a new value.
+    pub computed_changed: u32,
+    /// Computations whose comparator judged the value unchanged, sparing everything downstream.
+    pub computed_suppressed: u32,
+    /// Dependency edges recorded.
+    pub edges_added: u32,
+    /// Dependency edges retracted.
+    pub edges_removed: u32,
+    /// Jobs queued when the flush opened.
+    pub jobs_at_start: u32,
+    /// Jobs still queued when the flush closed.
+    ///
+    /// Non-zero after a panicking job: the flush hands what is left to a fresh one.
+    pub jobs_at_finish: u32,
+}
+
+impl FlushStats {
+    /// Returns `true` when the flush did no reactive work at all.
+    ///
+    /// The assertion an idle application wants: a settled graph produces either no flush or an
+    /// empty one, and "idle is idle" stops being a CPU percentage that varies between runs of the
+    /// same build.
+    ///
+    /// Deliberately ignores [`jobs_at_start`](Self::jobs_at_start) and
+    /// [`jobs_at_finish`](Self::jobs_at_finish), which describe the queue rather than work done.
+    pub fn is_empty(&self) -> bool {
+        self.root_writes == 0
+            && self.nodes_marked_check == 0
+            && self.nodes_marked_dirty == 0
+            && self.effects_queued == 0
+            && self.effects_coalesced == 0
+            && self.effects_run == 0
+            && self.effects_skipped == 0
+            && self.effects_disposed == 0
+            && self.computed_verified == 0
+            && self.computed_recomputed == 0
+            && self.edges_added == 0
+            && self.edges_removed == 0
+    }
+}
+
+/// Accumulates [`FlushStats`] and decides which flush each unit of work belongs to.
+///
+/// `pending` holds work performed outside any flush; opening the outermost flush takes it, so the
+/// writes that scheduled a flush are counted in it. `open` is the stack of flushes in progress,
+/// and work always lands on its top, which is what keeps a nested flush's totals out of its
+/// parent's.
+#[derive(Default)]
+pub(crate) struct FlushAccounting {
+    pending: RefCell<FlushStats>,
+    open: RefCell<Vec<FlushStats>>,
+}
+
+impl FlushAccounting {
+    pub(crate) fn record(&self, f: impl FnOnce(&mut FlushStats)) {
+        let mut open = self.open.borrow_mut();
+        match open.last_mut() {
+            Some(stats) => f(stats),
+            None => f(&mut self.pending.borrow_mut()),
+        }
+    }
+
+    pub(crate) fn open_flush(&self, jobs_at_start: usize) {
+        // Taking `pending` hands the writes that scheduled this flush to the flush itself. Inside
+        // a flush `pending` is always empty, so a nested open takes nothing and starts clean.
+        let mut stats = core::mem::take(&mut *self.pending.borrow_mut());
+        stats.jobs_at_start = saturating_u32(jobs_at_start);
+        self.open.borrow_mut().push(stats);
+    }
+
+    pub(crate) fn close_flush(
+        &self,
+        jobs_at_finish: usize,
+        effects_pending: usize,
+    ) -> Option<FlushStats> {
+        // `None` when a subscription arrived mid-flush, so there is no slot to close.
+        let mut stats = self.open.borrow_mut().pop()?;
+        stats.jobs_at_finish = saturating_u32(jobs_at_finish);
+        stats.effects_pending = saturating_u32(effects_pending);
+        Some(stats)
+    }
+
+    /// Drops everything accumulated so far. Called when the last subscription goes away, so a
+    /// later subscriber does not inherit totals from a window it could not see.
+    pub(crate) fn reset(&self) {
+        *self.pending.borrow_mut() = FlushStats::default();
+        self.open.borrow_mut().clear();
+    }
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 /// The maintained half of [`GraphStats`].
 ///
 /// Every field here is updated where the graph changes rather than computed on demand. The
@@ -192,6 +350,11 @@ impl GraphCounters {
     /// Records a pending run being executed or discarded.
     pub(crate) fn effect_unqueued(&self) {
         drop_by(&self.queued_effects, 1);
+    }
+
+    /// Effects currently holding a pending run.
+    pub(crate) fn queued_effects(&self) -> usize {
+        self.queued_effects.get()
     }
 
     /// Records a flush opening.

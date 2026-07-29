@@ -20,6 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its documented "late, never early" semantics. `node_origin` exposes the
   `#[track_caller]` creation site that until now surfaced only inside a
   `ReactCycleError`, the divergence panic, or a diagnostic event.
+- Per-flush work totals. `DiagnosticEvent::FlushFinished` now carries a `FlushStats`:
+  root writes, nodes marked (split check/dirty), maximum propagation depth, effects
+  queued/coalesced/run/skipped/disposed/pending, computed nodes
+  verified/recomputed/changed/suppressed, edges added and removed, and the job queue depth
+  at both ends. `FlushStats::is_empty()` is the assertion an idle application wants: a
+  settled graph produces either no flush or an empty one, so "idle is idle" stops being a
+  CPU percentage that varies between runs of the same build.
+  Work is attributed to **the next flush that closes**, exactly once. An inner flush's
+  totals are not rolled up into the enclosing one, so summing a capture double-counts
+  nothing; and work performed outside any flush — the writes that scheduled it — is handed
+  to the flush that drains it, so a write and the effect run it causes land in the same
+  totals. Note that `computed_changed + computed_suppressed` is *at most*
+  `computed_recomputed`: a computation that unwound published nothing and is neither.
+  Unlike `GraphStats`, these counters are maintained **only while a diagnostic
+  subscription is active**. The rule is that counters backing a query must always be true,
+  while counters backing an event follow the event — and `FlushStats` is only ever observed
+  by being delivered in one. Measured cost with diagnostics off, against the same
+  benchmarks without the feature: within noise on the three graph-walking benchmarks (one
+  of them measures 4.4% *faster* with the feature) and about +3% on the 18 ns
+  `signal_write_read` microbenchmark, which is the single predictable branch now guarding
+  propagation-depth tracking. An earlier cut that tracked depth unconditionally cost 15.7%
+  there, for the same reason the first computed-work cut was expensive: a drop obligation
+  on a hot path.
 - Computed-work diagnostics. Four new events make the middle of a propagation visible, where
   before only its endpoints were: `ComputedInvalidated` (every mark that reaches a thunk
   or memo, still carrying the original root write rather than blaming the node above

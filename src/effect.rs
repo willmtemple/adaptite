@@ -494,6 +494,13 @@ impl EffectInner {
 
     fn schedule(&self) {
         let skipped = self.disposed.get() || self.latch_scheduled();
+        self.reactor.record_flush(|stats| {
+            if skipped {
+                stats.effects_coalesced = stats.effects_coalesced.saturating_add(1);
+            } else {
+                stats.effects_queued = stats.effects_queued.saturating_add(1);
+            }
+        });
         if self.reactor.diagnostics_enabled()
             && let Some(effect_origin) = self.reactor.node_origin(self.id)
         {
@@ -650,6 +657,9 @@ impl EffectInner {
                         flush_epoch: self.reactor.flush_epoch(),
                     });
             }
+            self.reactor.record_flush(|stats| {
+                stats.effects_skipped = stats.effects_skipped.saturating_add(1);
+            });
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::EFFECT,
@@ -681,6 +691,8 @@ impl EffectInner {
                     flush_epoch,
                 });
         }
+        self.reactor
+            .record_flush(|stats| stats.effects_run = stats.effects_run.saturating_add(1));
         struct DiagnosticRunGuard<'a> {
             reactor: &'a Reactor,
             reactor_id: crate::ReactorId,
@@ -765,6 +777,9 @@ impl EffectInner {
                     effect: self.id,
                 });
         }
+        self.reactor.record_flush(|stats| {
+            stats.effects_disposed = stats.effects_disposed.saturating_add(1);
+        });
         self.owner.dispose();
         self.reactor.unregister_observer(self.id);
         self.reactor.dispose(self.id);

@@ -579,6 +579,9 @@ struct RecomputeSpan<'a> {
 impl<'a> RecomputeSpan<'a> {
     fn open(reactor: &'a Reactor, node: NodeId, kind: NodeKind) -> Self {
         let flush_epoch = reactor.flush_epoch();
+        reactor.record_flush(|stats| {
+            stats.computed_recomputed = stats.computed_recomputed.saturating_add(1);
+        });
         reactor.emit_diagnostic(DiagnosticEvent::ComputedRecomputeStarted {
             reactor: reactor.diagnostic_id(),
             node,
@@ -599,6 +602,13 @@ impl<'a> RecomputeSpan<'a> {
     fn completed(&mut self, changed: bool) {
         self.outcome = ComputeOutcome::Completed;
         self.changed = changed;
+        self.reactor.record_flush(|stats| {
+            if changed {
+                stats.computed_changed = stats.computed_changed.saturating_add(1);
+            } else {
+                stats.computed_suppressed = stats.computed_suppressed.saturating_add(1);
+            }
+        });
     }
 }
 
@@ -626,6 +636,8 @@ impl Drop for RecomputeSpan<'_> {
 #[cold]
 #[inline(never)]
 fn report_verification(reactor: &Reactor, node: NodeId, kind: NodeKind, recomputed: bool) {
+    reactor
+        .record_flush(|stats| stats.computed_verified = stats.computed_verified.saturating_add(1));
     reactor.emit_diagnostic(DiagnosticEvent::ComputedVerified {
         reactor: reactor.diagnostic_id(),
         node,

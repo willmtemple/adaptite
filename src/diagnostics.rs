@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use core::panic::Location;
 
 use crate::NodeId;
+use crate::stats::FlushStats;
 
 /// Stable identifier for one reactive graph during the process lifetime.
 ///
@@ -329,6 +330,8 @@ pub enum DiagnosticEvent {
         flush_epoch: u64,
         /// Jobs still pending when the flush ended.
         remaining_jobs: usize,
+        /// What this flush did. See [`FlushStats`] for how work is attributed when flushes nest.
+        stats: FlushStats,
     },
 }
 
