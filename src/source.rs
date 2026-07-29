@@ -1,6 +1,6 @@
 use alloc::rc::Rc;
 
-use crate::{NodeId, Reactor, current, trace_targets};
+use crate::{NodeId, NodeKind, Reactor, current, trace_targets};
 
 /// Creates a low-level reactive source node in the current reactor.
 #[track_caller]
@@ -160,7 +160,7 @@ impl Reactor {
 impl Source {
     #[track_caller]
     fn new(reactor: Reactor) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Source);
         tracing::debug!(
             target: trace_targets::GRAPH,
             event = "create_source",

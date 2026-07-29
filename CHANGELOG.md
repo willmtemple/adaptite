@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its documented "late, never early" semantics. `node_origin` exposes the
   `#[track_caller]` creation site that until now surfaced only inside a
   `ReactCycleError`, the divergence panic, or a diagnostic event.
+- Node kinds and node lifecycle diagnostics. The public `NodeKind` names the primitive a
+  node was allocated as — `Source`, `Signal`, `Event`, `Thunk`, `Memo`, `Effect` — and
+  `Reactor::node_kind` reports it for any live node. Two new diagnostic events,
+  `NodeCreated` and `NodeDisposed`, give creation and disposal evidence for *every* node
+  kind rather than only for effects, which is what leak and graph-growth attribution
+  needs; `NodeDisposed` carries the dependency and dependent counts sampled before
+  teardown empties the maps, so a leak report sees the edges the node died holding.
+  Disposal is idempotent but the event is delivered exactly once, even though several
+  `Drop` impls reach it. The kind is declared at construction, not inferred: a primitive
+  built on `source()` reports `Source`, a `Writable` reports `Memo`, and `Resource` and
+  `watch` compose existing nodes rather than contributing one of their own.
 - `Signal::id()`, `Thunk::id()`, `Memo::id()`, and `Event::id()` report a handle's node
   id, joining the `Source::id` that already existed. Without them the queries above were
   unreachable for every node kind except sources and effects — a consumer holding a

@@ -1,7 +1,7 @@
 use alloc::rc::Rc;
 use core::cell::RefCell;
 
-use crate::{NodeId, Reactor, current, trace_targets};
+use crate::{NodeId, NodeKind, Reactor, current, trace_targets};
 
 /// Creates a [`Signal`] in the current thread's default reactor.
 ///
@@ -68,7 +68,7 @@ impl Reactor {
 impl<T: 'static> Signal<T> {
     #[track_caller]
     fn new(reactor: Reactor, initial: T) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Signal);
         tracing::debug!(
             target: trace_targets::SIGNAL,
             event = "create_signal",

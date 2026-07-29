@@ -14,7 +14,7 @@ use runite::queue_microtask;
 
 use crate::{
     DiagnosticEvent, DiagnosticSubscription, InvalidationCause, InvalidationLevel, NodeId,
-    ReactorId, trace_targets,
+    NodeKind, ReactorId, trace_targets,
 };
 
 type Job = Box<dyn FnOnce() + 'static>;
@@ -887,6 +887,14 @@ impl Reactor {
         self.inner.meta.borrow().get(&node).map(|meta| meta.origin)
     }
 
+    /// Returns the primitive `node` was created as, or `None` if it is not live.
+    ///
+    /// See [`NodeKind`] for what "created as" means — the kind is declared at construction, not
+    /// inferred from how the node is used.
+    pub fn node_kind(&self, node: NodeId) -> Option<NodeKind> {
+        self.inner.meta.borrow().get(&node).map(|meta| meta.kind)
+    }
+
     /// Returns `node`'s current version, or `None` if it is not live.
     ///
     /// The version increments whenever the node's value changes — every write for a source, and
@@ -899,6 +907,9 @@ impl Reactor {
     }
 
     /// Disposes all graph bookkeeping for `node`.
+    ///
+    /// Idempotent: a node that is already gone is a silent no-op, and the
+    /// [`NodeDisposed`](DiagnosticEvent::NodeDisposed) event is delivered exactly once.
     pub fn dispose(&self, node: NodeId) {
         tracing::debug!(
             target: trace_targets::GRAPH,
@@ -906,6 +917,29 @@ impl Reactor {
             node_id = node.0,
             "disposing reactive node bookkeeping"
         );
+        // Sampled before anything is torn down: the counts a leak report wants are the ones the
+        // node died holding, and both maps are emptied below.
+        let epitaph = if self.diagnostics_enabled() {
+            self.inner.meta.borrow().get(&node).map(|meta| {
+                (
+                    meta.kind,
+                    meta.origin,
+                    self.inner
+                        .dependencies
+                        .borrow()
+                        .get(&node)
+                        .map_or(0, hashbrown::HashMap::len),
+                    self.inner
+                        .dependents
+                        .borrow()
+                        .get(&node)
+                        .map_or(0, hashbrown::HashSet::len),
+                )
+            })
+        } else {
+            None
+        };
+
         self.clear_observer_dependencies(node);
 
         let incoming = self
@@ -926,8 +960,21 @@ impl Reactor {
         }
 
         self.inner.observers.borrow_mut().remove(&node);
-        self.inner.meta.borrow_mut().remove(&node);
+        let was_live = self.inner.meta.borrow_mut().remove(&node).is_some();
         self.unregister_observation_hooks(node);
+
+        // Gated on `was_live` rather than on the sample: disposal is idempotent and is reached
+        // from several `Drop` impls, so without this a node could be reported dead twice.
+        if was_live && let Some((kind, origin, dependencies, dependents)) = epitaph {
+            self.inner.emit(DiagnosticEvent::NodeDisposed {
+                reactor: self.inner.id,
+                node,
+                kind,
+                origin,
+                dependencies,
+                dependents,
+            });
+        }
     }
 
     /// Schedules a job to run in the reactor's microtask-backed job queue.
@@ -1077,15 +1124,17 @@ impl Reactor {
     }
 
     #[track_caller]
-    pub(crate) fn allocate_node(&self) -> NodeId {
+    pub(crate) fn allocate_node(&self, kind: NodeKind) -> NodeId {
         let raw = self.inner.next_node.get();
         self.inner.next_node.set(raw.wrapping_add(1));
         let id = NodeId::new(raw);
+        let origin = Location::caller();
         self.inner.meta.borrow_mut().insert(
             id,
             NodeMeta {
                 version: 0,
-                origin: Location::caller(),
+                origin,
+                kind,
             },
         );
         #[cfg(debug_assertions)]
@@ -1093,8 +1142,17 @@ impl Reactor {
             target: trace_targets::GRAPH,
             event = "allocate_node",
             node_id = id.0,
+            ?kind,
             "allocated reactive node id"
         );
+        if self.diagnostics_enabled() {
+            self.inner.emit(DiagnosticEvent::NodeCreated {
+                reactor: self.inner.id,
+                node: id,
+                kind,
+                origin,
+            });
+        }
         id
     }
 
@@ -1283,6 +1341,7 @@ impl fmt::Debug for Reactor {
 struct NodeMeta {
     version: u64,
     origin: &'static Location<'static>,
+    kind: NodeKind,
 }
 
 struct ReactorInner {
@@ -1487,6 +1546,7 @@ mod tests {
     use runite::{queue_macrotask, run};
 
     use super::{Reactor, current};
+    use crate::NodeKind;
 
     #[test]
     fn current_reactor_is_thread_local_singleton() {
@@ -1579,8 +1639,8 @@ mod tests {
     #[test]
     fn observe_records_dependency_edges_with_versions() {
         let reactor = Reactor::new();
-        let observer = reactor.allocate_node();
-        let observable = reactor.allocate_node();
+        let observer = reactor.allocate_node(NodeKind::Source);
+        let observable = reactor.allocate_node(NodeKind::Source);
         reactor.trigger(observable);
 
         reactor.run_in_context(observer, || {
@@ -1703,8 +1763,8 @@ mod tests {
     #[test]
     fn cycle_detection_panics_with_path_and_origins() {
         let reactor = Reactor::new();
-        let a = reactor.allocate_node();
-        let b = reactor.allocate_node();
+        let a = reactor.allocate_node(NodeKind::Source);
+        let b = reactor.allocate_node(NodeKind::Source);
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             reactor.run_in_context(a, || {

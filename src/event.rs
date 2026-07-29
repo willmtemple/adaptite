@@ -6,7 +6,7 @@ use core::cell::{Cell, RefCell};
 use hashbrown::HashMap;
 
 use crate::scope::{OwnedDisposable, adopt_into_current};
-use crate::{NodeId, Reactor, current, trace_targets};
+use crate::{NodeId, NodeKind, Reactor, current, trace_targets};
 
 type SubscriberFn<T> = dyn Fn(&T) + 'static;
 
@@ -233,7 +233,7 @@ impl<T: 'static> Event<T> {
 
     #[track_caller]
     fn new(reactor: Reactor) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Event);
         tracing::debug!(
             target: trace_targets::EVENT,
             event = "create_event",

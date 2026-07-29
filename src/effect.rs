@@ -10,7 +10,8 @@ use crate::scope::{
     with_owner,
 };
 use crate::{
-    DiagnosticEvent, InvalidationCause, NodeId, Reactor, ReactorId, current, trace_targets,
+    DiagnosticEvent, InvalidationCause, NodeId, NodeKind, Reactor, ReactorId, current,
+    trace_targets,
 };
 
 /// Maximum number of times a single effect may run within one job flush before the reactor
@@ -314,7 +315,7 @@ impl EffectHandle {
         scheduler: Option<Rc<dyn EffectScheduler>>,
         effect: impl Fn() + 'static,
     ) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Effect);
         let inner = Rc::new(EffectInner {
             reactor: reactor.clone(),
             id,

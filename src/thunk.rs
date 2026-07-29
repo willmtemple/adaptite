@@ -3,7 +3,7 @@ use alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
 
 use crate::reactor::{Mark, ObserverHook, State};
-use crate::{InvalidationCause, NodeId, Reactor, current, trace_targets};
+use crate::{InvalidationCause, NodeId, NodeKind, Reactor, current, trace_targets};
 
 type ComputeFn<T> = dyn Fn() -> T + 'static;
 type ComputePrevFn<T> = dyn Fn(Option<&T>) -> T + 'static;
@@ -333,7 +333,7 @@ impl Reactor {
 impl<T: 'static> Thunk<T> {
     #[track_caller]
     fn new(reactor: Reactor, compute: impl Fn() -> T + 'static) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Thunk);
         let inner = Rc::new(ThunkInner {
             reactor: reactor.clone(),
             id,
@@ -428,7 +428,7 @@ impl<T: 'static> Memo<T> {
         equals: impl Fn(&T, &T) -> bool + 'static,
         compute: impl Fn(Option<&T>) -> T + 'static,
     ) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Memo);
         let inner = Rc::new(MemoInner {
             reactor: reactor.clone(),
             id,
