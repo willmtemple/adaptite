@@ -11,6 +11,7 @@ Three mechanisms, with different rules:
 | [`DiagnosticEvent`] stream | *Why* — causality, ordering | Dormant without a subscriber | Opt-in via `subscribe_diagnostics` |
 | [`GraphStats`] | *How much* — what the graph holds | `O(1)`, no walk | **Always maintained** |
 | [`GraphSnapshot`] | *What* — every node and edge | `O(nodes + edges)`, allocates | On demand |
+| [`OwnershipStats`] | *What is retained* — owner frames, cleanups, children | `O(1)`, no walk | **Always maintained**, thread-scoped |
 
 The governing rule for the second and third rows:
 
@@ -23,6 +24,41 @@ must always be true. `FlushStats` is only ever *observed* by being delivered on
 maintained only while a subscription is active.
 
 ---
+
+### Ownership is thread-scoped, not per-reactor
+
+[`OwnershipStats`] is the one thing here that is not keyed by reactor, and that is not an
+oversight. Ownership in adaptite is a thread-local stack: a [`scope`] has no reactor and never
+did, and a frame's parent is whatever was innermost when it was created. Reporting per-reactor
+would mean inventing an attribution the implementation does not have. An application that owns one
+reactor per thread — the shape adaptite is built for — gets the same answer either way.
+
+It matters because the graph can be clean while ownership leaks. An effect that never re-runs
+keeps every cleanup it registered; a scope nobody disposed keeps its children; a component frame
+held one generation too long keeps a whole subtree. The nodes are gone and the closures are not,
+so [`GraphStats`] cannot see any of it.
+
+### Keeping a gauge honest
+
+A gauge nobody checks drifts, and a drifted leak gauge is worse than none — it makes a real leak
+look fine. Two mechanisms, and the choice between them is worth copying for any counter added
+later:
+
+1. **Where a count is the population of a live object, make the count that object's lifetime.**
+   An `OwnerFrame` holds a tally that increments when constructed and decrements when dropped.
+   `live_owners` cannot disagree with reality, not because every call site was updated but
+   because there is no call site to forget.
+2. **Where it is not** — cleanups and adopted children live in `Vec`s — maintain it explicitly
+   and then *audit* it. `audit_ownership()` recomputes every live gauge by walking a registry of
+   live frames; `debug_assert_ownership_consistent()` fails on disagreement. The ownership tests
+   call it after every operation, including after each of 400 steps of a deterministically
+   shuffled workload, so a path added without its bookkeeping fails the suite rather than shipping.
+
+The audit is gated like `debug_assert!` and named for it: the registry is not built when
+`debug_assertions` is off, because making every application pay a `Weak` push per owner frame to
+hold a proof nobody reads would be the tail wagging the dog. `audit_ownership()` answers `None`
+there rather than a misleading empty result, and the assertion compiles to nothing — so a test
+suite that calls it still builds under `--release`, exactly as one full of `debug_assert!` would.
 
 ## Identity
 
@@ -257,11 +293,13 @@ builds, without parsing, and with semver behind it.
 
 - Events and payloads: [`DiagnosticEvent`], [`InvalidationCause`], [`InvalidationLevel`],
   [`ComputeOutcome`], [`NodeKind`]
-- Aggregates: [`GraphStats`], [`FlushStats`]
+- Aggregates: [`GraphStats`], [`FlushStats`], [`OwnershipStats`]
 - Queries: `Reactor::graph_stats`, `Reactor::debug_graph`, `Reactor::observer_count`,
   `Reactor::dependency_count`, `Reactor::dependencies_of`, `Reactor::dependents_of`,
   `Reactor::node_origin`, `Reactor::node_kind`, `Reactor::node_version`, `Reactor::is_observed`
 - Snapshot types: [`GraphSnapshot`], [`GraphNode`], [`GraphEdge`], [`NodeState`]
+- Ownership: `ownership_stats`, `audit_ownership`, `debug_assert_ownership_consistent`,
+  [`OwnershipDrift`]
 
 [`DiagnosticEvent`]: https://docs.rs/adaptite/latest/adaptite/enum.DiagnosticEvent.html
 [`InvalidationCause`]: https://docs.rs/adaptite/latest/adaptite/struct.InvalidationCause.html
@@ -274,3 +312,6 @@ builds, without parsing, and with semver behind it.
 [`GraphNode`]: https://docs.rs/adaptite/latest/adaptite/struct.GraphNode.html
 [`GraphEdge`]: https://docs.rs/adaptite/latest/adaptite/struct.GraphEdge.html
 [`NodeState`]: https://docs.rs/adaptite/latest/adaptite/enum.NodeState.html
+[`OwnershipStats`]: https://docs.rs/adaptite/latest/adaptite/struct.OwnershipStats.html
+[`OwnershipDrift`]: https://docs.rs/adaptite/latest/adaptite/struct.OwnershipDrift.html
+[`scope`]: https://docs.rs/adaptite/latest/adaptite/fn.scope.html

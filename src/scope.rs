@@ -5,6 +5,7 @@ use core::any::Any;
 use core::cell::{Cell, RefCell};
 use core::panic::Location;
 
+use crate::ownership::{self, OwnerTally};
 use crate::{NodeId, trace_targets};
 
 thread_local! {
@@ -23,11 +24,13 @@ pub(crate) trait OwnedDisposable {
 
 /// Ownership bookkeeping for a reactive owner (an effect or a scope): the children created
 /// during its execution and the cleanups registered against it.
-#[derive(Default)]
 pub(crate) struct OwnerFrame {
     children: RefCell<Vec<Rc<dyn OwnedDisposable>>>,
     cleanups: RefCell<Vec<Box<dyn FnOnce()>>>,
     disposed: Cell<bool>,
+    /// Counts this frame by existing. See [`crate::ownership`]: the live-owner gauge is this
+    /// field's lifetime rather than a pair of increments someone has to remember.
+    _tally: OwnerTally,
     /// The owner that was innermost when this frame was created.
     ///
     /// The thread-local owner stack describes the *dynamic* chain, which is empty by the time a
@@ -40,9 +43,32 @@ pub(crate) struct OwnerFrame {
 
 impl OwnerFrame {
     pub(crate) fn new() -> Rc<Self> {
-        let frame = Rc::new(Self::default());
-        *frame.parent.borrow_mut() = current_owner().as_ref().map(Rc::downgrade);
+        // Built field by field rather than via `Default` so the tally is visible here: it is the
+        // live-owner gauge, and a reader should be able to see where the count comes from.
+        let frame = Rc::new(Self {
+            children: RefCell::new(Vec::new()),
+            cleanups: RefCell::new(Vec::new()),
+            disposed: Cell::new(false),
+            _tally: OwnerTally::new(),
+            parent: RefCell::new(current_owner().as_ref().map(Rc::downgrade)),
+            error_handler: RefCell::new(None),
+        });
+        ownership::register(&frame);
         frame
+    }
+
+    /// Cleanups registered against this frame and not yet run. Used by the ownership audit, which
+    /// exists in debug builds only.
+    #[cfg(debug_assertions)]
+    pub(crate) fn pending_cleanups(&self) -> usize {
+        self.cleanups.borrow().len()
+    }
+
+    /// Effects and scopes this frame currently owns. Used by the ownership audit, which exists in
+    /// debug builds only.
+    #[cfg(debug_assertions)]
+    pub(crate) fn owned_children(&self) -> usize {
+        self.children.borrow().len()
     }
 
     /// Returns the nearest error handler at or above this frame.
@@ -65,16 +91,21 @@ impl OwnerFrame {
             return;
         }
         self.children.borrow_mut().push(child);
+        ownership::child_adopted();
     }
 
     /// Registers a cleanup to run before the owner next re-runs or when it is disposed. If the
     /// owner is already disposed, the cleanup runs immediately.
     pub(crate) fn add_cleanup(&self, cleanup: Box<dyn FnOnce()>) {
         if self.disposed.get() {
+            // Registered against a dead owner: it runs now and is never pending, so it counts as
+            // registered and run without ever touching the live gauge.
+            ownership::cleanup_run_immediately();
             cleanup();
             return;
         }
         self.cleanups.borrow_mut().push(cleanup);
+        ownership::cleanup_registered();
     }
 
     /// Runs registered cleanups and disposes owned children, most recent first. Called before an
@@ -105,12 +136,16 @@ impl OwnerFrame {
         }
 
         crate::untrack(|| {
-            drop(RunRemaining(core::mem::take(
-                &mut *self.cleanups.borrow_mut(),
-            )));
-            drop(DisposeRemaining(core::mem::take(
-                &mut *self.children.borrow_mut(),
-            )));
+            // Accounted at the moment each vector is taken rather than as each entry runs: the
+            // teardown guards below finish draining even while unwinding, so the gauge must not
+            // depend on reaching the end of a loop that may panic partway through.
+            let cleanups = core::mem::take(&mut *self.cleanups.borrow_mut());
+            ownership::cleanups_taken(cleanups.len());
+            drop(RunRemaining(cleanups));
+
+            let children = core::mem::take(&mut *self.children.borrow_mut());
+            ownership::children_taken(children.len());
+            drop(DisposeRemaining(children));
         });
     }
 
@@ -119,6 +154,7 @@ impl OwnerFrame {
         if self.disposed.replace(true) {
             return;
         }
+        ownership::owner_disposed();
         tracing::debug!(
             target: trace_targets::SCOPE,
             event = "dispose_owner",

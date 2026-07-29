@@ -74,7 +74,7 @@ pub struct GraphEdge {
     pub observable: NodeId,
 }
 
-/// Everything a reactor is holding, walked.
+/// Everything a reactor is holding, walked, plus what this thread's ownership tree is holding.
 ///
 /// The counterpart to [`GraphStats`], and the distinction between them is the point:
 /// `graph_stats` is `O(1)` and answers *how much*, safe to call every frame; this walks every
@@ -95,6 +95,13 @@ pub struct GraphSnapshot {
     pub edges: Vec<GraphEdge>,
     /// The `O(1)` account, taken at the same moment.
     pub stats: GraphStats,
+    /// What this thread's owner tree is holding, taken at the same moment.
+    ///
+    /// Thread-scoped rather than per-reactor, because adaptite's ownership is — see
+    /// [`crate::OwnershipStats`]. Included here because the two questions are almost always asked
+    /// together: a graph that looks clean and an owner tree that is still holding a subtree is a
+    /// leak, and reading the two from separate calls invites reading them at separate moments.
+    pub ownership: crate::OwnershipStats,
 }
 
 impl GraphSnapshot {
@@ -240,6 +247,7 @@ impl Reactor {
             nodes,
             edges,
             stats: self.graph_stats(),
+            ownership: crate::ownership_stats(),
         }
     }
 

@@ -20,6 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its documented "late, never early" semantics. `node_origin` exposes the
   `#[track_caller]` creation site that until now surfaced only inside a
   `ReactCycleError`, the divergence panic, or a diagnostic event.
+- Ownership accounting. `ownership_stats()` returns an `OwnershipStats`: live owner frames,
+  pending cleanup registrations, owned children, and cumulative totals for owners created
+  and disposed and cleanups registered and run. A reactive graph can be perfectly clean and
+  still leak, because ownership retains what the graph never sees — an effect that never
+  re-runs keeps every cleanup it registered, and a scope nobody disposed keeps its children.
+  `GraphSnapshot` now carries these alongside the graph counters, since the two questions
+  are almost always asked together.
+  These are **thread-scoped rather than per-reactor**, because adaptite's ownership is: a
+  `scope` has no reactor and never did, and a frame's parent is whatever was innermost when
+  it was created. Reporting per-reactor would mean inventing an attribution the
+  implementation does not have.
+  Two mechanisms keep the numbers honest. Where a count is the population of a live object,
+  **the count is that object's lifetime** — an `OwnerFrame` holds a tally that increments on
+  construction and decrements on drop, so `live_owners` cannot disagree with reality, not
+  because every call site was updated but because there is no call site. Where a count is
+  not an object lifetime — cleanups and children live in `Vec`s — it is maintained
+  explicitly and then audited: `audit_ownership()` recomputes every live gauge by walking a
+  registry of live frames, and `debug_assert_ownership_consistent()` fails on any
+  disagreement. Both are named and gated after `debug_assert!`: the registry is not built
+  when `debug_assertions` is off, so the audit answers `None` there and the assertion
+  compiles to nothing, which means a test suite that calls it still builds under `--release`.
+  The ownership tests call it after every operation, including after each of 400 steps of a
+  deterministically-shuffled workload.
 - `Reactor::debug_graph()` returns a `GraphSnapshot`: every live node with its id, kind,
   creation origin, version, staleness and edge counts, plus every recorded edge, plus a
   `GraphStats` taken at the same moment. The walking counterpart to `graph_stats()`, and
