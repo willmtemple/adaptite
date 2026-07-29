@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Public graph queries on `Reactor`: `observer_count`, `dependents_of`,
+- Public graph queries on `Reactor`: `observer_count`, `observers_of`,
   `dependencies_of`, `node_origin`, and `node_version`. All five existed internally;
   none was reachable. Together they answer "why did this update" without a
   subscription — `dependencies_of` returns each recorded edge with the version observed
@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiles to nothing, which means a test suite that calls it still builds under `--release`.
   The ownership tests call it after every operation, including after each of 400 steps of a
   deterministically-shuffled workload.
-- `Reactor::debug_graph()` returns a `GraphSnapshot`: every live node with its id, kind,
+- `Reactor::graph_snapshot()` returns a `GraphSnapshot`: every live node with its id, kind,
   creation origin, version, staleness and edge counts, plus every recorded edge, plus a
   `GraphStats` taken at the same moment. The walking counterpart to `graph_stats()`, and
   the distinction is the point — `graph_stats` is `O(1)` and answers *how much*, safe to
@@ -104,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   members change — swapping 200 dependencies for 200 different ones reports 200 either
   side, and the per-flush edge totals cannot distinguish it either, because every
   recomputation clears and re-records its whole set. Sampling `dependencies_of` either side
-  of a recomputation, or diffing two `debug_graph` snapshots, is the tool for that.
+  of a recomputation, or diffing two `graph_snapshot` snapshots, is the tool for that.
   Adaptite deliberately does **not** report individual edge additions and removals.
   Edge recording is the hottest path in the graph — one call per tracked read — so a
   wide node would emit more diagnostic events than it does reactive work, to answer a

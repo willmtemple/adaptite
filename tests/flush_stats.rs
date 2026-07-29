@@ -365,6 +365,7 @@ fn a_producer_that_runs_more_often_than_it_publishes_is_visible() {
     capture.borrow_mut().events.clear();
 
     // Twenty attempts, four of which actually change the value.
+    let write_line = line!() + 2;
     for step in 0..20 {
         sampled.set(step / 5);
         reactor.flush_now();
@@ -413,8 +414,9 @@ fn a_producer_that_runs_more_often_than_it_publishes_is_visible() {
         .collect::<Vec<_>>();
     assert_eq!(sites.len(), 16);
     assert!(
-        sites.windows(2).all(|pair| pair[0] == pair[1]),
-        "all attributed to the one call site"
+        sites.iter().all(|line| *line == write_line),
+        "every discarded write must name the line that made it, not merely agree with itself: \
+         got {sites:?}, expected all {write_line}"
     );
 
     // A suppressed write is not a `ReactiveWrite`: nothing propagated, and claiming otherwise
@@ -427,6 +429,174 @@ fn a_producer_that_runs_more_often_than_it_publishes_is_visible() {
     assert_eq!(propagated, 5);
 
     drop(capture);
+    effect.dispose();
+}
+
+#[test]
+fn a_nested_external_flush_joins_rather_than_opening_a_second() {
+    // The documented contract distinguishes two kinds of nesting: a nested `external_flush`
+    // *joins* the enclosing flush and opens no epoch, while a re-entrant `flush_now` takes its
+    // own. Only the second half was tested — removing the join entirely left the suite green.
+    let reactor = Reactor::new();
+    let (capture, _subscription) = Capture::install(&reactor);
+
+    let effect = reactor.effect(|| {});
+    reactor.flush_now();
+    capture.borrow_mut().events.clear();
+
+    reactor.external_flush(|| {
+        reactor.external_flush(|| {
+            reactor.external_flush(|| {});
+        });
+    });
+
+    let boundaries = capture
+        .borrow()
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                DiagnosticEvent::FlushStarted { .. } | DiagnosticEvent::FlushFinished { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        boundaries, 2,
+        "three nested declared boundaries are one flush, so one start and one finish"
+    );
+
+    effect.dispose();
+}
+
+#[test]
+fn the_queue_depth_fields_report_the_queue() {
+    // `jobs_at_start`, `jobs_at_finish` and `effects_pending` are public and nothing read them.
+    let reactor = Reactor::new();
+    let (capture, _subscription) = Capture::install(&reactor);
+
+    // Three jobs queued before the flush opens.
+    for _ in 0..3 {
+        reactor.schedule(|| {});
+    }
+    reactor.flush_now();
+
+    let flushes = capture.borrow().flushes.clone();
+    assert_eq!(flushes.len(), 1);
+    assert_eq!(
+        flushes[0].jobs_at_start, 3,
+        "the flush opened with three jobs waiting"
+    );
+    assert_eq!(flushes[0].jobs_at_finish, 0, "and drained all of them");
+    assert_eq!(flushes[0].effects_pending, 0);
+
+    // `peak_pending_jobs` remembers the high-water mark after the queue has drained.
+    let stats = reactor.graph_stats();
+    assert_eq!(stats.pending_jobs, 0);
+    assert!(
+        stats.peak_pending_jobs >= 3,
+        "the peak must survive the drain, got {}",
+        stats.peak_pending_jobs
+    );
+}
+
+#[test]
+fn an_effect_left_unrun_in_a_lane_is_reported_as_pending() {
+    // A consumer-scheduled effect that is never drained is still outstanding, and `is_empty()`
+    // deliberately does not count it as work — so the only thing that can say it exists is
+    // `effects_pending`.
+    let reactor = Reactor::new();
+    let (capture, _subscription) = Capture::install(&reactor);
+
+    let lane: Rc<RefCell<Vec<adaptite::EffectRun>>> = Rc::new(RefCell::new(Vec::new()));
+    let effect = reactor.effect_with(
+        {
+            let lane = Rc::clone(&lane);
+            move |ready| lane.borrow_mut().push(ready)
+        },
+        || {},
+    );
+    assert_eq!(lane.borrow().len(), 1, "the initial run went to the lane");
+
+    // Creating the effect queued it, and that work is folded into the next flush that closes.
+    // Absorb it, so the *second* boundary below is genuinely empty.
+    reactor.external_flush(|| {});
+    capture.borrow_mut().flushes.clear();
+
+    // A declared boundary over a graph with nothing to drain: no work, but an effect is waiting.
+    reactor.external_flush(|| {});
+
+    let flushes = capture.borrow().flushes.clone();
+    let last = flushes.last().expect("the declared boundary is reported");
+    assert!(last.is_empty(), "this flush did no work");
+    assert_eq!(
+        last.effects_pending, 1,
+        "and yet an effect is still holding a run — which is why `is_empty` ignores this field"
+    );
+
+    drop(lane);
+    effect.dispose();
+}
+
+#[test]
+fn a_re_entrant_flush_inside_external_flush_closes_the_right_epochs() {
+    // `external_flush` opened a flush without pinning its epoch, so a re-entrant `flush_now`
+    // inside it moved the shared epoch on and the outer close reported the *inner* number. The
+    // stream then showed one epoch finished twice and another never finished at all — fatal for
+    // any consumer keying totals by `flush_epoch`, which is the documented aggregation key.
+    let reactor = Reactor::new();
+    let (capture, _subscription) = Capture::install(&reactor);
+
+    let source = signal_in(&reactor, 0_u32);
+    let effect = reactor.effect({
+        let source = source.clone();
+        let reactor = reactor.clone();
+        move || {
+            if source.get() == 1 {
+                // Give the nested drain something to find; an empty drain is not a flush.
+                reactor.schedule(|| {});
+                reactor.flush_now();
+            }
+        }
+    });
+    reactor.flush_now();
+    capture.borrow_mut().events.clear();
+
+    reactor.external_flush(|| {
+        source.set(1);
+        reactor.flush_now();
+    });
+
+    let boundaries = capture
+        .borrow()
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            DiagnosticEvent::FlushStarted { flush_epoch, .. } => Some(("start", *flush_epoch)),
+            DiagnosticEvent::FlushFinished { flush_epoch, .. } => Some(("finish", *flush_epoch)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    // Whatever the epoch numbers are, they must nest: every start closed exactly once, in
+    // reverse order, with nothing left open.
+    let mut open: Vec<u64> = Vec::new();
+    for (kind, epoch) in &boundaries {
+        match *kind {
+            "start" => open.push(*epoch),
+            _ => assert_eq!(
+                open.pop(),
+                Some(*epoch),
+                "flush boundaries do not nest: {boundaries:?}"
+            ),
+        }
+    }
+    assert!(open.is_empty(), "a flush was never closed: {boundaries:?}");
+    assert!(
+        boundaries.len() >= 4,
+        "expected a nested flush, got {boundaries:?}"
+    );
+
     effect.dispose();
 }
 

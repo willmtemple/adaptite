@@ -783,9 +783,35 @@ impl EffectInner {
         self.reactor.record_flush(|stats| {
             stats.effects_disposed = stats.effects_disposed.saturating_add(1);
         });
+
+        // Release the pending-run latch here rather than leaving it to the queued run. That run
+        // holds only a `Weak`, so if this effect is dropped before the run is reached — an
+        // unowned handle dropped before the first flush is the common case — the upgrade fails
+        // and nothing ever decrements the reactor's queued-effect gauge. Idempotent: a later
+        // `run_scheduled_inner` unlatch becomes a no-op.
+        self.unlatch_scheduled();
+
+        // Unhook from the graph even if owner teardown unwinds. `disposed` is already set, so
+        // there is no second attempt, and an effect left registered keeps its node metadata and
+        // every edge it recorded for the reactor's lifetime — which is exactly the retention the
+        // 0.3 gauges are supposed to make visible, manufactured by adaptite itself.
+        struct UnhookOnUnwind<'a> {
+            reactor: &'a Reactor,
+            id: NodeId,
+        }
+
+        impl Drop for UnhookOnUnwind<'_> {
+            fn drop(&mut self) {
+                self.reactor.unregister_observer(self.id);
+                self.reactor.dispose(self.id);
+            }
+        }
+
+        let _unhook = UnhookOnUnwind {
+            reactor: &self.reactor,
+            id: self.id,
+        };
         self.owner.dispose();
-        self.reactor.unregister_observer(self.id);
-        self.reactor.dispose(self.id);
     }
 }
 

@@ -124,7 +124,7 @@ is how often it mattered.
   The per-flush `edges_added`/`edges_removed` totals cannot either, because every recomputation
   clears and re-records its whole edge set, so churn and stability are indistinguishable there.
   For identity churn, sample `Reactor::dependencies_of` either side of a recomputation or diff two
-  `Reactor::debug_graph` snapshots — targeted-investigation tools, not per-frame ones.
+  `Reactor::graph_snapshot` snapshots — targeted-investigation tools, not per-frame ones.
 - Anything through `tracing`. See [Tracing is not a contract](#tracing-is-not-a-contract).
 
 ---
@@ -276,9 +276,11 @@ with diagnostics off, and the first implementation of flush totals cost **15.7%*
 signal write. Both for the same reason: a `Drop` type was constructed on a hot path regardless of
 whether anyone was subscribed. A drop obligation is not free even when its body is a no-op.
 
-Both were fixed the same way, and this is the pattern to follow for any new diagnostic:
+Both were fixed the same way. This is contributor guidance rather than consumer API — the gate
+it shows, `Reactor::diagnostics_enabled`, is `pub(crate)` — but it is the pattern to follow for
+any diagnostic added to adaptite itself:
 
-```rust
+```rust,ignore
 // Wrong: the guard exists whether or not anyone is listening.
 let mut span = Span::open(reactor, node);   // has a Drop impl
 do_the_work();
@@ -353,8 +355,8 @@ builds, without parsing, and with semver behind it.
 - Events and payloads: [`DiagnosticEvent`], [`InvalidationCause`], [`InvalidationLevel`],
   [`ComputeOutcome`], [`NodeKind`]
 - Aggregates: [`GraphStats`], [`FlushStats`], [`OwnershipStats`]
-- Queries: `Reactor::graph_stats`, `Reactor::debug_graph`, `Reactor::observer_count`,
-  `Reactor::dependency_count`, `Reactor::dependencies_of`, `Reactor::dependents_of`,
+- Queries: `Reactor::graph_stats`, `Reactor::graph_snapshot`, `Reactor::observer_count`,
+  `Reactor::dependency_count`, `Reactor::dependencies_of`, `Reactor::observers_of`,
   `Reactor::node_origin`, `Reactor::node_kind`, `Reactor::node_version`, `Reactor::is_observed`
 - Snapshot types: [`GraphSnapshot`], [`GraphNode`], [`GraphEdge`], [`NodeState`]
 - Ownership: `ownership_stats`, `audit_ownership`, `debug_assert_ownership_consistent`,

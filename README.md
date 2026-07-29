@@ -465,7 +465,7 @@ assert_eq!(after.nodes_created - before.nodes_created, 1);
 assert_eq!(after.live_nodes, before.live_nodes, "nothing was retained");
 ```
 
-`Reactor::debug_graph()` is the walking counterpart: every node with its kind,
+`Reactor::graph_snapshot()` is the walking counterpart: every node with its kind,
 origin, version and staleness, and every edge, for an inspector or a
 post-mortem rather than a per-frame check. And each `FlushFinished` event
 carries a `FlushStats` saying what that flush actually did, so a settled graph

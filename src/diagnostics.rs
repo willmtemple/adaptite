@@ -18,14 +18,25 @@ impl ReactorId {
     }
 }
 
+impl core::fmt::Display for ReactorId {
+    /// Matches [`NodeId`]'s formatting, so the `(reactor, node)` pair every diagnostic is scoped
+    /// by can be printed without reaching for [`get`](Self::get) on one half of it.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// The primitive a reactive node was created as.
 ///
 /// The kind is **declared at construction, not inferred from behaviour**. A primitive built on
 /// [`crate::source`] reports [`Source`](NodeKind::Source), because a raw source is exactly what
 /// the graph was handed; a [`crate::Writable`] is a memo bundled with a setter and reports
-/// [`Memo`](NodeKind::Memo); [`crate::Resource`] and [`crate::watch`] compose existing nodes and
-/// contribute no node of their own. Read this as "what adaptite was asked to allocate", not as a
-/// claim about what the consumer built with it.
+/// [`Memo`](NodeKind::Memo).
+///
+/// Composite primitives contribute no kind of their *own*, but they do contribute nodes: a
+/// [`crate::Resource`] allocates three signals and an effect, and [`crate::watch`] a memo and an
+/// effect, each counted individually under the kind it was allocated as. Read this as "what
+/// adaptite was asked to allocate", not as a claim about what the consumer built with it.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NodeKind {
@@ -49,6 +60,24 @@ impl NodeKind {
     /// Deliberately not public: the enum is `#[non_exhaustive]`, and a public count would make
     /// adding a kind a breaking change for anyone who sized an array by it.
     pub(crate) const COUNT: usize = 6;
+
+    /// Returns every kind, so a consumer can iterate them.
+    ///
+    /// [`NodeKind`] is `#[non_exhaustive]`, which stops a downstream crate matching it
+    /// exhaustively — without this, the only way to write "break these counts down by kind" is to
+    /// hardcode the variants, and that silently under-reports the day a kind is added. Iterate
+    /// this instead and a new kind appears on its own.
+    pub fn all() -> impl ExactSizeIterator<Item = Self> + Clone {
+        [
+            Self::Source,
+            Self::Signal,
+            Self::Event,
+            Self::Thunk,
+            Self::Memo,
+            Self::Effect,
+        ]
+        .into_iter()
+    }
 
     /// Dense index into the per-kind counter arrays.
     pub(crate) const fn index(self) -> usize {
@@ -147,7 +176,7 @@ pub enum DiagnosticEvent {
         /// Edges this node recorded on its inputs at the moment of disposal.
         dependencies: usize,
         /// Observers still recording an edge on this node at the moment of disposal.
-        dependents: usize,
+        observers: usize,
     },
     /// A write to a source node was suppressed because the value had not changed.
     ///
@@ -179,6 +208,10 @@ pub enum DiagnosticEvent {
     ReactiveWrite {
         /// Graph containing the node.
         reactor: ReactorId,
+        /// Primitive the written node was created as. Present here as well as on
+        /// [`WriteSuppressed`](Self::WriteSuppressed) so writes can be broken down by kind
+        /// whether or not they reached the graph.
+        kind: NodeKind,
         /// Root mutation and its source locations.
         cause: InvalidationCause,
     },
@@ -204,6 +237,9 @@ pub enum DiagnosticEvent {
         cause: InvalidationCause,
         /// Whether the node is definitely dirty or must verify its own inputs.
         level: InvalidationLevel,
+        /// Flush in progress when the mark was delivered, or the most recent one. Marking can
+        /// happen outside any flush — a write from a task does exactly that.
+        flush_epoch: u64,
         /// Whether this mark actually made the node staler.
         ///
         /// `false` means the node was already at least this stale and the mark coalesced into
@@ -225,6 +261,8 @@ pub enum DiagnosticEvent {
         node: NodeId,
         /// Whether the node is a thunk or a memo.
         kind: NodeKind,
+        /// Location at which the node was created.
+        node_origin: &'static Location<'static>,
         /// Flush that performed the verification, or the most recent one.
         flush_epoch: u64,
         /// Whether verification found a changed input and forced a recomputation.
@@ -239,6 +277,8 @@ pub enum DiagnosticEvent {
         node: NodeId,
         /// Whether the node is a thunk or a memo.
         kind: NodeKind,
+        /// Location at which the node was created.
+        node_origin: &'static Location<'static>,
         /// Flush the recomputation belongs to, or the most recent one.
         flush_epoch: u64,
         /// Dependencies recorded by the previous run.
@@ -258,7 +298,7 @@ pub enum DiagnosticEvent {
     /// `edges_added`/`edges_removed` totals, because every recomputation clears and re-records its
     /// whole edge set, so churn and stability look identical there. For that question, sample
     /// [`Reactor::dependencies_of`](crate::Reactor::dependencies_of) either side of a
-    /// recomputation, or diff two [`Reactor::debug_graph`](crate::Reactor::debug_graph) snapshots
+    /// recomputation, or diff two [`Reactor::graph_snapshot`](crate::Reactor::graph_snapshot) snapshots
     /// — both are targeted-investigation tools rather than something to run per frame.
     ///
     /// Adaptite deliberately does not report individual edge additions and removals: edge
@@ -272,6 +312,8 @@ pub enum DiagnosticEvent {
         node: NodeId,
         /// Whether the node is a thunk or a memo.
         kind: NodeKind,
+        /// Location at which the node was created.
+        node_origin: &'static Location<'static>,
         /// Flush the recomputation belonged to.
         flush_epoch: u64,
         /// Dependencies recorded by this run.
@@ -377,6 +419,111 @@ pub enum DiagnosticEvent {
         /// What this flush did. See [`FlushStats`] for how work is attributed when flushes nest.
         stats: FlushStats,
     },
+}
+
+impl DiagnosticEvent {
+    /// Returns the graph this event describes.
+    ///
+    /// Every variant carries it, but both the enum and its variants are `#[non_exhaustive]`, so a
+    /// downstream crate cannot destructure it generically — without this, reading a field that is
+    /// present on all of them means a match arm per variant, re-audited on every release.
+    /// Adaptite can match exhaustively because `#[non_exhaustive]` does not bind the defining
+    /// crate, so these accessors stay correct as variants are added.
+    pub fn reactor(&self) -> ReactorId {
+        match self {
+            Self::NodeCreated { reactor, .. }
+            | Self::NodeDisposed { reactor, .. }
+            | Self::WriteSuppressed { reactor, .. }
+            | Self::ReactiveWrite { reactor, .. }
+            | Self::ComputedInvalidated { reactor, .. }
+            | Self::ComputedVerified { reactor, .. }
+            | Self::ComputedRecomputeStarted { reactor, .. }
+            | Self::ComputedRecomputeFinished { reactor, .. }
+            | Self::EffectInvalidated { reactor, .. }
+            | Self::EffectScheduled { reactor, .. }
+            | Self::EffectRunStarted { reactor, .. }
+            | Self::EffectRunFinished { reactor, .. }
+            | Self::EffectRunSkipped { reactor, .. }
+            | Self::EffectDisposed { reactor, .. }
+            | Self::FlushStarted { reactor, .. }
+            | Self::FlushFinished { reactor, .. } => *reactor,
+        }
+    }
+
+    /// Returns the node this event concerns, or `None` for the flush boundaries, which concern
+    /// the whole graph rather than one node.
+    ///
+    /// Pair it with [`reactor`](Self::reactor) to get the `(ReactorId, NodeId)` every diagnostic
+    /// payload is scoped by.
+    pub fn node(&self) -> Option<NodeId> {
+        match self {
+            Self::NodeCreated { node, .. }
+            | Self::NodeDisposed { node, .. }
+            | Self::WriteSuppressed { node, .. }
+            | Self::ComputedInvalidated { node, .. }
+            | Self::ComputedVerified { node, .. }
+            | Self::ComputedRecomputeStarted { node, .. }
+            | Self::ComputedRecomputeFinished { node, .. } => Some(*node),
+            Self::ReactiveWrite { cause, .. } => Some(cause.node),
+            Self::EffectInvalidated { effect, .. }
+            | Self::EffectScheduled { effect, .. }
+            | Self::EffectRunStarted { effect, .. }
+            | Self::EffectRunFinished { effect, .. }
+            | Self::EffectRunSkipped { effect, .. }
+            | Self::EffectDisposed { effect, .. } => Some(*effect),
+            Self::FlushStarted { .. } | Self::FlushFinished { .. } => None,
+        }
+    }
+
+    /// Returns where the node this event concerns was created, when the event carries it.
+    ///
+    /// Worth preferring over [`Reactor::node_origin`](crate::Reactor::node_origin) in a trace
+    /// sink: that query answers only for *live* nodes, and a sink processing events after the fact
+    /// is exactly the case where the node is already gone.
+    pub fn node_origin(&self) -> Option<&'static Location<'static>> {
+        match self {
+            Self::NodeCreated { origin, .. } | Self::NodeDisposed { origin, .. } => Some(origin),
+            Self::WriteSuppressed { node_origin, .. }
+            | Self::ComputedInvalidated { node_origin, .. }
+            | Self::ComputedVerified { node_origin, .. }
+            | Self::ComputedRecomputeStarted { node_origin, .. }
+            | Self::ComputedRecomputeFinished { node_origin, .. } => Some(node_origin),
+            Self::ReactiveWrite { cause, .. } => Some(cause.node_origin),
+            Self::EffectInvalidated { effect_origin, .. }
+            | Self::EffectScheduled { effect_origin, .. }
+            | Self::EffectRunStarted { effect_origin, .. } => Some(effect_origin),
+            Self::EffectRunFinished { .. }
+            | Self::EffectRunSkipped { .. }
+            | Self::EffectDisposed { .. }
+            | Self::FlushStarted { .. }
+            | Self::FlushFinished { .. } => None,
+        }
+    }
+
+    /// Returns the flush this event belongs to, when it carries one.
+    ///
+    /// `None` on events that can occur outside any flush and do not record which one was most
+    /// recent — node creation and disposal, writes, and invalidation.
+    pub fn flush_epoch(&self) -> Option<u64> {
+        match self {
+            Self::ComputedVerified { flush_epoch, .. }
+            | Self::ComputedRecomputeStarted { flush_epoch, .. }
+            | Self::ComputedRecomputeFinished { flush_epoch, .. }
+            | Self::EffectScheduled { flush_epoch, .. }
+            | Self::EffectRunStarted { flush_epoch, .. }
+            | Self::EffectRunFinished { flush_epoch, .. }
+            | Self::EffectRunSkipped { flush_epoch, .. }
+            | Self::FlushStarted { flush_epoch, .. }
+            | Self::FlushFinished { flush_epoch, .. } => Some(*flush_epoch),
+            Self::NodeCreated { .. }
+            | Self::NodeDisposed { .. }
+            | Self::WriteSuppressed { .. }
+            | Self::ReactiveWrite { .. }
+            | Self::ComputedInvalidated { .. }
+            | Self::EffectInvalidated { .. }
+            | Self::EffectDisposed { .. } => None,
+        }
+    }
 }
 
 /// Keeps a diagnostic callback subscribed to one reactor.
@@ -662,6 +809,51 @@ mod tests {
     }
 
     #[test]
+    fn a_coalesced_mark_is_reported_and_says_it_changed_nothing() {
+        // The contract is that `ComputedInvalidated` fires for *every* mark delivered, including
+        // one that coalesces into staleness the node already had — that is what exposes
+        // propagation amplification. `state_changed` is what separates the two, and neither
+        // half had a test.
+        let reactor = Reactor::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = reactor.subscribe_diagnostics({
+            let events = Rc::clone(&events);
+            move |event| events.borrow_mut().push(event)
+        });
+
+        let source = signal_in(&reactor, 0_u32);
+        let doubled = memo_in(&reactor, {
+            let source = source.clone();
+            move || source.get() * 2
+        });
+        assert_eq!(doubled.get(), 0);
+        events.borrow_mut().clear();
+
+        // Two writes with no read in between: the first makes the memo dirty, the second finds
+        // it already dirty and changes nothing.
+        source.set(1);
+        source.set(2);
+
+        let marks = events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                DiagnosticEvent::ComputedInvalidated {
+                    node,
+                    state_changed,
+                    ..
+                } if *node == doubled.id() => Some(*state_changed),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marks,
+            [true, false],
+            "both marks must be reported, and only the first changed the node's state"
+        );
+    }
+
+    #[test]
     fn a_panicking_computation_closes_its_pair() {
         use crate::{ComputeOutcome, thunk_in};
         use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -788,14 +980,9 @@ mod tests {
                 matches!(event, DiagnosticEvent::NodeCreated { kind: reported, .. } if *reported == kind)
             })
         };
-        for kind in [
-            NodeKind::Source,
-            NodeKind::Signal,
-            NodeKind::Event,
-            NodeKind::Thunk,
-            NodeKind::Memo,
-            NodeKind::Effect,
-        ] {
+        // Iterating rather than listing: a kind added later is covered here automatically, which
+        // is the whole reason `NodeKind::all` exists.
+        for kind in NodeKind::all() {
             assert!(created(kind), "{kind:?} should report its creation");
         }
 
@@ -862,9 +1049,9 @@ mod tests {
                     node,
                     kind,
                     dependencies,
-                    dependents,
+                    observers,
                     ..
-                } if *node == memo_id => Some((*kind, *dependencies, *dependents)),
+                } if *node == memo_id => Some((*kind, *dependencies, *observers)),
                 _ => None,
             })
             .expect("the memo should report its disposal");
@@ -1020,11 +1207,14 @@ mod tests {
         });
         reactor.flush_now();
 
-        // Work performed while nothing was listening.
-        for value in 1..5 {
-            source.set(value);
-            reactor.flush_now();
-        }
+        // Accumulate into the pending slot *while subscribed*, and outside any flush: a write
+        // schedules a job but does not drain it, so this lands in `FlushAccounting::pending` and
+        // is exactly what a later subscriber must not inherit. Accumulating while unsubscribed
+        // would prove nothing — `record_flush` is gated, so nothing is collected in the first
+        // place, and the test would pass with `reset` deleted.
+        let first = reactor.subscribe_diagnostics(|_| {});
+        source.set(1);
+        drop(first);
 
         let flushes = Rc::new(RefCell::new(Vec::new()));
         let _subscription = reactor.subscribe_diagnostics({
@@ -1043,7 +1233,8 @@ mod tests {
         assert_eq!(flushes.len(), 1);
         assert_eq!(
             flushes[0].root_writes, 1,
-            "only the write made while subscribed is counted"
+            "the write made under the previous subscription must have been discarded, not \
+             carried into this flush"
         );
         assert_eq!(
             flushes[0].effects_run, 1,

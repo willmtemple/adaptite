@@ -110,7 +110,7 @@ impl OwnershipStats {
 
 /// Returns what this thread's owner tree is holding. See [`OwnershipStats`].
 pub fn ownership_stats() -> OwnershipStats {
-    OWNERSHIP.with(Counters::snapshot)
+    OWNERSHIP.try_with(Counters::snapshot).unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -146,6 +146,20 @@ thread_local! {
     static OWNERSHIP: Counters = Counters::default();
 }
 
+/// Runs `f` against this thread's counters, doing nothing if they are already gone.
+///
+/// Every accounting call here is reachable from a `Drop` — an `OwnerFrame` released during thread
+/// teardown is the ordinary case for a host that parks handles in a thread-local. `LocalKey::with`
+/// *panics* once its value has been destroyed, and a panic in a destructor is a non-unwinding
+/// abort, so this must never use it. Thread-local destructors run in reverse registration order,
+/// so `OWNERSHIP` is routinely destroyed before the frames it counts.
+///
+/// Losing a decrement while the thread is being torn down costs nothing: nobody can observe the
+/// counters afterwards. Aborting the process costs everything.
+fn with_counters(f: impl FnOnce(&Counters)) {
+    let _ = OWNERSHIP.try_with(f);
+}
+
 fn add(cell: &Cell<usize>, n: usize) {
     cell.set(cell.get().saturating_add(n));
 }
@@ -167,7 +181,7 @@ pub(crate) struct OwnerTally;
 
 impl OwnerTally {
     pub(crate) fn new() -> Self {
-        OWNERSHIP.with(|counters| {
+        with_counters(|counters| {
             add(&counters.live_owners, 1);
             tick(&counters.owners_created, 1);
         });
@@ -177,20 +191,32 @@ impl OwnerTally {
 
 impl Drop for OwnerTally {
     fn drop(&mut self) {
-        OWNERSHIP.with(|counters| sub(&counters.live_owners, 1));
+        with_counters(|counters| sub(&counters.live_owners, 1));
     }
 }
 
 /// Records a frame in the audit registry. Debug builds only.
+///
+/// Prunes as it goes. A `Weak` keeps the whole `RcBox<OwnerFrame>` allocation alive, not just its
+/// own header, so a registry that only compacted when [`audit_ownership`] happened to be called
+/// would retain every frame a debug-built *application* ever created — and applications do not
+/// call the audit. Compacting whenever the registry has grown to twice the live count keeps it
+/// `O(live owners)` with amortised `O(1)` pushes.
 pub(crate) fn register(frame: &Rc<OwnerFrame>) {
     #[cfg(debug_assertions)]
-    OWNERSHIP.with(|counters| counters.registry.borrow_mut().push(Rc::downgrade(frame)));
+    with_counters(|counters| {
+        let mut registry = counters.registry.borrow_mut();
+        if registry.len() >= 8 && registry.len() >= counters.live_owners.get().saturating_mul(2) {
+            registry.retain(|weak| weak.strong_count() > 0);
+        }
+        registry.push(Rc::downgrade(frame));
+    });
     #[cfg(not(debug_assertions))]
     let _ = frame;
 }
 
 pub(crate) fn cleanup_registered() {
-    OWNERSHIP.with(|counters| {
+    with_counters(|counters| {
         add(&counters.cleanup_registrations, 1);
         tick(&counters.cleanups_registered, 1);
     });
@@ -198,7 +224,7 @@ pub(crate) fn cleanup_registered() {
 
 /// Records `count` cleanups leaving the pending set to be executed.
 pub(crate) fn cleanups_taken(count: usize) {
-    OWNERSHIP.with(|counters| {
+    with_counters(|counters| {
         sub(&counters.cleanup_registrations, count);
         tick(&counters.cleanups_run, count as u64);
     });
@@ -207,33 +233,73 @@ pub(crate) fn cleanups_taken(count: usize) {
 /// Records a cleanup that ran without ever being pending — registered against an owner that was
 /// already disposed, so it executed immediately.
 pub(crate) fn cleanup_run_immediately() {
-    OWNERSHIP.with(|counters| {
+    with_counters(|counters| {
         tick(&counters.cleanups_registered, 1);
         tick(&counters.cleanups_run, 1);
     });
 }
 
 pub(crate) fn child_adopted() {
-    OWNERSHIP.with(|counters| add(&counters.owned_children, 1));
+    with_counters(|counters| add(&counters.owned_children, 1));
 }
 
 pub(crate) fn children_taken(count: usize) {
-    OWNERSHIP.with(|counters| sub(&counters.owned_children, count));
+    with_counters(|counters| sub(&counters.owned_children, count));
 }
 
 pub(crate) fn owner_disposed() {
-    OWNERSHIP.with(|counters| tick(&counters.owners_disposed, 1));
+    with_counters(|counters| tick(&counters.owners_disposed, 1));
+}
+
+/// Number of entries in the audit registry, including any not yet pruned.
+///
+/// Test-only: the registry is an implementation detail of [`audit_ownership`], but its *size* is
+/// the thing that regressed once, so it needs to be assertable.
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn registry_len() -> usize {
+    OWNERSHIP.with(|counters| counters.registry.borrow().len())
+}
+
+/// A gauge in [`OwnershipStats`] that the audit can check against the live owner tree.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OwnershipGauge {
+    /// [`OwnershipStats::live_owners`].
+    LiveOwners,
+    /// [`OwnershipStats::cleanup_registrations`].
+    CleanupRegistrations,
+    /// [`OwnershipStats::owned_children`].
+    OwnedChildren,
 }
 
 /// A disagreement between a maintained gauge and the live owner tree.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OwnershipDrift {
     /// Which gauge disagreed.
-    pub gauge: &'static str,
+    pub gauge: OwnershipGauge,
     /// What the maintained counter says.
     pub reported: usize,
     /// What walking the live owner frames says.
     pub actual: usize,
+}
+
+/// The outcome of [`audit_ownership`].
+///
+/// Three states rather than an `Option<Vec<_>>`, because the difference between "nothing is wrong"
+/// and "this build cannot tell you" must not be expressible as the same value. With an `Option`,
+/// the natural `audit_ownership().unwrap_or_default().is_empty()` reads as a pass in a build with
+/// `debug_assertions` off — silently, and exactly where a silent pass is least wanted.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnershipAudit {
+    /// No registry to walk: this build has `debug_assertions` off, so the gauges cannot be
+    /// checked. **Not** an assertion that they are correct.
+    Unavailable,
+    /// Every gauge agrees with the live owner tree.
+    Consistent,
+    /// At least one gauge disagrees. Never empty.
+    Drifted(Vec<OwnershipDrift>),
 }
 
 /// Recomputes every live gauge by walking the owner tree and reports any disagreement.
@@ -243,10 +309,9 @@ pub struct OwnershipDrift {
 /// path is added without its decrement. Walking is the only honest check, and the registry that
 /// makes walking possible exists in debug builds only.
 ///
-/// Returns `Some` with an empty vector when everything agrees, and `None` in a build with
-/// `debug_assertions` off — there is no registry to walk there, so the honest answer is "cannot
-/// say" rather than "nothing wrong". Prefer [`debug_assert_ownership_consistent`] in tests, which
-/// formats the failure and handles both.
+/// See [`OwnershipAudit`] for why the three outcomes are a named enum rather than an
+/// `Option<Vec<_>>`. Prefer [`debug_assert_ownership_consistent`] in tests, which formats the
+/// failure and handles all three.
 ///
 /// The registry this walks is not built in release: the proof is for the test suite, and making
 /// every application pay a `Weak` push per owner frame to hold a proof nobody reads would be the
@@ -254,44 +319,54 @@ pub struct OwnershipDrift {
 ///
 /// Prunes dead registry entries as it goes, so calling it repeatedly is cheap and the registry
 /// does not grow without bound across a long test.
-pub fn audit_ownership() -> Option<Vec<OwnershipDrift>> {
+pub fn audit_ownership() -> OwnershipAudit {
     #[cfg(not(debug_assertions))]
-    return None;
+    return OwnershipAudit::Unavailable;
 
     #[cfg(debug_assertions)]
-    OWNERSHIP.with(|counters| {
-        let mut live = Vec::new();
-        counters.registry.borrow_mut().retain(|weak| {
-            let Some(frame) = weak.upgrade() else {
-                return false;
-            };
-            live.push(frame);
-            true
-        });
+    OWNERSHIP
+        .try_with(|counters| {
+            let mut live = Vec::new();
+            counters.registry.borrow_mut().retain(|weak| {
+                let Some(frame) = weak.upgrade() else {
+                    return false;
+                };
+                live.push(frame);
+                true
+            });
 
-        let mut drift = Vec::new();
-        let mut check = |gauge, reported: usize, actual: usize| {
-            if reported != actual {
-                drift.push(OwnershipDrift {
-                    gauge,
-                    reported,
-                    actual,
-                });
+            let mut drift = Vec::new();
+            let mut check = |gauge: OwnershipGauge, reported: usize, actual: usize| {
+                if reported != actual {
+                    drift.push(OwnershipDrift {
+                        gauge,
+                        reported,
+                        actual,
+                    });
+                }
+            };
+            check(
+                OwnershipGauge::LiveOwners,
+                counters.live_owners.get(),
+                live.len(),
+            );
+            check(
+                OwnershipGauge::CleanupRegistrations,
+                counters.cleanup_registrations.get(),
+                live.iter().map(|frame| frame.pending_cleanups()).sum(),
+            );
+            check(
+                OwnershipGauge::OwnedChildren,
+                counters.owned_children.get(),
+                live.iter().map(|frame| frame.owned_children()).sum(),
+            );
+            if drift.is_empty() {
+                OwnershipAudit::Consistent
+            } else {
+                OwnershipAudit::Drifted(drift)
             }
-        };
-        check("live_owners", counters.live_owners.get(), live.len());
-        check(
-            "cleanup_registrations",
-            counters.cleanup_registrations.get(),
-            live.iter().map(|frame| frame.pending_cleanups()).sum(),
-        );
-        check(
-            "owned_children",
-            counters.owned_children.get(),
-            live.iter().map(|frame| frame.owned_children()).sum(),
-        );
-        Some(drift)
-    })
+        })
+        .unwrap_or(OwnershipAudit::Unavailable)
 }
 
 /// Panics if any ownership gauge has drifted from the live owner tree.
@@ -306,10 +381,91 @@ pub fn audit_ownership() -> Option<Vec<OwnershipDrift>> {
 /// stops checking, exactly as a `debug_assert!` would.
 #[track_caller]
 pub fn debug_assert_ownership_consistent() {
-    if let Some(drift) = audit_ownership() {
-        assert!(
-            drift.is_empty(),
-            "ownership counters drifted from the live owner tree: {drift:?}"
-        );
+    if let OwnershipAudit::Drifted(drift) = audit_ownership() {
+        panic!("ownership counters drifted from the live owner tree: {drift:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Reactor, on_cleanup, scope};
+
+    #[test]
+    fn the_audit_detects_a_gauge_that_has_drifted() {
+        // Every other ownership test asserts the audit stays quiet, which cannot distinguish "the
+        // counters are right" from "the audit never fires". Induce a drift by hand and prove it
+        // is caught, named, and quantified.
+        std::thread::spawn(|| {
+            let (_handle, ()) = scope(|| {});
+            assert_eq!(audit_ownership(), OwnershipAudit::Consistent);
+
+            let before = ownership_stats().owned_children;
+            child_adopted(); // a child counted but never actually adopted
+
+            match audit_ownership() {
+                OwnershipAudit::Drifted(drift) => assert_eq!(
+                    drift,
+                    vec![OwnershipDrift {
+                        gauge: OwnershipGauge::OwnedChildren,
+                        reported: before + 1,
+                        actual: before,
+                    }]
+                ),
+                other => panic!("the audit missed a drift it was built to catch: {other:?}"),
+            }
+
+            children_taken(1); // put it back
+            assert_eq!(audit_ownership(), OwnershipAudit::Consistent);
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_audit_registry_does_not_grow_with_owners_long_dead() {
+        // A `Weak` keeps the whole `RcBox<OwnerFrame>` alive, so a registry that only compacted
+        // when the audit happened to run retained every frame a debug-built application ever
+        // created — 30 MB over 200k scopes, invisible to `live_owners`, which correctly read 0.
+        std::thread::spawn(|| {
+            for _ in 0..2_000 {
+                let (handle, ()) = scope(|| on_cleanup(|| {}));
+                handle.dispose();
+            }
+            let live = ownership_stats().live_owners;
+            assert!(
+                registry_len() < 64,
+                "registry retained {} entries for {live} live owners",
+                registry_len()
+            );
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    #[test]
+    fn accounting_survives_a_thread_local_destroyed_before_the_frames_it_counts() {
+        // Thread-local destructors run in reverse registration order, so a host that parks a
+        // handle in its own thread-local — a component registry, a task queue — has its holder
+        // destroyed *after* the counters. Reaching for the counters there panics, and a panic in
+        // a destructor is a non-unwinding abort: this used to take the whole process down.
+        //
+        // If it regresses, this test does not fail — the process dies and the suite goes with it.
+        // Reaching the assertion at all is the point.
+        thread_local! {
+            static HOLDER: std::cell::RefCell<Option<crate::ScopeHandle>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        std::thread::spawn(|| {
+            HOLDER.with(|holder| drop(holder.borrow())); // registers this holder's dtor first
+            let reactor = Reactor::new();
+            let _guard = reactor.enter();
+            let (handle, ()) = scope(|| on_cleanup(|| {}));
+            HOLDER.with(|holder| *holder.borrow_mut() = Some(handle));
+        })
+        .join()
+        .expect("the thread must unwind cleanly rather than abort");
     }
 }

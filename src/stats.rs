@@ -242,8 +242,11 @@ impl FlushStats {
     /// flush arrived. This is for the flush an [`Reactor::external_flush`](crate::Reactor::external_flush)
     /// reports over a settled graph — the boundary was declared, but there was nothing to do.
     ///
-    /// Deliberately ignores [`jobs_at_start`](Self::jobs_at_start) and
-    /// [`jobs_at_finish`](Self::jobs_at_finish), which describe the queue rather than work done.
+    /// Deliberately ignores [`jobs_at_start`](Self::jobs_at_start),
+    /// [`jobs_at_finish`](Self::jobs_at_finish) and [`effects_pending`](Self::effects_pending),
+    /// which describe outstanding state rather than work this flush did. An empty flush with a
+    /// non-zero `effects_pending` is a real and meaningful combination: nothing happened here,
+    /// and an effect is still sitting unrun in a consumer-owned lane.
     pub fn is_empty(&self) -> bool {
         self.root_writes == 0
             && self.writes_suppressed == 0
@@ -606,6 +609,64 @@ mod tests {
         assert_eq!(reactor.graph_stats().queued_effects, 0);
 
         effect.dispose();
+    }
+
+    #[test]
+    fn dropping_a_latched_effect_releases_the_queued_gauge() {
+        // The latch is normally released by the pending run, or by the `EffectRun` being dropped
+        // — but both reach the effect through a `Weak`. An effect dropped before its first run
+        // (an unowned handle going out of scope is the ordinary way) made both upgrades fail, so
+        // nothing ever decremented the gauge and it climbed without bound.
+        let reactor = Reactor::new();
+        let baseline = reactor.graph_stats().queued_effects;
+
+        for _ in 0..100 {
+            let _effect = reactor.effect(|| {});
+        }
+        reactor.flush_now();
+
+        let stats = reactor.graph_stats();
+        assert_eq!(
+            stats.queued_effects, baseline,
+            "an effect dropped while latched must not leave a run pending forever"
+        );
+        assert_eq!(stats.live_nodes, 0, "and its node must be gone too");
+    }
+
+    #[test]
+    fn disposal_unhooks_the_node_even_when_a_cleanup_panics() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        // Teardown of the owner frame is total, but disposal used to stop one level short: the
+        // graph-side unhook sat after `owner.dispose()` unprotected, so a panicking cleanup left
+        // the effect's node metadata and every edge it recorded in the reactor for good — with
+        // `is_disposed()` reporting true. The gauges made it visible; nothing made it not happen.
+        let reactor = Reactor::new();
+        let value = signal_in(&reactor, 0_u32);
+        let effect = reactor.effect({
+            let value = value.clone();
+            move || {
+                let _ = value.get();
+                crate::on_cleanup(|| panic!("cleanup failed"));
+            }
+        });
+        reactor.flush_now();
+        assert_eq!(reactor.graph_stats().live_nodes, 2);
+
+        let result = catch_unwind(AssertUnwindSafe(|| effect.dispose()));
+        assert!(
+            result.is_err(),
+            "the cleanup panic still reaches the caller"
+        );
+
+        let stats = reactor.graph_stats();
+        assert_eq!(
+            stats.live_nodes_of_kind(NodeKind::Effect),
+            0,
+            "the effect's node must leave the graph even though teardown failed"
+        );
+        assert_eq!(stats.live_edges, 0, "and so must the edges it recorded");
+        assert_eq!(reactor.observer_count(value.id()), 0);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
+use core::panic::Location;
 
 use crate::reactor::{Mark, ObserverHook, State};
 use crate::{
@@ -549,6 +550,7 @@ fn mark_computed(
             node_origin,
             cause,
             level: mark.into(),
+            flush_epoch: reactor.flush_epoch(),
             state_changed,
         });
     }
@@ -575,6 +577,9 @@ struct RecomputeSpan<'a> {
     reactor: &'a Reactor,
     node: NodeId,
     kind: NodeKind,
+    /// Captured once at open: the node can be disposed before the span closes, and a trace sink
+    /// still needs to know where it came from.
+    node_origin: &'static Location<'static>,
     flush_epoch: u64,
     changed: bool,
     outcome: ComputeOutcome,
@@ -583,6 +588,9 @@ struct RecomputeSpan<'a> {
 impl<'a> RecomputeSpan<'a> {
     fn open(reactor: &'a Reactor, node: NodeId, kind: NodeKind) -> Self {
         let flush_epoch = reactor.flush_epoch();
+        let node_origin = reactor
+            .node_origin(node)
+            .unwrap_or_else(|| Location::caller());
         reactor.record_flush(|stats| {
             stats.computed_recomputed = stats.computed_recomputed.saturating_add(1);
         });
@@ -590,6 +598,7 @@ impl<'a> RecomputeSpan<'a> {
             reactor: reactor.diagnostic_id(),
             node,
             kind,
+            node_origin,
             flush_epoch,
             dependencies_before: reactor.dependency_count(node),
         });
@@ -597,6 +606,7 @@ impl<'a> RecomputeSpan<'a> {
             reactor,
             node,
             kind,
+            node_origin,
             flush_epoch,
             changed: false,
             outcome: ComputeOutcome::Panicked,
@@ -623,6 +633,7 @@ impl Drop for RecomputeSpan<'_> {
                 reactor: self.reactor.diagnostic_id(),
                 node: self.node,
                 kind: self.kind,
+                node_origin: self.node_origin,
                 flush_epoch: self.flush_epoch,
                 // On the unwind path this reports the edges recorded before the panic, which is
                 // what the node is actually holding.
@@ -642,10 +653,14 @@ impl Drop for RecomputeSpan<'_> {
 fn report_verification(reactor: &Reactor, node: NodeId, kind: NodeKind, recomputed: bool) {
     reactor
         .record_flush(|stats| stats.computed_verified = stats.computed_verified.saturating_add(1));
+    let Some(node_origin) = reactor.node_origin(node) else {
+        return;
+    };
     reactor.emit_diagnostic(DiagnosticEvent::ComputedVerified {
         reactor: reactor.diagnostic_id(),
         node,
         kind,
+        node_origin,
         flush_epoch: reactor.flush_epoch(),
         recomputed,
     });

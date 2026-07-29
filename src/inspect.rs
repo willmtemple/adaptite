@@ -22,7 +22,7 @@ use crate::{NodeId, NodeKind, Reactor, ReactorId};
 /// Sources are never stale — they *are* the truth — so only computed nodes and effects report
 /// one.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NodeState {
     /// Up to date.
     Clean,
@@ -45,7 +45,7 @@ impl From<State> for NodeState {
 
 /// One node in a [`GraphSnapshot`].
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GraphNode {
     /// Process-local identity, unique within this reactor.
     pub id: NodeId,
@@ -55,13 +55,22 @@ pub struct GraphNode {
     pub origin: &'static Location<'static>,
     /// Current version. Increments whenever the node's value changes.
     pub version: u64,
-    /// How stale the node is, or `None` for a node that is never stale — a source, a signal, an
-    /// event: anything with no computation to bring up to date.
+    /// How stale the node is, or `None` when the node has no staleness to report.
+    ///
+    /// `None` has two causes, and a post-mortem should not confuse them:
+    ///
+    /// - the node is **never** stale — a source, a signal, an event: anything with no computation
+    ///   to bring up to date. This is the ordinary case;
+    /// - the node is a computed node or effect whose hook has already been released while its
+    ///   metadata is still live, which is a narrow window during teardown.
+    ///
+    /// [`kind`](Self::kind) separates them: `None` on a [`NodeKind::Thunk`], [`NodeKind::Memo`] or
+    /// [`NodeKind::Effect`] is the second case.
     pub state: Option<NodeState>,
     /// Dependencies recorded during this node's last run.
     pub dependencies: usize,
     /// Observers currently recording a dependency on this node.
-    pub dependents: usize,
+    pub observers: usize,
 }
 
 /// A recorded dependency: `observer` read `observable`.
@@ -72,6 +81,26 @@ pub struct GraphEdge {
     pub observer: NodeId,
     /// The node that was read.
     pub observable: NodeId,
+    /// Version of `observable` recorded when the edge was, so a snapshot can answer "why did this
+    /// update" on its own rather than sending the caller back to the live graph.
+    pub version: u64,
+}
+
+/// One dependency recorded during a node's last run.
+///
+/// A named type rather than a `(NodeId, u64)` tuple: the version is the load-bearing half —
+/// comparing it against [`Reactor::node_version`] is how a consumer identifies which input
+/// actually moved — and an anonymous tuple field can neither be read clearly nor grown later.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordedDependency {
+    /// The node that was read.
+    pub node: NodeId,
+    /// Version of `node` at the moment the edge was recorded.
+    ///
+    /// When this no longer matches the node's current version, this is the dependency that
+    /// invalidated the observer.
+    pub version: u64,
 }
 
 /// Everything a reactor is holding, walked, plus what this thread's ownership tree is holding.
@@ -85,7 +114,7 @@ pub struct GraphEdge {
 /// inspection cannot perturb the graph it is inspecting — including the `state` field, which
 /// reports staleness rather than resolving it.
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphSnapshot {
     /// Graph this describes.
     pub reactor: ReactorId,
@@ -188,7 +217,7 @@ impl Reactor {
     /// });
     /// assert_eq!(doubled.get(), 2);
     ///
-    /// let snapshot = reactor.debug_graph();
+    /// let snapshot = reactor.graph_snapshot();
     /// assert_eq!(snapshot.nodes.len(), 2);
     /// assert_eq!(snapshot.edges.len(), 1);
     /// assert_eq!(snapshot.edges[0].observer, doubled.id());
@@ -201,10 +230,10 @@ impl Reactor {
     ///
     /// // Writing leaves the memo stale until something reads it again.
     /// value.set(2);
-    /// let snapshot = reactor.debug_graph();
+    /// let snapshot = reactor.graph_snapshot();
     /// assert_eq!(snapshot.stale().count(), 1);
     /// ```
-    pub fn debug_graph(&self) -> GraphSnapshot {
+    pub fn graph_snapshot(&self) -> GraphSnapshot {
         let meta = self.inner.meta.borrow();
         let dependencies = self.inner.dependencies.borrow();
         let dependents = self.inner.dependents.borrow();
@@ -215,9 +244,10 @@ impl Reactor {
         for (id, entry) in meta.iter() {
             let outgoing = dependencies.get(id);
             if let Some(outgoing) = outgoing {
-                edges.extend(outgoing.keys().map(|observable| GraphEdge {
+                edges.extend(outgoing.iter().map(|(observable, version)| GraphEdge {
                     observer: *id,
                     observable: *observable,
+                    version: *version,
                 }));
             }
             nodes.push(GraphNode {
@@ -232,7 +262,7 @@ impl Reactor {
                     .and_then(|weak| weak.upgrade())
                     .map(|hook| hook.state().into()),
                 dependencies: outgoing.map_or(0, hashbrown::HashMap::len),
-                dependents: dependents.get(id).map_or(0, hashbrown::HashSet::len),
+                observers: dependents.get(id).map_or(0, hashbrown::HashSet::len),
             });
         }
 
@@ -270,7 +300,7 @@ impl Reactor {
     /// The enumerating counterpart to [`observer_count`](Self::observer_count), for an inspector
     /// or a post-mortem that needs to name the observers rather than count them. It copies the
     /// set out, so prefer `observer_count` when only the number is wanted.
-    pub fn dependents_of(&self, node: NodeId) -> Vec<NodeId> {
+    pub fn observers_of(&self, node: NodeId) -> Vec<NodeId> {
         self.inner
             .dependents
             .borrow()
@@ -306,19 +336,41 @@ impl Reactor {
     ///
     /// let dependencies = reactor.dependencies_of(doubled.id());
     /// assert_eq!(dependencies.len(), 1);
-    /// assert_eq!(dependencies[0].0, value.id());
+    /// assert_eq!(dependencies[0].node, value.id());
     ///
     /// // The recorded version is what a later write is compared against.
     /// value.set(2);
-    /// assert_ne!(reactor.node_version(value.id()), Some(dependencies[0].1));
+    /// assert_ne!(reactor.node_version(value.id()), Some(dependencies[0].version));
     /// ```
-    pub fn dependencies_of(&self, node: NodeId) -> Vec<(NodeId, u64)> {
+    pub fn dependencies_of(&self, node: NodeId) -> Vec<RecordedDependency> {
         self.inner
             .dependencies
             .borrow()
             .get(&node)
-            .map(|edges| edges.iter().map(|(id, version)| (*id, *version)).collect())
+            .map(|edges| {
+                edges
+                    .iter()
+                    .map(|(id, version)| RecordedDependency {
+                        node: *id,
+                        version: *version,
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// Returns how stale `node` is, or `None` if it has no staleness to report.
+    ///
+    /// The per-node counterpart to [`GraphNode::state`] — see that field for what `None` means.
+    /// `O(1)`, so an assertion about one node does not have to walk the whole graph with
+    /// [`graph_snapshot`](Self::graph_snapshot).
+    pub fn node_state(&self, node: NodeId) -> Option<NodeState> {
+        self.inner
+            .observers
+            .borrow()
+            .get(&node)
+            .and_then(|weak| weak.upgrade())
+            .map(|hook| hook.state().into())
     }
 
     /// Returns the source location at which `node` was created, or `None` if it is not live.
@@ -415,7 +467,7 @@ mod tests {
         });
         reactor.flush_now();
 
-        let snapshot = reactor.debug_graph();
+        let snapshot = reactor.graph_snapshot();
         assert_eq!(snapshot.reactor, reactor.id());
         assert_eq!(snapshot.nodes.len(), 4);
         assert_eq!(snapshot.stats.live_nodes, 4);
@@ -435,7 +487,7 @@ mod tests {
         let memo = snapshot.node(total.id()).expect("the memo is live");
         assert_eq!(memo.kind, NodeKind::Memo);
         assert_eq!(memo.dependencies, 2);
-        assert_eq!(memo.dependents, 1);
+        assert_eq!(memo.observers, 1);
         assert_eq!(memo.state, Some(NodeState::Clean));
         assert!(memo.origin.file().ends_with("inspect.rs"));
 
@@ -465,14 +517,14 @@ mod tests {
             move || source.get() * 2
         });
         assert_eq!(doubled.get(), 2);
-        assert_eq!(reactor.debug_graph().stale().count(), 0);
+        assert_eq!(reactor.graph_snapshot().stale().count(), 0);
 
         source.set(5);
 
         // Twice: an inspection that recomputed on the way past would answer its own question and
         // hide the thing being investigated.
         for _ in 0..2 {
-            let snapshot = reactor.debug_graph();
+            let snapshot = reactor.graph_snapshot();
             let stale = snapshot.stale().collect::<Vec<_>>();
             assert_eq!(stale.len(), 1);
             assert_eq!(stale[0].id, doubled.id());
@@ -480,7 +532,86 @@ mod tests {
         }
 
         assert_eq!(doubled.get(), 10);
-        assert_eq!(reactor.debug_graph().stale().count(), 0);
+        assert_eq!(reactor.graph_snapshot().stale().count(), 0);
+    }
+
+    #[test]
+    fn a_check_marked_node_is_distinguishable_from_a_dirty_one() {
+        // Only `Clean` and `Dirty` were ever produced by the suite. `Check` is the whole reason
+        // the three-state model exists — "a computed input *may* have changed, verify before
+        // recomputing" — so a snapshot that could not show it would be missing the interesting
+        // middle of every propagation.
+        let reactor = Reactor::new();
+        let source = signal_in(&reactor, 1_u32);
+        let first = memo_in(&reactor, {
+            let source = source.clone();
+            move || source.get() + 1
+        });
+        let second = memo_in(&reactor, {
+            let first = first.clone();
+            move || first.get() + 1
+        });
+        assert_eq!(second.get(), 3);
+
+        // Write without reading: the direct dependent is definitely dirty, everything downstream
+        // only knows a computed input may have moved.
+        source.set(2);
+
+        let snapshot = reactor.graph_snapshot();
+        assert_eq!(
+            snapshot.node(first.id()).expect("live").state,
+            Some(NodeState::Dirty)
+        );
+        assert_eq!(
+            snapshot.node(second.id()).expect("live").state,
+            Some(NodeState::Check)
+        );
+        assert_eq!(snapshot.stale().count(), 2);
+
+        // A node that has left the graph is absent rather than reported as clean.
+        let id = second.id();
+        drop(second);
+        assert!(reactor.graph_snapshot().node(id).is_none());
+    }
+
+    #[test]
+    fn an_invalidated_effect_reports_as_stale_before_it_runs() {
+        // `ObserverHook::state` gained an implementation for effects in 0.3 and nothing observed
+        // it: an effect that is queued but has not run yet is stale, and a snapshot should say so.
+        let reactor = Reactor::new();
+        let source = signal_in(&reactor, 0_u32);
+        let effect = reactor.effect({
+            let source = source.clone();
+            move || {
+                let _ = source.get();
+            }
+        });
+        reactor.flush_now();
+        assert_eq!(reactor.node_state(effect.id()), Some(NodeState::Clean));
+        assert_eq!(reactor.graph_snapshot().stale().count(), 0);
+
+        source.set(1);
+        assert_eq!(
+            reactor.node_state(effect.id()),
+            Some(NodeState::Dirty),
+            "the effect is invalidated and has not run yet"
+        );
+        assert!(
+            reactor
+                .graph_snapshot()
+                .stale()
+                .any(|node| node.id == effect.id())
+        );
+
+        reactor.flush_now();
+        assert_eq!(reactor.node_state(effect.id()), Some(NodeState::Clean));
+
+        effect.dispose();
+        assert_eq!(
+            reactor.node_state(effect.id()),
+            None,
+            "a node that has left the graph has no state to report"
+        );
     }
 
     #[test]
@@ -496,7 +627,7 @@ mod tests {
         let effect = application.effect(|| {});
         application.flush_now();
 
-        let orphan = stranded.debug_graph();
+        let orphan = stranded.graph_snapshot();
         assert_eq!(orphan.nodes.len(), 1);
         assert_eq!(orphan.edges.len(), 0);
         assert_eq!(orphan.stats.observed_nodes, 0);
@@ -504,7 +635,13 @@ mod tests {
             orphan.stats.flushes, 0,
             "the telltale: this graph has never been flushed"
         );
-        assert_ne!(orphan.reactor, application.debug_graph().reactor);
+        // The contrast is the point, and asserting only the zero above would hold just as well
+        // if the flush counter never incremented at all.
+        assert!(
+            application.graph_stats().flushes > 0,
+            "the application's graph did flush, which is what makes the orphan's zero mean \
+             something"
+        );
 
         drop(held);
         effect.dispose();
@@ -515,13 +652,13 @@ mod tests {
         let reactor = Reactor::new();
         let node = source_in(&reactor);
 
-        let snapshot = reactor.debug_graph();
+        let snapshot = reactor.graph_snapshot();
         assert_eq!(snapshot.nodes.len(), 1);
         assert_eq!(
             snapshot.node(node.id()).expect("live").kind,
             NodeKind::Source
         );
-        assert_eq!(snapshot.node(node.id()).expect("live").dependents, 0);
+        assert_eq!(snapshot.node(node.id()).expect("live").observers, 0);
         assert!(snapshot.edges.is_empty());
     }
 }

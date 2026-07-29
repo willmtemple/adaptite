@@ -128,7 +128,7 @@ let after = reactor.graph_stats();
 assert_eq!(after.live_nodes, before.live_nodes, "nothing was retained");
 ```
 
-`Reactor::debug_graph()` is the walking counterpart: every node with its kind,
+`Reactor::graph_snapshot()` is the walking counterpart: every node with its kind,
 origin, version and staleness, plus every edge, sorted so two snapshots diff
 directly. For a human or an inspector, not for a per-frame check.
 
@@ -183,7 +183,7 @@ unreachable for most kinds.
   graph. `dependencies_before`/`dependencies_after` detect a read set that
   changes *size*; for one that swaps members, sample
   `Reactor::dependencies_of` either side of a recomputation or diff two
-  `debug_graph` snapshots.
+  `graph_snapshot` snapshots.
 - **No node labels or `serde` export.** `#[track_caller]` origins already give the
   human anchor at no runtime cost.
 - **`tracing` is still not a contract.** The targets are private and several

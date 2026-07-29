@@ -207,7 +207,7 @@ pub(crate) trait ObserverHook {
     /// dependencies (effects).
     fn refresh(&self) {}
 
-    /// Reports how stale this observer currently is, for [`Reactor::debug_graph`].
+    /// Reports how stale this observer currently is, for [`Reactor::graph_snapshot`].
     ///
     /// Staleness lives on each node's own inner struct rather than in the reactor's maps, so a
     /// snapshot has to ask. Read-only, and must not recompute: an inspection that brought nodes
@@ -728,6 +728,8 @@ impl Reactor {
         if let Some(cause) = cause {
             self.inner.emit(DiagnosticEvent::ReactiveWrite {
                 reactor: self.inner.id,
+                // Same map lookup that produced `cause`, so a live node always has a kind here.
+                kind: self.node_kind(observable).unwrap_or(NodeKind::Source),
                 cause,
             });
             self.record_flush(|stats| stats.root_writes = stats.root_writes.saturating_add(1));
@@ -856,9 +858,9 @@ impl Reactor {
     /// Computed dependencies are refreshed before comparison, so unchanged memos suppress
     /// downstream recomputation.
     pub(crate) fn dependencies_changed(&self, observer: NodeId) -> bool {
-        for (dependency, seen_version) in self.dependencies_of(observer) {
-            self.refresh_node(dependency);
-            if self.version(dependency) != seen_version {
+        for recorded in self.dependencies_of(observer) {
+            self.refresh_node(recorded.node);
+            if self.version(recorded.node) != recorded.version {
                 return true;
             }
         }
@@ -938,7 +940,7 @@ impl Reactor {
                 kind: meta.kind,
                 origin: meta.origin,
                 dependencies,
-                dependents,
+                observers: dependents,
             });
         }
     }
@@ -1394,6 +1396,14 @@ pub(crate) struct ReactorInner {
     pub(crate) pending_jobs: RefCell<VecDeque<Job>>,
     flush_scheduled: Cell<bool>,
     pub(crate) flush_epoch: Cell<u64>,
+    /// Epoch pinned by the outermost `begin_flush`, so `end_flush` closes the flush it opened
+    /// rather than whichever one happens to be current.
+    ///
+    /// A re-entrant `flush_now` inside a consumer-declared flush bumps the shared epoch, so
+    /// reading the live value at close reports the *inner* flush a second time and never
+    /// terminates the outer one. `flush_jobs` pins the same way in its `FlushGuard`; this is that
+    /// pin for the `begin_flush`/`end_flush` pair, which had none.
+    open_flush_epoch: Cell<u64>,
     /// Identifies one *logical drain*: the outermost flush and everything nested inside it.
     ///
     /// Distinct from `flush_epoch`, which identifies each flush for diagnostics. A re-entrant
@@ -1435,6 +1445,7 @@ impl ReactorInner {
             diagnostics: RefCell::new(Vec::new()),
             observation_hooks: RefCell::new(HashMap::new()),
             counters: GraphCounters::default(),
+            open_flush_epoch: Cell::new(0),
             drain_epoch: Cell::new(0),
             flushes: FlushAccounting::default(),
             mark_depth: Cell::new(0),
@@ -1476,6 +1487,7 @@ impl ReactorInner {
         self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
         self.counters.flush_opened();
         let epoch = self.flush_epoch.get();
+        self.open_flush_epoch.set(epoch);
         if self.diagnostics_active.get() {
             self.flushes.open_flush(self.pending_jobs.borrow().len());
         }
@@ -1510,7 +1522,10 @@ impl ReactorInner {
                 .unwrap_or_default();
             self.emit(DiagnosticEvent::FlushFinished {
                 reactor: self.id,
-                flush_epoch: self.flush_epoch.get(),
+                // The pinned epoch, not the live one: a re-entrant `flush_now` inside this flush
+                // has already moved `flush_epoch` on, so reading it here would close the inner
+                // flush a second time and never terminate this one.
+                flush_epoch: self.open_flush_epoch.get(),
                 remaining_jobs,
                 stats,
             });

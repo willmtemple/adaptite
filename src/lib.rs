@@ -40,11 +40,11 @@ pub use effect::{
 };
 pub use event::{Event, Subscription, event, event_in, on, on_in};
 pub use id::NodeId;
-pub use inspect::{GraphEdge, GraphNode, GraphSnapshot, NodeState};
+pub use inspect::{GraphEdge, GraphNode, GraphSnapshot, NodeState, RecordedDependency};
 pub use observable::{DynObservable, Observable};
 pub use ownership::{
-    OwnershipDrift, OwnershipStats, audit_ownership, debug_assert_ownership_consistent,
-    ownership_stats,
+    OwnershipAudit, OwnershipDrift, OwnershipGauge, OwnershipStats, audit_ownership,
+    debug_assert_ownership_consistent, ownership_stats,
 };
 pub use reactor::{EnterGuard, ReactCycleError, Reactor, current, try_current, untrack};
 pub use resource::{Resource, resource, resource_in};

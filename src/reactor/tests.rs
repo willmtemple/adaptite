@@ -114,10 +114,10 @@ fn observe_records_dependency_edges_with_versions() {
             .expect("should not detect cycle")
     });
 
-    assert_eq!(
-        reactor.dependencies_of(observer),
-        vec![(observable, reactor.version(observable))]
-    );
+    let recorded = reactor.dependencies_of(observer);
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].node, observable);
+    assert_eq!(recorded[0].version, reactor.version(observable));
     assert_eq!(
         reactor.inner.dependents.borrow().get(&observable),
         Some(&[observer].into_iter().collect())
@@ -141,7 +141,7 @@ fn the_public_queries_answer_why_did_this_update() {
     // Both inputs are observed once, by the memo.
     assert_eq!(reactor.observer_count(left.id()), 1);
     assert_eq!(reactor.observer_count(right.id()), 1);
-    assert_eq!(reactor.dependents_of(left.id()), vec![total.id()]);
+    assert_eq!(reactor.observers_of(left.id()), vec![total.id()]);
 
     // Snapshot the edges as the memo last saw them, then move one input.
     let recorded = reactor.dependencies_of(total.id());
@@ -153,8 +153,8 @@ fn the_public_queries_answer_why_did_this_update() {
     // `dependencies_of` and `node_version` to be reachable.
     let moved = recorded
         .iter()
-        .filter(|(node, seen)| reactor.node_version(*node) != Some(*seen))
-        .map(|(node, _)| *node)
+        .filter(|edge| reactor.node_version(edge.node) != Some(edge.version))
+        .map(|edge| edge.node)
         .collect::<Vec<_>>();
     assert_eq!(moved, vec![right.id()]);
 }
@@ -190,7 +190,7 @@ fn observer_counts_are_late_but_never_early() {
     );
     reactor.flush_now();
     assert_eq!(reactor.observer_count(watched.id()), 0);
-    assert!(reactor.dependents_of(watched.id()).is_empty());
+    assert!(reactor.observers_of(watched.id()).is_empty());
 
     // Disposal retracts the observer's own edges, which is what a leak test watches.
     toggle.set(true);
