@@ -181,6 +181,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The reactive graph no longer allocates during propagation, verification, or edge
+  re-recording. Writing to the head of a 64-deep memo chain and reading the tail cost 383
+  allocations and 18.8 kB; a 64-wide fan-out cost 129. Both are now zero. The allocations
+  were copies made to release a borrow before calling code that may re-enter the graph —
+  now taken from a pool — and hash tables discarded by an observer that was about to refill
+  them, which are now emptied in place. `OwnerFrame::reset` likewise keeps the capacity of
+  its cleanup and child lists. Effect runs went from 7 allocations to 2 (a boxed job and
+  runite's microtask closure), and an effect with a cleanup from 8 to 2. Throughput,
+  release, A/B against a saved baseline: edge re-recording -56.9%, deep-chain invalidation
+  -43.4%, wide fan-out -32.1%, layered diamonds -31.5%, node create/dispose -10.7%, and no
+  benchmark regressed. One consequence worth knowing: `GraphStats::observed_nodes` is now a
+  maintained counter rather than the length of the dependents index, because emptied entries
+  are retained across an observer's rerun. The value is unchanged and is asserted against a
+  walk of the graph in the test suite.
+- An effect that writes state it depends on and then calls `flush_now` no longer re-enters
+  itself. Both halves are documented as legal — convergent self-feedback, and synchronous
+  propagation for host integrations — but together the nested flush found the job the write
+  had just queued and ran the effect from inside its own body, clearing the dependency set
+  the outer run was still recording. A run requested while the effect is already running is
+  now deferred and queued once the current run finishes, so the loop converges as documented
+  and the dependency set survives.
+- `FlushStarted` no longer holds a borrow of the job queue across the diagnostic subscriber.
+  A subscriber that scheduled reactive work — the obvious thing to do from a flush boundary,
+  and something `FlushFinished` already permitted — got a bare `RefCell already borrowed`
+  originating inside adaptite.
 - **`Event` delivered to subscribers in hash order, contradicting a documented guarantee.**
   `Event::on` says values are drained "in emission order". Its queue is fed by an ordinary
   immediate subscriber, and subscribers were stored in a hash map with a randomly seeded
