@@ -208,3 +208,92 @@ fn an_effect_that_panics_in_cleanup_still_re_runs_cleanly_afterwards() {
 
     effect.dispose();
 }
+
+/// Teardown installs an owner *barrier*, not merely an absence of one.
+///
+/// A host that calls `flush_now` from inside a `scope` leaves that scope on the owner stack while
+/// an effect re-runs and tears down. Without a barrier, a cleanup that registers a cleanup
+/// attached it to the enclosing scope: it outlived the effect it belonged to and ran when that
+/// outer scope died, which for an application root is never. A leak with no error attached.
+#[test]
+fn a_cleanup_registered_during_teardown_never_attaches_to_an_enclosing_scope() {
+    use std::cell::RefCell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::rc::Rc;
+
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let reactor = Reactor::new();
+    let value = adaptite::signal_in(&reactor, 0u32);
+
+    let outer = adaptite::scope({
+        let value = value.clone();
+        let reactor = reactor.clone();
+        let log = Rc::clone(&log);
+        move || {
+            let handle = reactor.effect({
+                let value = value.clone();
+                let log = Rc::clone(&log);
+                move || {
+                    value.get();
+                    let log = Rc::clone(&log);
+                    adaptite::on_cleanup(move || {
+                        let inner = Rc::clone(&log);
+                        let attempt = catch_unwind(AssertUnwindSafe(move || {
+                            adaptite::on_cleanup(move || {
+                                inner.borrow_mut().push("escaped to the outer scope");
+                            });
+                        }));
+                        log.borrow_mut().push(if attempt.is_ok() {
+                            "registered"
+                        } else {
+                            "reported"
+                        });
+                    });
+                }
+            });
+            core::mem::forget(handle);
+            reactor.flush_now(); // first run registers the cleanup
+            value.set(1);
+            reactor.flush_now(); // re-run tears down, with `outer` on the owner stack
+        }
+    });
+
+    assert_eq!(
+        &*log.borrow(),
+        &["reported"],
+        "registering a cleanup during teardown must be reported, not silently redirected"
+    );
+
+    drop(outer);
+    assert!(
+        !log.borrow().contains(&"escaped to the outer scope"),
+        "a cleanup registered during teardown outlived its owner and ran with the outer scope"
+    );
+}
+
+/// "No owner" and "no owner because one is being torn down" are different situations, and the
+/// second used to be reported as the first — sending the reader after a missing `scope` that was
+/// never the problem.
+#[test]
+fn registering_a_cleanup_during_teardown_reports_the_real_reason() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let during_teardown = catch_unwind(AssertUnwindSafe(|| {
+        let owner = adaptite::scope(|| adaptite::on_cleanup(|| adaptite::on_cleanup(|| {})));
+        drop(owner);
+    }))
+    .expect_err("registering a cleanup during teardown should panic");
+    let during_teardown = panic_message(&during_teardown);
+    assert!(
+        during_teardown.contains("from inside a cleanup"),
+        "message should name the real cause, got: {during_teardown}"
+    );
+
+    let no_owner = catch_unwind(AssertUnwindSafe(|| adaptite::on_cleanup(|| {})))
+        .expect_err("registering a cleanup with no owner should panic");
+    let no_owner = panic_message(&no_owner);
+    assert!(
+        no_owner.contains("outside a reactive owner"),
+        "the genuinely-ownerless case should keep its own message, got: {no_owner}"
+    );
+}

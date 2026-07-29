@@ -14,6 +14,33 @@ thread_local! {
     /// `None` entries are barriers pushed by [`unowned`]: they shadow any enclosing owner
     /// without establishing a new one.
     static OWNER_STACK: RefCell<Vec<Option<Rc<OwnerFrame>>>> = const { RefCell::new(Vec::new()) };
+
+    /// Non-zero while cleanups or child disposals are running on this thread.
+    ///
+    /// Teardown installs an owner *barrier*, so `current_owner()` is `None` throughout — but
+    /// "no owner" and "no owner because we are tearing one down" call for different diagnoses,
+    /// and only this distinguishes them.
+    static TEARDOWN_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Marks the dynamic extent of a teardown, so `on_cleanup` can explain itself accurately.
+struct TeardownMark;
+
+impl TeardownMark {
+    fn enter() -> Self {
+        let _ = TEARDOWN_DEPTH.try_with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for TeardownMark {
+    fn drop(&mut self) {
+        let _ = TEARDOWN_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn in_teardown() -> bool {
+    TEARDOWN_DEPTH.try_with(Cell::get).unwrap_or(0) > 0
 }
 
 /// Handler installed by [`scope_catch`], invoked for panics from the effects a scope owns.
@@ -152,12 +179,23 @@ impl OwnerFrame {
 
         let mut first_panic: Option<Box<dyn Any + Send>> = None;
         crate::untrack(|| {
-            for cleanup in cleanups.drain(..).rev() {
-                capture_panic(&mut first_panic, cleanup);
-            }
-            for child in children.drain(..).rev() {
-                capture_panic(&mut first_panic, || child.dispose_owned());
-            }
+            // An owner barrier, not merely an absence of one. Teardown can be reached with an
+            // unrelated owner on the stack — a host that calls `flush_now` from inside a `scope`
+            // does exactly that, and an effect re-running under that flush tears down here.
+            // Without the barrier a cleanup that registers a cleanup silently attaches it to
+            // whatever scope encloses the *flush*, so it outlives the effect it belongs to and
+            // runs when that outer scope dies, which may be never. That is a leak with no error
+            // attached to it. With the barrier, teardown is uniformly unowned and the attempt is
+            // reported instead.
+            with_owner_entry(None, || {
+                let _teardown = TeardownMark::enter();
+                for cleanup in cleanups.drain(..).rev() {
+                    capture_panic(&mut first_panic, cleanup);
+                }
+                for child in children.drain(..).rev() {
+                    capture_panic(&mut first_panic, || child.dispose_owned());
+                }
+            });
         });
 
         // Both lists are empty now — `drain` was used rather than `into_iter` precisely so the
@@ -247,25 +285,38 @@ pub(crate) fn with_owner<T>(frame: &Rc<OwnerFrame>, f: impl FnOnce() -> T) -> T 
 }
 
 fn with_owner_entry<T>(entry: Option<Rc<OwnerFrame>>, f: impl FnOnce() -> T) -> T {
-    OWNER_STACK.with(|stack| stack.borrow_mut().push(entry));
+    // `try_with` throughout, because teardown is reachable from `Drop` and therefore from a
+    // thread-local destructor, by which point this thread-local may already be gone. Panicking
+    // in a `Drop` that runs during thread shutdown aborts the process rather than failing a test.
+    // A push that did not happen must not be popped, so the guard records whether it took effect.
+    let pushed = OWNER_STACK
+        .try_with(|stack| stack.borrow_mut().push(entry))
+        .is_ok();
 
-    struct Guard;
+    struct Guard {
+        pushed: bool,
+    }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            OWNER_STACK.with(|stack| {
+            if !self.pushed {
+                return;
+            }
+            let _ = OWNER_STACK.try_with(|stack| {
                 stack.borrow_mut().pop();
             });
         }
     }
 
-    let _guard = Guard;
+    let _guard = Guard { pushed };
     f()
 }
 
 /// Returns the innermost reactive owner on this thread, if any.
 pub(crate) fn current_owner() -> Option<Rc<OwnerFrame>> {
-    OWNER_STACK.with(|stack| stack.borrow().last().cloned().flatten())
+    OWNER_STACK
+        .try_with(|stack| stack.borrow().last().cloned().flatten())
+        .unwrap_or(None)
 }
 
 /// Hands `child` to the innermost owner on this thread, returning `false` when no owner is
@@ -519,6 +570,15 @@ pub fn unowned<T>(f: impl FnOnce() -> T) -> T {
 /// ```
 pub fn on_cleanup(cleanup: impl FnOnce() + 'static) {
     let Some(owner) = current_owner() else {
+        if in_teardown() {
+            panic!(
+                "adaptite: on_cleanup called from inside a cleanup, while its owner is being \
+                 torn down; the owner's cleanup list has already been taken, so there is no \
+                 point at which this cleanup could run. Register it from the effect body or \
+                 scope that is being cleaned up, or create a `scope` inside the cleanup if you \
+                 need resources released after it"
+            );
+        }
         panic!(
             "adaptite: on_cleanup called outside a reactive owner (an effect run or a scope); \
              the cleanup would never execute"
