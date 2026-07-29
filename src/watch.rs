@@ -114,9 +114,14 @@ impl Reactor {
         self.effect(move || {
             let new = gated.get();
             crate::untrack(|| {
-                let mut previous = previous.borrow_mut();
-                handler(&new, previous.as_ref());
-                *previous = Some(new);
+                // The borrow must not span the handler. A handler that writes the watched source
+                // and flushes re-enters this effect, and holding it across the call turns that
+                // into a `BorrowMutError` in release (debug hits the reactor's re-entrancy
+                // assert first, so the two profiles disagreed). Writing back afterwards still
+                // means a panicking handler leaves `previous` at the last value it handled.
+                let prior = previous.borrow().clone();
+                handler(&new, prior.as_ref());
+                *previous.borrow_mut() = Some(new);
             });
         })
     }

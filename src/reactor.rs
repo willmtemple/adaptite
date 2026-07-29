@@ -522,10 +522,22 @@ impl Reactor {
             observer_id = observer.0
         )
         .entered();
+        // Checked before anything is mutated, and checked in *every* build. The insert happens
+        // in release regardless — only the assertion was being stripped — so this costs nothing
+        // and replaces a silent corruption with a diagnosis: re-entering a running observer used
+        // to fall through to `clear_observer_dependencies` below, wiping the dependency set of a
+        // computation that was still using it, and the node would emerge with whatever subset of
+        // its inputs it happened to re-read.
+        let inserted = self.inner.active_computations.borrow_mut().insert(observer);
+        assert!(
+            inserted,
+            "adaptite: a reactive computation re-entered itself, which cannot be tracked \
+             coherently — the inner run would clear the dependencies the outer run is still \
+             recording. This usually means a computation, or a callback it invoked, wrote state \
+             it depends on and then forced a synchronous flush"
+        );
         self.clear_observer_dependencies(observer);
         self.inner.stack.borrow_mut().push(observer);
-        let inserted = self.inner.active_computations.borrow_mut().insert(observer);
-        debug_assert!(inserted, "observer should not already be active");
 
         // Entering a computation starts a fresh tracking scope. `untrack` says "do not record
         // this read for whoever is currently observing" — it must not mean "and also record

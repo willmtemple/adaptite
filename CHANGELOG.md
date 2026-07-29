@@ -181,6 +181,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Event` delivered to subscribers in hash order, contradicting a documented guarantee.**
+  `Event::on` says values are drained "in emission order". Its queue is fed by an ordinary
+  immediate subscriber, and subscribers were stored in a hash map with a randomly seeded
+  hasher — so when another subscriber re-emitted, the nested value could be queued *first*
+  and delivered before the value that caused it. Two `on` subscriptions on the same event
+  could disagree with each other about the order of the same emit sequence, differently on
+  every process run. Subscribers are now stored in a `BTreeMap` keyed by the existing
+  monotonic subscription id, so iteration order **is** registration order. This also makes
+  immediate-subscriber order deterministic, which was never specified and never stable.
+- **Re-entering a running computation is now refused in every build.** It was a
+  `debug_assert`, so release builds fell through into `clear_observer_dependencies` and
+  wiped the dependency set of a computation that was still recording it — the node emerged
+  with whatever subset of its inputs the inner run happened to re-read, silently. The check
+  now runs before anything is mutated and in all profiles; the `insert` it tests already ran
+  in release, so refusing costs nothing.
+- **`watch` held a `RefCell` borrow across its handler.** A handler that wrote the watched
+  source and forced a flush — a combination the README explicitly sanctions — re-entered the
+  effect and panicked with a bare `BorrowMutError` in release while debug hit the reactor's
+  re-entrancy assert, so the two profiles disagreed about what went wrong. The previous value
+  is now cloned out before the handler runs. A panicking handler still leaves `previous` at
+  the last value it handled.
+
 - **`untrack` leaked into computed nodes, freezing them permanently.** `UNTRACKED_DEPTH` is
   a thread-global counter and `run_in_context` never reset it, so a `Thunk` or `Memo` whose
   first recomputation happened inside an untracked region recorded **zero dependencies**,

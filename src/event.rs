@@ -3,7 +3,11 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
-use hashbrown::HashMap;
+// A `BTreeMap` rather than a hash map: subscriber ids come from a monotonic counter, so
+// ordered iteration *is* registration order. `Event::on` feeds its queue from an ordinary
+// immediate subscriber, so with hash iteration a re-entrant `emit` could enqueue values out of
+// emission order — contradicting the documented guarantee — and the order varied per process.
+use alloc::collections::BTreeMap;
 
 use crate::scope::{OwnedDisposable, adopt_into_current};
 use crate::{NodeId, NodeKind, Reactor, current, trace_targets};
@@ -386,7 +390,7 @@ struct EventInner<T> {
     reactor: Reactor,
     id: NodeId,
     next_subscriber: Cell<usize>,
-    subscribers: RefCell<HashMap<usize, Rc<SubscriberFn<T>>>>,
+    subscribers: RefCell<BTreeMap<usize, Rc<SubscriberFn<T>>>>,
 }
 
 struct SubscriptionInner {
@@ -418,6 +422,64 @@ impl SubscriptionInner {
 impl Drop for SubscriptionInner {
     fn drop(&mut self) {
         self.unsubscribe();
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    use crate::{Reactor, event_in};
+
+    #[test]
+    fn immediate_subscribers_run_in_registration_order() {
+        // Hash iteration made this arbitrary and different on every process run, so a consumer
+        // registering a logger before a handler had no guarantee about which ran first.
+        let reactor = Reactor::new();
+        let stream = event_in::<u32>(&reactor);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let _subs = (0..8)
+            .map(|i| {
+                let seen = Rc::clone(&seen);
+                stream.subscribe(move |_| seen.borrow_mut().push(i))
+            })
+            .collect::<Vec<_>>();
+        stream.emit(1);
+
+        assert_eq!(*seen.borrow(), [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn a_re_entrant_emit_still_drains_in_emission_order() {
+        // `on` documents delivery "in emission order". Its queue is fed by an ordinary immediate
+        // subscriber, so when another subscriber re-emits, the two enqueues raced in hash order:
+        // the nested value could be queued first and delivered before the value that caused it.
+        let reactor = Reactor::new();
+        let stream = event_in::<u32>(&reactor);
+        let drained = Rc::new(RefCell::new(Vec::new()));
+
+        let _drain = reactor.on(&stream, {
+            let drained = Rc::clone(&drained);
+            move |value| drained.borrow_mut().push(*value)
+        });
+        let _echo = stream.subscribe({
+            let stream = stream.clone();
+            move |value| {
+                if *value < 100 {
+                    stream.emit(value + 100);
+                }
+            }
+        });
+
+        stream.emit(1);
+        reactor.flush_now();
+        assert_eq!(
+            *drained.borrow(),
+            [1, 101],
+            "the value that triggered the nested emit must be delivered first"
+        );
     }
 }
 

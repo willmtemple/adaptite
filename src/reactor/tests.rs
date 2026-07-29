@@ -332,6 +332,48 @@ fn a_computation_that_first_runs_untracked_still_records_its_dependencies() {
 }
 
 #[test]
+fn re_entering_a_running_computation_is_refused_in_every_build() {
+    use crate::{memo_in, signal_in};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // Re-entry cannot be tracked coherently: the inner run clears the dependency set the outer
+    // run is still recording. This was a `debug_assert`, so release builds fell through and the
+    // node emerged with whatever subset of its inputs the inner run happened to re-read — silent
+    // and shape-dependent. The `insert` it checks already ran in release, so refusing is free.
+    let reactor = Reactor::new();
+    let source = signal_in(&reactor, 1_u64);
+    let reader: Rc<RefCell<Option<crate::Memo<u64>>>> = Rc::new(RefCell::new(None));
+
+    let memo = memo_in(&reactor, {
+        let source = source.clone();
+        let reader = Rc::clone(&reader);
+        move || {
+            let value = source.get();
+            // Read itself from inside its own computation.
+            if let Some(me) = reader.borrow().as_ref() {
+                let _ = me.peek();
+            }
+            value
+        }
+    });
+    *reader.borrow_mut() = Some(memo.clone());
+
+    let result = catch_unwind(AssertUnwindSafe(|| memo.get()));
+    let payload = result.expect_err("re-entry must be refused");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    assert!(
+        message.contains("re-entered itself") || message.contains("cycle"),
+        "the refusal should explain itself, got: {message}"
+    );
+
+    *reader.borrow_mut() = None;
+}
+
+#[test]
 fn cycle_detection_panics_with_path_and_origins() {
     let reactor = Reactor::new();
     let a = reactor.allocate_node(NodeKind::Source);
