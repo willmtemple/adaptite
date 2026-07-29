@@ -179,6 +179,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   twice — a `Drop` guard constructed on a hot path is not free even when its body is a
   no-op — with the fix pattern, so the next diagnostic added does not rediscover it.
 
+### Fixed
+
+- **A cleanup panicking during thread teardown aborted the process.** Every ownership
+  counter reached its thread-local with `LocalKey::with`, which *panics* once that value has
+  been destroyed — and a panic in a destructor is a non-unwinding abort. Thread-local
+  destructors run in reverse registration order, so any host parking an adaptite handle in
+  its own thread-local (a component registry, a task queue) had the counters destroyed first
+  and took the process down at exit. Debug builds only, because the audit registry is what
+  makes the counters need dropping. All accounting now uses `try_with` and no-ops when the
+  counters are already gone: losing a decrement during teardown costs nothing, aborting costs
+  everything.
+- **`GraphStats::queued_effects` climbed without bound.** The pending-run latch was released
+  by the queued run or by a discarded `EffectRun`, both of which reach the effect through a
+  `Weak`. An effect dropped before its run — an unowned handle going out of scope is the
+  ordinary way — made both upgrades fail, so the gauge was never decremented: 1,000
+  create-and-drop cycles left it reading 1,000 on an empty graph. `dispose` now releases the
+  latch itself, and `FlushStats::effects_pending`, which inherited the same lie, is fixed
+  with it.
+- **Disposal stranded a node when a cleanup panicked.** `EffectHandle::dispose` ran owner
+  teardown and then unhooked from the graph, unprotected — so a panicking cleanup left the
+  effect's node metadata and every edge it had recorded in the reactor permanently, while
+  `is_disposed()` reported true. The unhook now happens even when teardown unwinds. This
+  predates 0.3 but contradicts the teardown contract this release introduced, and the new
+  gauges are what made it visible.
+- **`external_flush` closed the wrong flush.** It never pinned the epoch it opened, so a
+  re-entrant `flush_now` inside it moved the shared epoch on and the outer close reported the
+  inner number — one epoch finished twice, another never finished at all. Fatal for a
+  consumer keying totals by `flush_epoch`, which is the documented aggregation key.
+  `flush_jobs` already pinned its epoch for exactly this reason; the `begin_flush`/`end_flush`
+  pair now does too.
+- **The audit registry retained every owner frame ever created.** A `Weak` keeps the whole
+  allocation alive, and nothing pruned except `audit_ownership`, which applications never
+  call: 200,000 scopes grew a debug build by 30 MB while `live_owners` correctly read 0 — a
+  leak invisible to the very gauge meant to expose leaks. The registry now compacts as it
+  grows.
+
 ### Changed
 
 - **Teardown is total.** `OwnerFrame::reset` documented that a panicking cleanup does not
