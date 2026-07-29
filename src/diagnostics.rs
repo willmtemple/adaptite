@@ -809,6 +809,95 @@ mod tests {
     }
 
     #[test]
+    fn the_generic_accessors_agree_with_every_variant_they_cover() {
+        use crate::{NodeKind, thunk_in};
+
+        // These exist so a consumer does not need a match arm per variant to read a field every
+        // variant carries. They were added without a test, which is precisely the shape that
+        // rots: a variant added later would silently return the wrong thing, or `None`.
+        let reactor = Reactor::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = reactor.subscribe_diagnostics({
+            let events = Rc::clone(&events);
+            move |event| events.borrow_mut().push(event)
+        });
+
+        let source = signal_in(&reactor, 1_u32);
+        let doubled = thunk_in(&reactor, {
+            let source = source.clone();
+            move || source.get() * 2
+        });
+        let effect = reactor.effect({
+            let doubled = doubled.clone();
+            move || {
+                let _ = doubled.get();
+            }
+        });
+        reactor.flush_now();
+        source.set(2);
+        source.set(2); // suppressed at the source
+        reactor.flush_now();
+        effect.dispose();
+
+        let events = events.borrow();
+        assert!(events.len() > 10, "the workload should be varied");
+
+        for event in events.iter() {
+            // Present on every variant without exception.
+            assert_eq!(event.reactor(), reactor.id());
+
+            // `node` must agree with whatever the variant itself carries.
+            match event {
+                DiagnosticEvent::FlushStarted { .. } | DiagnosticEvent::FlushFinished { .. } => {
+                    assert_eq!(event.node(), None, "a flush concerns no single node");
+                    assert_eq!(event.node_origin(), None);
+                }
+                DiagnosticEvent::ReactiveWrite { cause, .. } => {
+                    assert_eq!(event.node(), Some(cause.node));
+                    assert_eq!(event.node_origin(), Some(cause.node_origin));
+                }
+                DiagnosticEvent::NodeCreated { node, origin, .. }
+                | DiagnosticEvent::NodeDisposed { node, origin, .. } => {
+                    assert_eq!(event.node(), Some(*node));
+                    assert_eq!(event.node_origin(), Some(*origin));
+                }
+                _ => assert!(
+                    event.node().is_some(),
+                    "every non-flush event concerns a node: {event:?}"
+                ),
+            }
+
+            // A reported epoch must be a flush that actually happened.
+            if let Some(epoch) = event.flush_epoch() {
+                assert!(epoch <= reactor.graph_stats().flush_epoch);
+            }
+        }
+
+        // The accessors reach the kinds the workload produced, not just one of them.
+        let nodes = events
+            .iter()
+            .filter_map(DiagnosticEvent::node)
+            .collect::<Vec<_>>();
+        assert!(nodes.contains(&source.id()));
+        assert!(nodes.contains(&doubled.id()));
+        assert!(
+            events.iter().any(|e| e.flush_epoch().is_some()),
+            "some events carry a flush"
+        );
+        assert!(
+            events.iter().any(|e| e.flush_epoch().is_none()),
+            "and some legitimately do not"
+        );
+
+        // Every kind is reachable from `all()`, and ids format as a pair without `.get()`.
+        assert_eq!(NodeKind::all().count(), 6);
+        assert_eq!(
+            format!("{}:{}", reactor.id(), source.id()),
+            format!("{}:{}", reactor.id().get(), source.id().get())
+        );
+    }
+
+    #[test]
     fn a_coalesced_mark_is_reported_and_says_it_changed_nothing() {
         // The contract is that `ComputedInvalidated` fires for *every* mark delivered, including
         // one that coalesces into staleness the node already had — that is what exposes

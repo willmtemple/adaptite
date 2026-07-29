@@ -288,6 +288,9 @@ impl<T> core::fmt::Debug for DynObservable<T> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::rc::Rc;
+    use core::cell::Cell;
+
     use super::{DynObservable, Observable};
     use crate::{Reactor, memo_in, signal_in, thunk_in};
 
@@ -413,5 +416,67 @@ mod tests {
 
         base.set(2);
         assert_eq!(total(), 122, "erased handles still track updates");
+    }
+
+    /// `with_peek` exists to read without recording a dependency. Every implementor had it
+    /// untested — including the type-erased path, where a mistake would be invisible.
+    #[test]
+    fn with_peek_reads_without_recording_a_dependency() {
+        use crate::{DynObservable, Reactor, memo_in, signal_in, thunk_in};
+
+        let reactor = Reactor::new();
+        let value = signal_in(&reactor, 7_u32);
+        let computed = thunk_in(&reactor, {
+            let value = value.clone();
+            move || value.get() * 2
+        });
+        let gated = memo_in(&reactor, {
+            let value = value.clone();
+            move || value.get() % 2
+        });
+
+        // Values first: peeking must still see the current value.
+        assert_eq!(value.with_peek(|v| *v), 7);
+        assert_eq!(computed.with_peek(|v| *v), 14);
+        assert_eq!(gated.with_peek(|v| *v), 1);
+
+        let erased: DynObservable<u32> = value.clone().into_dyn();
+        assert_eq!(erased.with_peek(|v| *v), 7);
+        assert!(format!("{erased:?}").contains("DynObservable"));
+
+        // Now the property that matters: an observer that only peeks records nothing, so it is
+        // never re-run. Four peeks, one per implementor, including the erased one.
+        let runs = Rc::new(Cell::new(0));
+        let effect = reactor.effect({
+            let value = value.clone();
+            let computed = computed.clone();
+            let gated = gated.clone();
+            let erased = erased.clone();
+            let runs = Rc::clone(&runs);
+            move || {
+                runs.set(runs.get() + 1);
+                value.with_peek(|_| {});
+                computed.with_peek(|_| {});
+                gated.with_peek(|_| {});
+                erased.with_peek(|_| {});
+            }
+        });
+        reactor.flush_now();
+        assert_eq!(runs.get(), 1);
+        assert_eq!(
+            reactor.observer_count(value.id()),
+            2,
+            "the thunk and the memo read it; the peeking effect did not"
+        );
+
+        value.set(9);
+        reactor.flush_now();
+        assert_eq!(
+            runs.get(),
+            1,
+            "an observer that only peeks must never be re-run"
+        );
+
+        effect.dispose();
     }
 }

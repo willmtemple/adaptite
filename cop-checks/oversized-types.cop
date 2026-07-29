@@ -2,8 +2,16 @@
 # usually doing too much and is hard to review. Flag the worst offenders so they
 # get split. The budget is intentionally generous to keep false positives low;
 # tighten it as the codebase is refactored.
+#
+# Generated code is excluded, the way `module-size.cop` and `single-module-crate.cop`
+# already exclude it. Without this the rule fires on build artifacts: a coverage run
+# with `--doctests` writes a bundle of every doctest in the crate into
+# `target/llvm-cov-target/doctestbins/`, which trips the member budget and fails the
+# local gate for a file nobody wrote.
 
-predicate hasTooManyMembers(Type) => Type.Methods.count() > 90
+predicate isProductionType(Type) => !Type.File.Path:startsWith('target/')
+
+predicate hasTooManyMembers(Type) => isProductionType && Type.Methods.count() > 90
 
 let oversized-types-violations = codebase.Types:hasTooManyMembers
     :toWarning('{item.Name} exposes {item.Methods.count()} members; consider splitting it')
