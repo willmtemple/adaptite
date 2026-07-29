@@ -1505,6 +1505,21 @@ impl ReactorInner {
     }
 
     fn flush_jobs(self: Rc<Self>) {
+        // A drain with nothing to drain is not a flush. `flush_now` runs the queue directly but
+        // cannot unqueue the microtask that `ensure_flush_scheduled` already handed to the
+        // runtime, so that microtask arrives later with an empty queue — and every such arrival
+        // used to open an epoch, emit a Started/Finished pair, and report an empty `FlushStats`.
+        // For an application asking "does my idle window flush?", that turned a settled graph
+        // into a stream of empty flushes with no cause, which is exactly the signal being looked
+        // for. Returning here makes "no flush at all" the honest signature of idle.
+        //
+        // Deliberately not applied to `begin_flush`: `external_flush` is a boundary a consumer
+        // declared, and it should be reported whether or not the drain found work.
+        if self.pending_jobs.borrow().is_empty() {
+            self.flush_scheduled.set(false);
+            return;
+        }
+
         let _span = tracing::debug_span!(
             target: trace_targets::GRAPH,
             "reactor.flush_jobs"

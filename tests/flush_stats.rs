@@ -182,8 +182,15 @@ fn totals_agree_with_the_stream_through_suppression_and_coalescing() {
     reactor.flush_now();
 
     effect.dispose();
+
+    // The disposal happened outside any flush, so it sits in the pending accumulator until a
+    // flush actually runs — and a drain with an empty queue is no longer a flush. Creating an
+    // effect schedules a job, which gives the pending work somewhere to land. Without this the
+    // aggregate legitimately trails the event stream by one disposal.
+    let keeper = reactor.effect(|| {});
     reactor.flush_now();
     assert_consistent(&capture);
+    keeper.dispose();
 }
 
 #[test]
@@ -310,14 +317,25 @@ fn a_settled_graph_reports_an_empty_flush() {
     reactor.flush_now();
     capture.borrow_mut().flushes.clear();
 
-    // Nothing has changed, so a flush over a settled graph is genuinely empty — the assertion an
-    // idle application makes instead of watching a CPU percentage.
+    // Nothing has changed, so there is nothing to drain — and a drain with nothing to drain is
+    // not a flush. "No flush at all" is the signature of idle, which is the assertion an idle
+    // application makes instead of watching a CPU percentage.
     reactor.flush_now();
+    assert!(
+        capture.borrow().flushes.is_empty(),
+        "a settled graph must not flush at all, got {:?}",
+        capture.borrow().flushes
+    );
+
+    // A consumer-declared boundary is different: `external_flush` is reported whether or not the
+    // drain found work, because the consumer said a drain happened. That is where an *empty*
+    // `FlushStats` still shows up, and what `is_empty()` is for.
+    reactor.external_flush(|| {});
     let flushes = capture.borrow().flushes.clone();
-    assert_eq!(flushes.len(), 1);
+    assert_eq!(flushes.len(), 1, "the declared boundary is still reported");
     assert!(
         flushes[0].is_empty(),
-        "a settled graph must produce an empty flush, got {:?}",
+        "and it did no work, got {:?}",
         flushes[0]
     );
 

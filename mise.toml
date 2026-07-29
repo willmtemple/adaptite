@@ -68,7 +68,7 @@ shell = "bash -c"
 run = """
 set -euo pipefail
 for ex in spreadsheet stock_ticker screen_router signal_thunk_showcase \
-          tracing_subscriber_showcase readme_md_01 readme_md_02 readme_md_03; do
+          tracing_subscriber_showcase idle_audit readme_md_01 readme_md_02 readme_md_03; do
   echo "== example: $ex =="
   cargo run --quiet --example "$ex"
 done

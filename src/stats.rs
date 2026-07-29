@@ -161,6 +161,19 @@ impl GraphStats {
 /// - Work performed outside any flush — most importantly the writes that scheduled it — is
 ///   handed to the flush that drains it. A write and the effect run it causes therefore appear
 ///   in the same totals, which is what makes `root_writes` answer "what set this flush off".
+///   The corollary: work never followed by a flush is never reported. Disposing an effect and
+///   then stopping, for example, accumulates a disposal that no flush arrives to carry. That is
+///   deliberate — a drain with an empty queue is not a flush, and making one happen because
+///   diagnostics are subscribed would break the rule that subscribing never changes behaviour.
+///   In an application, where flushes keep coming, it is invisible.
+///
+/// # A settled graph does not flush
+///
+/// A drain with nothing to drain is not a flush: it opens no epoch and reports nothing. So the
+/// signature of an idle application is **no flushes at all**, not a stream of empty ones. An
+/// empty `FlushStats` still occurs for a boundary a consumer declared with
+/// [`Reactor::external_flush`](crate::Reactor::external_flush), which is reported whether or not
+/// the drain found work — see `examples/idle_audit.rs`.
 ///
 /// # No durations
 ///
@@ -619,12 +632,22 @@ mod tests {
         assert_eq!(idle.pending_jobs, 0);
         assert_eq!(idle.flush_depth, 0);
 
-        // A write that changes nothing still costs a flush, but leaves nothing behind.
+        // `set` compares before writing, so an unchanged value never reaches the graph and
+        // cannot cost a flush.
         let flushes_before = idle.flushes;
         value.set(0);
         reactor.flush_now();
+        assert_eq!(
+            reactor.graph_stats().flushes,
+            flushes_before,
+            "an equal `set` is suppressed at the signal, before the graph hears about it"
+        );
+
+        // A real write costs exactly one flush and leaves nothing behind.
+        value.set(1);
+        reactor.flush_now();
         let after = reactor.graph_stats();
-        assert!(after.flushes > flushes_before);
+        assert_eq!(after.flushes, flushes_before + 1);
         assert_eq!(after.queued_effects, 0);
         assert_eq!(after.pending_jobs, 0);
 

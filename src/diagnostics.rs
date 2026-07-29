@@ -987,14 +987,19 @@ mod tests {
                 }
             }
         });
+        // Real work, so a flush actually happens: a settled graph does not flush at all.
+        source.set(99);
         reactor.flush_now();
 
         let flushes = flushes.borrow();
         assert_eq!(flushes.len(), 1);
-        assert!(
-            flushes[0].is_empty(),
-            "a new subscriber must not inherit totals from a window it could not observe: {:?}",
-            flushes[0]
+        assert_eq!(
+            flushes[0].root_writes, 1,
+            "only the write made while subscribed is counted"
+        );
+        assert_eq!(
+            flushes[0].effects_run, 1,
+            "a new subscriber must not inherit totals from a window it could not observe"
         );
 
         effect.dispose();
@@ -1084,10 +1089,15 @@ mod tests {
             }
         });
 
-        // A job that flushes re-entrantly bumps the shared epoch mid-flush.
+        // A job that queues more work and then flushes re-entrantly bumps the shared epoch
+        // mid-flush. The inner job matters: a drain with an empty queue is no longer a flush at
+        // all, so without it there would be no nesting to observe.
         reactor.schedule({
             let reactor = reactor.clone();
-            move || reactor.flush_now()
+            move || {
+                reactor.schedule(|| {});
+                reactor.flush_now();
+            }
         });
         reactor.flush_now();
 
