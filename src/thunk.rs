@@ -736,10 +736,35 @@ impl<T> ThunkInner<T> {
         };
         let next = self.reactor.run_in_context(self.id, || (self.compute)());
         guard.armed = false;
-        *self.value.borrow_mut() = Some(next);
+        match self.value.try_borrow_mut() {
+            Ok(mut slot) => *slot = Some(next),
+            Err(_) => report_value_busy(&self.reactor, self.id, "thunk"),
+        }
         // A thunk has no equality comparator, so every recomputation counts as a change.
         self.reactor.bump_version(self.id);
     }
+}
+
+/// Reports a recomputation that collided with a live borrow of the cached value.
+///
+/// Reachable from ordinary code: a closure passed to `with` or `with_peek` holds a shared borrow
+/// of the value for its whole body, so invalidating that same node and reading it back inside the
+/// closure forces a recomputation that must replace the value the closure is still holding.
+/// Without this the consumer sees a bare `RefCell already borrowed` naming neither the node, its
+/// origin, nor `with` — an implementation detail they never chose, in a build with no debug info.
+#[cold]
+#[inline(never)]
+fn report_value_busy(reactor: &Reactor, id: NodeId, kind: &str) -> ! {
+    let origin = reactor
+        .node_origin(id)
+        .map(|location| location.to_string())
+        .unwrap_or_else(|| "<unknown>".into());
+    panic!(
+        "adaptite: the {kind} created at {origin} had to recompute while its cached value was \
+         still borrowed. A closure passed to `with` or `with_peek` holds that borrow for its \
+         whole body, so invalidating this {kind} and reading it back from inside the closure \
+         cannot work. Clone or copy what you need out of the closure, then invalidate"
+    )
 }
 
 struct MemoInner<T> {
@@ -813,7 +838,10 @@ impl<T> MemoInner<T> {
                 None => true,
             }
         };
-        *self.value.borrow_mut() = Some(next);
+        match self.value.try_borrow_mut() {
+            Ok(mut slot) => *slot = Some(next),
+            Err(_) => report_value_busy(&self.reactor, self.id, "memo"),
+        }
         if changed {
             self.reactor.bump_version(self.id);
         }

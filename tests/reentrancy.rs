@@ -105,3 +105,70 @@ fn a_diagnostic_subscriber_may_schedule_work_while_a_flush_is_opening() {
     );
     drop((observer, driver));
 }
+
+/// A closure passed to `with` holds a borrow of the cached value for its whole body, so
+/// invalidating that node and reading it back from inside the closure cannot work. That is
+/// documented — but it used to surface as a bare `RefCell already borrowed`, naming neither the
+/// node, its origin, nor `with`. In a release build that is close to nothing to go on.
+#[test]
+fn a_thunk_that_recomputes_while_borrowed_names_itself() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let reactor = Reactor::new();
+    let source = adaptite::signal_in(&reactor, 0u32);
+    let thunk = adaptite::thunk_in(&reactor, {
+        let source = source.clone();
+        move || source.get()
+    });
+    let _ = thunk.get();
+
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        thunk.with(|_value| {
+            source.set(1);
+            let _ = thunk.get();
+        });
+    }))
+    .expect_err("invalidating and re-reading inside `with` should panic");
+
+    let message = payload
+        .downcast_ref::<String>()
+        .expect("the diagnosis is formatted, so the payload is a String");
+    assert!(
+        message.contains("thunk created at") && message.contains("tests/reentrancy.rs"),
+        "the message should name the thunk and its origin, got: {message}"
+    );
+    assert!(
+        message.contains("`with`"),
+        "the message should name the API that holds the borrow, got: {message}"
+    );
+}
+
+/// The same for `Memo`, which stores its value through a different path.
+#[test]
+fn a_memo_that_recomputes_while_borrowed_names_itself() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let reactor = Reactor::new();
+    let source = adaptite::signal_in(&reactor, 0u32);
+    let memo = adaptite::memo_in(&reactor, {
+        let source = source.clone();
+        move || source.get()
+    });
+    let _ = memo.get();
+
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        memo.with(|_value| {
+            source.set(1);
+            let _ = memo.get();
+        });
+    }))
+    .expect_err("invalidating and re-reading inside `with` should panic");
+
+    let message = payload
+        .downcast_ref::<String>()
+        .expect("the diagnosis is formatted, so the payload is a String");
+    assert!(
+        message.contains("memo created at") && message.contains("tests/reentrancy.rs"),
+        "the message should name the memo and its origin, got: {message}"
+    );
+}

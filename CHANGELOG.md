@@ -195,6 +195,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maintained counter rather than the length of the dependents index, because emptied entries
   are retained across an observer's rerun. The value is unchanged and is asserted against a
   walk of the graph in the test suite.
+- Teardown now installs an owner *barrier*, closing a silent leak. `OwnerFrame::reset` ran
+  cleanups and child disposals without establishing an owner, so they saw whatever owner happened
+  to enclose the teardown. A host that calls `flush_now` from inside a `scope` leaves that scope
+  on the owner stack while an effect re-runs and tears down — so a cleanup that registered a
+  cleanup had it silently adopted by the enclosing scope, outliving the effect it belonged to and
+  running when that outer scope died, which for an application root is never. Registering a
+  cleanup during teardown is now reported rather than redirected.
+- `on_cleanup` called from inside a cleanup says so. It previously claimed the caller was
+  "outside a reactive owner", which is false when the caller is demonstrably inside one being
+  torn down, and sent the reader after a missing `scope` that was never the problem.
+- A thunk or memo that must recompute while its cached value is borrowed now names itself. A
+  closure passed to `with` or `with_peek` holds that borrow for its whole body, so invalidating
+  the node and reading it back from inside the closure cannot work — documented, but it surfaced
+  as a bare `RefCell already borrowed` naming neither the node, its origin, nor `with`. The
+  diagnosis now carries all three and says what to do instead.
 - The divergence guard is now enforced in **every** build, not only debug. A non-convergent
   feedback loop used to panic with a precise diagnosis in debug and hang `flush_now` forever in
   release — no panic, no log, nothing for a user to report, and for a GUI host a permanently
