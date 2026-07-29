@@ -485,9 +485,10 @@ mod tests {
 
     #[test]
     fn a_graph_nobody_flushes_is_visible_as_a_graph_nobody_flushes() {
-        // Kiln's second bug: signals created outside a render landed on a reactor nobody
-        // flushed, so reads and writes worked and nothing re-rendered. From inside that reactor
-        // the failure is invisible; from outside, the whole graph is one unobserved node.
+        // The silent failure this makes visible: state created while no reactor was entered
+        // lands on a fresh graph nobody flushes, so reads and writes work and nothing ever
+        // re-runs. From inside that reactor there is nothing to see; from outside, the whole
+        // graph is one unobserved node that has never been flushed.
         let application = Reactor::new();
         let stranded = Reactor::new();
 

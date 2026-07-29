@@ -1166,6 +1166,11 @@ impl Reactor {
     /// Returns the identity of the logical drain in progress: the outermost flush and everything
     /// nested inside it. Used by the divergence guard, which must not be resettable by a
     /// re-entrant `flush_now`.
+    ///
+    /// The guard is debug-only, so this has no caller in an optimized build. The *field* is still
+    /// maintained there — one `Cell` write per outermost flush — because making the flush paths
+    /// differ between profiles would be a far worse trade than that increment.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn drain_epoch(&self) -> u64 {
         self.inner.drain_epoch.get()
     }

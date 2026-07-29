@@ -60,8 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued/coalesced/run/skipped/disposed/pending, computed nodes
   verified/recomputed/changed/suppressed, edges added and removed, and the job queue depth
   at both ends. `FlushStats::is_empty()` is the assertion an idle application wants: a
-  settled graph produces either no flush or an empty one, so "idle is idle" stops being a
-  CPU percentage that varies between runs of the same build.
+  settled graph does not flush at all (see the `Changed` entry below), and an `external_flush`
+  over one reports an empty `FlushStats` — either way "idle is idle" stops being a CPU
+  percentage that varies between runs of the same build.
   Work is attributed to **the next flush that closes**, exactly once. An inner flush's
   totals are not rolled up into the enclosing one, so summing a capture double-counts
   nothing; and work performed outside any flush — the writes that scheduled it — is handed
@@ -166,6 +167,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not — the shape behind "a pane re-rendered at the frame rate because an unchanged value was
   written every tick". Deliberately small enough to copy into an application: what counts as
   "settled" is an application's policy, not a reactive graph's.
+- [`docs/MIGRATING-0.3.md`](docs/MIGRATING-0.3.md) covers the two changes that need action
+  (variant patterns needing `..`, and runite 0.3) and the three behaviour changes that need
+  none but are worth knowing: a settled graph no longer flushes, teardown is total, and the
+  ambient-reactor warning fires in more cases.
 - [`docs/diagnostics.md`](docs/diagnostics.md) states the whole contract in one place:
   identity and id-reuse rules, the callback contract, dormancy, pairing and panic
   semantics for every started/finished pair, flush attribution under nesting, which

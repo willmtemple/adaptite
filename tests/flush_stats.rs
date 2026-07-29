@@ -344,10 +344,11 @@ fn a_settled_graph_reports_an_empty_flush() {
 
 #[test]
 fn a_producer_that_runs_more_often_than_it_publishes_is_visible() {
-    // Kiln's case: a sampler wrote its signal ~80 times and changed it 14. The equality gate
-    // saves the re-render and hides the work, so the propagation stream — which by construction
-    // only sees writes that propagated — reports the 14 and nothing else. `writes_suppressed` and
-    // `WriteSuppressed` are what make the other 66 attributable to the site that made them.
+    // The shape this exists for: a sampler that writes its signal far more often than the value
+    // moves. The equality gate saves the re-render and hides the work, so the propagation stream —
+    // which by construction only sees writes that propagated — reports the changes and nothing
+    // else. `writes_suppressed` and `WriteSuppressed` make the rest attributable to the site that
+    // produced them.
     let reactor = Reactor::new();
     let (capture, _subscription) = Capture::install(&reactor);
 

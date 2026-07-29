@@ -186,12 +186,12 @@ fn a_panicking_cleanup_does_not_strand_the_gauge() {
         assert_eq!(
             ran.get(),
             1,
-            "the sibling cleanup still runs — teardown is total (#28)"
+            "the sibling cleanup still runs: teardown is total"
         );
 
-        // What #24 is responsible for holds either way: the pending set is accounted at the
+        // The gauges hold regardless of how teardown goes: the pending set is accounted at the
         // moment it is taken, not as each entry completes, so a panic partway through cannot
-        // leave the gauge overstated. This is the assertion that has to survive #28.
+        // leave a gauge overstated.
         let after = ownership_stats();
         assert_eq!(after.cleanup_registrations, before.cleanup_registrations);
         assert_eq!(after.cleanups_run - before.cleanups_run, 2);

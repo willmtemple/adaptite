@@ -41,6 +41,11 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # Debug-only code paths (the divergence guard, the ownership audit registry) leave their
+      # helpers unused in an optimized build, so `cfg` mistakes are invisible to the debug lint
+      # above. Two real dead-code findings came from this before it was a CI step.
+      - name: Clippy (release profile)
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
       # Advisory: an application can only reach the runite minor adaptite
       # declares, so a new runite minor is invisible downstream until adaptite
       # releases against it. Non-blocking because it depends on the network and

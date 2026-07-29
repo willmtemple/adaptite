@@ -238,9 +238,9 @@ pub struct FlushStats {
 impl FlushStats {
     /// Returns `true` when the flush did no reactive work at all.
     ///
-    /// The assertion an idle application wants: a settled graph produces either no flush or an
-    /// empty one, and "idle is idle" stops being a CPU percentage that varies between runs of the
-    /// same build.
+    /// A settled graph does not flush at all, so an idle application usually asserts that no
+    /// flush arrived. This is for the flush an [`Reactor::external_flush`](crate::Reactor::external_flush)
+    /// reports over a settled graph — the boundary was declared, but there was nothing to do.
     ///
     /// Deliberately ignores [`jobs_at_start`](Self::jobs_at_start) and
     /// [`jobs_at_finish`](Self::jobs_at_finish), which describe the queue rather than work done.
@@ -337,40 +337,40 @@ pub(crate) struct GraphCounters {
 impl GraphCounters {
     /// Records an allocation. `live_nodes` is the node count *including* the new node.
     pub(crate) fn node_created(&self, kind: NodeKind, live_nodes: usize) {
-        bump(&self.live_nodes_by_kind[kind.index()], 1);
-        bump(&self.nodes_created, 1);
+        add(&self.live_nodes_by_kind[kind.index()], 1);
+        tick(&self.nodes_created, 1);
         raise(&self.peak_nodes, live_nodes);
     }
 
     /// Records a disposal. Called only when the node was actually live, so the by-kind gauge
     /// cannot go negative on a repeated dispose.
     pub(crate) fn node_disposed(&self, kind: NodeKind) {
-        drop_by(&self.live_nodes_by_kind[kind.index()], 1);
-        bump(&self.nodes_disposed, 1);
+        sub(&self.live_nodes_by_kind[kind.index()], 1);
+        tick(&self.nodes_disposed, 1);
     }
 
     /// Records one newly recorded dependency edge.
     pub(crate) fn edge_added(&self) {
         let live = self.live_edges.get() + 1;
         self.live_edges.set(live);
-        bump(&self.edges_added, 1);
+        tick(&self.edges_added, 1);
         raise(&self.peak_edges, live);
     }
 
     /// Records `count` edges retracted at once, as observer teardown does.
     pub(crate) fn edges_removed(&self, count: usize) {
-        drop_by(&self.live_edges, count);
-        bump(&self.edges_removed, count as u64);
+        sub(&self.live_edges, count);
+        tick(&self.edges_removed, count as u64);
     }
 
     /// Records an effect acquiring a pending run.
     pub(crate) fn effect_queued(&self) {
-        bump(&self.queued_effects, 1);
+        add(&self.queued_effects, 1);
     }
 
     /// Records a pending run being executed or discarded.
     pub(crate) fn effect_unqueued(&self) {
-        drop_by(&self.queued_effects, 1);
+        sub(&self.queued_effects, 1);
     }
 
     /// Effects currently holding a pending run.
@@ -380,7 +380,7 @@ impl GraphCounters {
 
     /// Records a flush opening.
     pub(crate) fn flush_opened(&self) {
-        bump(&self.flushes, 1);
+        tick(&self.flushes, 1);
     }
 
     /// Records the queue depth after a job was pushed.
@@ -422,43 +422,29 @@ impl GraphCounters {
     }
 }
 
-fn bump<T: Counter>(cell: &Cell<T>, by: T) {
-    cell.set(cell.get().saturating_add(by));
+/// Adds to a live gauge.
+///
+/// Saturating, like every counter helper here, so a gauge can never wrap into a nonsense reading
+/// if an accounting path is ever missed. A stuck-at-zero gauge is a visible bug; a gauge reading
+/// `usize::MAX` looks like a leak.
+fn add(cell: &Cell<usize>, n: usize) {
+    cell.set(cell.get().saturating_add(n));
 }
 
-/// Saturating, so a gauge can never wrap into a nonsense reading if an accounting path is ever
-/// missed. A stuck-at-zero gauge is a visible bug; a gauge reading `usize::MAX` looks like a leak.
-fn drop_by<T: Counter>(cell: &Cell<T>, by: T) {
-    cell.set(cell.get().saturating_sub(by));
+/// Subtracts from a live gauge.
+fn sub(cell: &Cell<usize>, n: usize) {
+    cell.set(cell.get().saturating_sub(n));
 }
 
+/// Advances a cumulative total, which only ever grows.
+fn tick(cell: &Cell<u64>, n: u64) {
+    cell.set(cell.get().saturating_add(n));
+}
+
+/// Raises a high-water mark.
 fn raise(cell: &Cell<usize>, value: usize) {
     if value > cell.get() {
         cell.set(value);
-    }
-}
-
-/// Saturating arithmetic over the two counter widths, so `bump`/`drop_by` stay generic.
-pub(crate) trait Counter: Copy {
-    fn saturating_add(self, other: Self) -> Self;
-    fn saturating_sub(self, other: Self) -> Self;
-}
-
-impl Counter for usize {
-    fn saturating_add(self, other: Self) -> Self {
-        usize::saturating_add(self, other)
-    }
-    fn saturating_sub(self, other: Self) -> Self {
-        usize::saturating_sub(self, other)
-    }
-}
-
-impl Counter for u64 {
-    fn saturating_add(self, other: Self) -> Self {
-        u64::saturating_add(self, other)
-    }
-    fn saturating_sub(self, other: Self) -> Self {
-        u64::saturating_sub(self, other)
     }
 }
 

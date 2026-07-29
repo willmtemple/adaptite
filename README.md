@@ -49,9 +49,9 @@ Because that scheduling goes through runite's thread-local queues, adaptite and
 the application must resolve the **same** runite: two copies in one dependency
 tree means two queues, and adaptite's reactive work is flushed by a runtime
 nobody is driving. Adaptite therefore depends on a single runite minor at a time
-(`runite = "0.2"` for adaptite 0.2), and reaching a newer runite minor requires
-an adaptite release against it. An application should not pin runite itself; take
-whatever adaptite resolves.
+— the exact requirement is in adaptite's `Cargo.toml` — and reaching a newer
+runite minor requires an adaptite release against it. An application should not
+pin runite itself; take whatever adaptite resolves.
 
 Adaptite does not function across thread boundaries. It tracks dependencies
 between entities on the same thread only. Async work feeds the graph from the
@@ -120,10 +120,10 @@ assert_eq!(*painted.borrow(), [1]);
 # effect.dispose();
 ```
 
-Draining inside `Reactor::external_flush` gives the whole drain one flush epoch,
-which keeps the debug divergence guard meaningful across it and reports the
-drain to diagnostic consumers as a single flush. A run executed outside any
-flush opens one of its own. `EffectRun::run` must happen on the reactor's
+Draining inside `Reactor::external_flush` reports the whole drain to diagnostic
+consumers as a single flush rather than one per effect. A run executed outside
+any flush opens one of its own. (The debug divergence guard counts per *drain*
+rather than per flush, so it stays meaningful across nested flushes either way.) `EffectRun::run` must happen on the reactor's
 thread — verification and the effect body always do.
 
 Discarding an `EffectRun` instead of running it is legal: the effect keeps its
@@ -136,8 +136,9 @@ An effect may write state it depends on, as long as the loop converges — for
 example clamping a value, normalizing input, or syncing two representations.
 Convergence is reached when the rewritten value is equal to the existing one
 and the write is suppressed. A loop that never converges is a bug: in debug
-builds, an effect that runs more than 100 times in a single flush panics with
-the effect's creation site instead of hanging the event loop.
+builds, an effect that runs more than 100 times in a single *drain* — the
+outermost flush and everything nested inside it — panics with the effect's
+creation site instead of hanging the event loop.
 
 Synchronous read cycles (a thunk whose computation reads itself, directly or
 transitively) have no convergent interpretation and always panic, reporting
@@ -469,6 +470,13 @@ origin, version and staleness, and every edge, for an inspector or a
 post-mortem rather than a per-frame check. And each `FlushFinished` event
 carries a `FlushStats` saying what that flush actually did, so a settled graph
 can be *asserted* idle rather than inferred idle from a CPU percentage.
+
+A graph can be clean and still leak, because ownership retains what the graph
+never sees — an effect that never re-runs keeps every cleanup it registered.
+`ownership_stats()` reports live owner frames, pending cleanups and owned
+children for the calling thread, and in tests
+`debug_assert_ownership_consistent()` checks those counts against a walk of the
+live owner tree.
 
 The full contract — identity, pairing and panic semantics, flush attribution,
 which counters are always maintained, and what it costs — is in

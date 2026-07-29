@@ -22,6 +22,10 @@ exclude = [
   "mise.toml",
   "rust-toolchain.toml",
   "ROADMAP.md",
+  # Process record of the 0.3 review with downstream consumers: quotes their repositories,
+  # names unreleased plans, and answers questions a crates.io user never asked. `docs/` is
+  # otherwise user-facing (the diagnostics contract, migration guides) and does ship.
+  "/docs/0.3-consumer-responses.md",
 ]
 
 [dependencies]

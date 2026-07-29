@@ -4,28 +4,28 @@ adaptite can explain itself: which write caused which effect to run, what a flus
 graph is holding, and where every node came from. This document is the contract that surface
 comes with — what is guaranteed, what it costs, and what is deliberately absent.
 
-Three mechanisms, with different rules:
+Four surfaces, with different rules:
 
 | | What it answers | Cost | Availability |
 |---|---|---|---|
-| [`DiagnosticEvent`] stream | *Why* — causality, ordering | Dormant without a subscriber | Opt-in via `subscribe_diagnostics` |
+| [`DiagnosticEvent`] stream, including [`FlushStats`] | *Why* — causality and ordering, and what each flush cost | Dormant without a subscriber | Opt-in via `subscribe_diagnostics` |
 | [`GraphStats`] | *How much* — what the graph holds | `O(1)`, no walk | **Always maintained** |
-| [`GraphSnapshot`] | *What* — every node and edge | `O(nodes + edges)`, allocates | On demand |
 | [`OwnershipStats`] | *What is retained* — owner frames, cleanups, children | `O(1)`, no walk | **Always maintained**, thread-scoped |
+| [`GraphSnapshot`] | *What* — every node and edge | `O(nodes + edges)`, allocates | On demand |
 
-The governing rule for the second and third rows:
+One rule decides that last column:
 
 > **Counters that back a query are always maintained. Counters that back an event follow the
 > event.**
 
-`GraphStats` backs `Reactor::graph_stats()`, which can be called at any moment, so its numbers
-must always be true. `FlushStats` is only ever *observed* by being delivered on
-`FlushFinished`, and an event nobody subscribed to is not delivered — so those counters are
-maintained only while a subscription is active.
+`GraphStats` and `OwnershipStats` back queries that can be called at any moment, so their numbers
+must always be true. `FlushStats` is only ever *observed* by being delivered on `FlushFinished`,
+and an event nobody subscribed to is not delivered — so those counters are maintained only while a
+subscription is active.
 
 ---
 
-### Ownership is thread-scoped, not per-reactor
+## Ownership is thread-scoped, not per-reactor
 
 [`OwnershipStats`] is the one thing here that is not keyed by reactor, and that is not an
 oversight. Ownership in adaptite is a thread-local stack: a [`scope`] has no reactor and never
@@ -38,7 +38,7 @@ keeps every cleanup it registered; a scope nobody disposed keeps its children; a
 held one generation too long keeps a whole subtree. The nodes are gone and the closures are not,
 so [`GraphStats`] cannot see any of it.
 
-### Keeping a gauge honest
+## Keeping a gauge honest
 
 A gauge nobody checks drifts, and a drifted leak gauge is worse than none — it makes a real leak
 look fine. Two mechanisms, and the choice between them is worth copying for any counter added
@@ -240,8 +240,9 @@ and counted exactly once.
   design, so it contributes no separate totals. Only the outermost `external_flush` opens one.
 
 `FlushStats::is_empty()` ignores the job-queue depths and asks only whether any reactive work
-happened. A settled graph produces either no flush or an empty one — the assertion an idle
-application should make instead of watching a CPU percentage.
+happened. A settled graph does not flush at all, so the usual idle assertion is that no flush
+arrived; `is_empty()` is for the flush an `external_flush` reports over a settled graph, where the
+boundary was declared but there was nothing to do.
 
 One arithmetic caveat worth knowing: `computed_changed + computed_suppressed` is **at most**
 `computed_recomputed`, not equal to it. A computation that unwound published nothing and is

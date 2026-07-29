@@ -38,8 +38,9 @@ const MAX_RUNS_PER_FLUSH: u32 = 100;
 ///
 /// # Panics
 ///
-/// Debug builds panic when the effect runs more than 100 times within a single flush, which
-/// indicates a divergent feedback loop: the effect writes state it (transitively) depends on
+/// Debug builds panic when the effect runs more than 100 times within a single *drain* — the
+/// outermost flush and everything nested inside it, so a re-entrant
+/// [`Reactor::flush_now`] cannot reset the count — which indicates a divergent feedback loop: the effect writes state it (transitively) depends on
 /// with a value that never converges. The panic message names the effect's creation site.
 /// Convergent feedback (for example clamping, where the rewritten value is suppressed by the
 /// signal's equality check) is legal and settles well below the limit.
@@ -728,7 +729,7 @@ impl EffectInner {
         });
     }
 
-    /// Panics when this effect keeps re-running within a single flush, which indicates a
+    /// Panics when this effect keeps re-running within a single drain, which indicates a
     /// divergent feedback loop: the effect writes state it (transitively) depends on with a
     /// value that never converges.
     ///
@@ -904,7 +905,7 @@ mod tests {
         );
 
         // Every effect-shaped event in the stream is attributable to the handle without any
-        // private access — RUIN's acceptance criterion for this pair.
+        // private access, which is the whole point of exposing the id there.
         let effect_events = events
             .borrow()
             .iter()
