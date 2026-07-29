@@ -26,6 +26,9 @@ exclude = [
   # names unreleased plans, and answers questions a crates.io user never asked. `docs/` is
   # otherwise user-facing (the diagnostics contract, migration guides) and does ship.
   "/docs/0.3-consumer-responses.md",
+  # Design survey of other reactive systems: useful for deciding what to build, not for using
+  # the crate, and it quotes other projects at length.
+  "/docs/prior-art.md",
 ]
 
 [dependencies]
