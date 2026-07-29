@@ -542,7 +542,7 @@ impl Reactor {
                 .expect("active computation should appear in observer stack");
             let mut cycle = stack[start..].to_vec();
             cycle.push(observable);
-            let origins = cycle.iter().map(|node| self.origin(*node)).collect();
+            let origins = cycle.iter().map(|node| self.node_origin(*node)).collect();
             tracing::debug!(
                 target: trace_targets::GRAPH,
                 event = "cycle_detected",
@@ -679,7 +679,7 @@ impl Reactor {
         self.bump_version(observable);
         let write_origin = Location::caller();
         let cause = if self.diagnostics_enabled() {
-            self.origin(observable)
+            self.node_origin(observable)
                 .map(|node_origin| InvalidationCause {
                     node: observable,
                     version: self.version(observable),
@@ -781,11 +781,121 @@ impl Reactor {
     /// use is garbage collection in fine-grained data structures — dropping per-key
     /// [`crate::Source`] nodes that no longer have readers.
     pub fn is_observed(&self, node: NodeId) -> bool {
+        self.observer_count(node) > 0
+    }
+
+    /// Returns how many observers currently record a dependency on `node`.
+    ///
+    /// `O(1)` and allocation-free — the dependent set is already indexed by node — so this is the
+    /// query to reach for on a hot path or in a per-frame assertion. A reactive graph leaks by
+    /// accumulating observers that never detach, and this is the number that says so.
+    ///
+    /// Carries the same recorded-edge semantics as [`is_observed`](Self::is_observed): the count
+    /// can be late (an observer that stopped reading `node` still counts until it re-runs or is
+    /// disposed) but never early.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::{Reactor, memo_in, signal_in};
+    ///
+    /// let reactor = Reactor::new();
+    /// let value = signal_in(&reactor, 1);
+    /// assert_eq!(reactor.observer_count(value.id()), 0);
+    ///
+    /// let doubled = memo_in(&reactor, {
+    ///     let value = value.clone();
+    ///     move || value.get() * 2
+    /// });
+    /// assert_eq!(doubled.get(), 2);
+    /// assert_eq!(reactor.observer_count(value.id()), 1);
+    /// ```
+    pub fn observer_count(&self, node: NodeId) -> usize {
         self.inner
             .dependents
             .borrow()
             .get(&node)
-            .is_some_and(|observers| !observers.is_empty())
+            .map_or(0, |observers| observers.len())
+    }
+
+    /// Returns the observers that currently record a dependency on `node`.
+    ///
+    /// The enumerating counterpart to [`observer_count`](Self::observer_count), for an inspector
+    /// or a post-mortem that needs to name the observers rather than count them. It copies the
+    /// set out, so prefer `observer_count` when only the number is wanted.
+    pub fn dependents_of(&self, node: NodeId) -> Vec<NodeId> {
+        self.inner
+            .dependents
+            .borrow()
+            .get(&node)
+            .map(|observers| observers.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns the dependencies recorded during `node`'s last run, each with the version of that
+    /// dependency observed at the time.
+    ///
+    /// This is the edge set that dependency verification compares against, and reading it is how
+    /// a consumer answers "why did this update": the dependency whose current
+    /// [`version`](Self::node_version) differs from the version recorded here is the one that
+    /// invalidated `node`.
+    ///
+    /// A snapshot, copied out so no borrow is held across graph mutation. Nothing is refreshed
+    /// and no reactive computation runs — this is not a read and never records a dependency of
+    /// its own.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::{Reactor, memo_in, signal_in};
+    ///
+    /// let reactor = Reactor::new();
+    /// let value = signal_in(&reactor, 1);
+    /// let doubled = memo_in(&reactor, {
+    ///     let value = value.clone();
+    ///     move || value.get() * 2
+    /// });
+    /// assert_eq!(doubled.get(), 2);
+    ///
+    /// let dependencies = reactor.dependencies_of(doubled.id());
+    /// assert_eq!(dependencies.len(), 1);
+    /// assert_eq!(dependencies[0].0, value.id());
+    ///
+    /// // The recorded version is what a later write is compared against.
+    /// value.set(2);
+    /// assert_ne!(reactor.node_version(value.id()), Some(dependencies[0].1));
+    /// ```
+    pub fn dependencies_of(&self, node: NodeId) -> Vec<(NodeId, u64)> {
+        self.inner
+            .dependencies
+            .borrow()
+            .get(&node)
+            .map(|edges| edges.iter().map(|(id, version)| (*id, *version)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns the source location at which `node` was created, or `None` if it is not live.
+    ///
+    /// Every node records its creation site via `#[track_caller]`. Until now that origin was
+    /// reachable only when adaptite chose to hand it over — in a [`ReactCycleError`], in the
+    /// divergence panic, or attached to a diagnostic event. This answers for any node, which is
+    /// what an inspector, a leak report, or a post-mortem needs.
+    ///
+    /// `None` means the node has been disposed or never existed; ids are never reused, so it
+    /// cannot mean "some other node now".
+    pub fn node_origin(&self, node: NodeId) -> Option<&'static Location<'static>> {
+        self.inner.meta.borrow().get(&node).map(|meta| meta.origin)
+    }
+
+    /// Returns `node`'s current version, or `None` if it is not live.
+    ///
+    /// The version increments whenever the node's value changes — every write for a source, and
+    /// every recomputation that a memo's comparator does not suppress. Comparing it against the
+    /// version recorded in [`dependencies_of`](Self::dependencies_of) is how verification decides
+    /// whether an observer must re-run, and comparing two samples is how a consumer detects
+    /// change without subscribing.
+    pub fn node_version(&self, node: NodeId) -> Option<u64> {
+        self.inner.meta.borrow().get(&node).map(|meta| meta.version)
     }
 
     /// Disposes all graph bookkeeping for `node`.
@@ -1007,29 +1117,12 @@ impl Reactor {
     }
 
     /// Returns the current version of `node`, or 0 if the node is unknown.
+    ///
+    /// The internal counterpart to [`node_version`](Self::node_version): verification compares
+    /// versions on every dependency of every observer it checks, and an absent node comparing
+    /// equal to a never-written one is the behaviour that path wants.
     pub(crate) fn version(&self, node: NodeId) -> u64 {
-        self.inner
-            .meta
-            .borrow()
-            .get(&node)
-            .map(|meta| meta.version)
-            .unwrap_or(0)
-    }
-
-    /// Returns the source location at which `node` was created.
-    pub(crate) fn origin(&self, node: NodeId) -> Option<&'static Location<'static>> {
-        self.inner.meta.borrow().get(&node).map(|meta| meta.origin)
-    }
-
-    /// Returns the dependencies recorded during `observer`'s last run, with the version of each
-    /// dependency observed at that time.
-    pub(crate) fn dependencies_of(&self, observer: NodeId) -> Vec<(NodeId, u64)> {
-        self.inner
-            .dependencies
-            .borrow()
-            .get(&observer)
-            .map(|edges| edges.iter().map(|(id, version)| (*id, *version)).collect())
-            .unwrap_or_default()
+        self.node_version(node).unwrap_or(0)
     }
 
     /// Returns the number of the currently running (or most recent) job flush.
@@ -1504,6 +1597,107 @@ mod tests {
             reactor.inner.dependents.borrow().get(&observable),
             Some(&[observer].into_iter().collect())
         );
+    }
+
+    #[test]
+    fn the_public_queries_answer_why_did_this_update() {
+        use crate::{memo_in, signal_in};
+
+        let reactor = Reactor::new();
+        let left = signal_in(&reactor, 1_u32);
+        let right = signal_in(&reactor, 10_u32);
+        let total = memo_in(&reactor, {
+            let left = left.clone();
+            let right = right.clone();
+            move || left.get() + right.get()
+        });
+        assert_eq!(total.get(), 11);
+
+        // Both inputs are observed once, by the memo.
+        assert_eq!(reactor.observer_count(left.id()), 1);
+        assert_eq!(reactor.observer_count(right.id()), 1);
+        assert_eq!(reactor.dependents_of(left.id()), vec![total.id()]);
+
+        // Snapshot the edges as the memo last saw them, then move one input.
+        let recorded = reactor.dependencies_of(total.id());
+        assert_eq!(recorded.len(), 2);
+        right.set(20);
+
+        // The culprit is the dependency whose live version no longer matches the recorded one.
+        // That comparison is the whole "why did this update" mechanism, and it needs both
+        // `dependencies_of` and `node_version` to be reachable.
+        let moved = recorded
+            .iter()
+            .filter(|(node, seen)| reactor.node_version(*node) != Some(*seen))
+            .map(|(node, _)| *node)
+            .collect::<Vec<_>>();
+        assert_eq!(moved, vec![right.id()]);
+    }
+
+    #[test]
+    fn observer_counts_are_late_but_never_early() {
+        use crate::{signal_in, source_in};
+
+        let reactor = Reactor::new();
+        let toggle = signal_in(&reactor, true);
+        let watched = source_in(&reactor);
+
+        let effect = reactor.effect({
+            let toggle = toggle.clone();
+            let watched = watched.clone();
+            let reactor = reactor.clone();
+            move || {
+                if toggle.get() {
+                    reactor.observe(watched.id());
+                }
+            }
+        });
+        reactor.flush_now();
+        assert_eq!(reactor.observer_count(watched.id()), 1);
+
+        // Stopping the read does not retract the edge until the observer actually re-runs —
+        // documented as "late, never early", and the property GC sweeps depend on.
+        toggle.set(false);
+        assert_eq!(
+            reactor.observer_count(watched.id()),
+            1,
+            "the edge survives until the observer re-runs"
+        );
+        reactor.flush_now();
+        assert_eq!(reactor.observer_count(watched.id()), 0);
+        assert!(reactor.dependents_of(watched.id()).is_empty());
+
+        // Disposal retracts the observer's own edges, which is what a leak test watches.
+        toggle.set(true);
+        reactor.flush_now();
+        assert_eq!(reactor.observer_count(watched.id()), 1);
+        effect.dispose();
+        assert_eq!(reactor.observer_count(watched.id()), 0);
+    }
+
+    #[test]
+    fn node_origin_reports_the_creation_site_and_forgets_a_disposed_node() {
+        use crate::signal_in;
+
+        let reactor = Reactor::new();
+        let line = line!() + 1;
+        let value = signal_in(&reactor, 0_u32);
+
+        let origin = reactor
+            .node_origin(value.id())
+            .expect("a live node reports where it was created");
+        assert_eq!(origin.line(), line);
+        assert!(origin.file().ends_with("reactor.rs"));
+        assert_eq!(reactor.node_version(value.id()), Some(0));
+
+        let id = value.id();
+        drop(value);
+        assert_eq!(
+            reactor.node_origin(id),
+            None,
+            "a disposed node is absent, not misattributed — ids are never reused"
+        );
+        assert_eq!(reactor.node_version(id), None);
     }
 
     #[test]

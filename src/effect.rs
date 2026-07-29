@@ -474,7 +474,7 @@ impl EffectInner {
     fn schedule(&self) {
         let skipped = self.disposed.get() || self.scheduled.replace(true);
         if self.reactor.diagnostics_enabled()
-            && let Some(effect_origin) = self.reactor.origin(self.id)
+            && let Some(effect_origin) = self.reactor.node_origin(self.id)
         {
             self.reactor
                 .emit_diagnostic(DiagnosticEvent::EffectScheduled {
@@ -555,7 +555,7 @@ impl EffectInner {
             return;
         };
 
-        let origin = self.reactor.origin(self.id);
+        let origin = self.reactor.node_origin(self.id);
         tracing::warn!(
             target: trace_targets::EFFECT,
             event = "effect_panicked",
@@ -651,7 +651,7 @@ impl EffectInner {
         let reactor_id = self.reactor.diagnostic_id();
         let flush_epoch = self.reactor.flush_epoch();
         let diagnostics_enabled = self.reactor.diagnostics_enabled();
-        if diagnostics_enabled && let Some(effect_origin) = self.reactor.origin(self.id) {
+        if diagnostics_enabled && let Some(effect_origin) = self.reactor.node_origin(self.id) {
             self.reactor
                 .emit_diagnostic(DiagnosticEvent::EffectRunStarted {
                     reactor: reactor_id,
@@ -715,7 +715,7 @@ impl EffectInner {
         if runs > MAX_RUNS_PER_FLUSH {
             let origin = self
                 .reactor
-                .origin(self.id)
+                .node_origin(self.id)
                 .map(|location| location.to_string())
                 .unwrap_or_else(|| "<unknown>".into());
             panic!(
@@ -759,7 +759,7 @@ impl OwnedDisposable for EffectInner {
 impl ObserverHook for EffectInner {
     fn mark(&self, mark: Mark, cause: Option<InvalidationCause>) {
         if let Some(cause) = cause
-            && let Some(effect_origin) = self.reactor.origin(self.id)
+            && let Some(effect_origin) = self.reactor.node_origin(self.id)
         {
             self.reactor
                 .emit_diagnostic(DiagnosticEvent::EffectInvalidated {

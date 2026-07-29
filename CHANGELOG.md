@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Public graph queries on `Reactor`: `observer_count`, `dependents_of`,
+  `dependencies_of`, `node_origin`, and `node_version`. All five existed internally;
+  none was reachable. Together they answer "why did this update" without a
+  subscription — `dependencies_of` returns each recorded edge with the version observed
+  when it was recorded, so the dependency whose current `node_version` no longer matches
+  is the one that invalidated the observer. `observer_count` is `O(1)` and
+  allocation-free (the dependent set is already indexed by node), which makes it usable
+  in a per-frame leak assertion; `is_observed` is now defined in terms of it and keeps
+  its documented "late, never early" semantics. `node_origin` exposes the
+  `#[track_caller]` creation site that until now surfaced only inside a
+  `ReactCycleError`, the divergence panic, or a diagnostic event.
+- `Signal::id()`, `Thunk::id()`, `Memo::id()`, and `Event::id()` report a handle's node
+  id, joining the `Source::id` that already existed. Without them the queries above were
+  unreachable for every node kind except sources and effects — a consumer holding a
+  `Signal` had no way to name it.
+
 - `EffectHandle::id()` and `EffectHandle::reactor_id()` report an effect's node identity
   and the graph it belongs to. `EffectRun::id()` already exposed the same `NodeId`, but
   only from the first *scheduled* run — one run later than a consumer that wants to key

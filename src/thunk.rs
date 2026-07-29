@@ -384,6 +384,15 @@ impl<T: 'static> Thunk<T> {
         self.inner.reactor.clone()
     }
 
+    /// Returns this thunk's node id, for use with the graph queries on
+    /// [`Reactor`] — [`observer_count`](Reactor::observer_count),
+    /// [`dependencies_of`](Reactor::dependencies_of), [`node_origin`](Reactor::node_origin) and
+    /// friends. Ids are unique within one reactor, so aggregate on
+    /// `(`[`Reactor::id`]`, id)`.
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
     /// Runs `f` with a shared reference to the current computed value without recording a
     /// dependency. The thunk is still brought up to date before `f` runs.
     ///
@@ -470,6 +479,15 @@ impl<T: 'static> Memo<T> {
     /// Returns the reactor this memo's node belongs to.
     pub fn reactor(&self) -> Reactor {
         self.inner.reactor.clone()
+    }
+
+    /// Returns this memo's node id, for use with the graph queries on
+    /// [`Reactor`] — [`observer_count`](Reactor::observer_count),
+    /// [`dependencies_of`](Reactor::dependencies_of), [`node_origin`](Reactor::node_origin) and
+    /// friends. Ids are unique within one reactor, so aggregate on
+    /// `(`[`Reactor::id`]`, id)`.
+    pub fn id(&self) -> NodeId {
+        self.inner.id
     }
 
     /// Runs `f` with a shared reference to the current computed value without recording a

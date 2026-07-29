@@ -115,6 +115,15 @@ impl<T: 'static> Signal<T> {
         self.inner.reactor.clone()
     }
 
+    /// Returns this signal's node id, for use with the graph queries on
+    /// [`Reactor`] — [`observer_count`](Reactor::observer_count),
+    /// [`dependencies_of`](Reactor::dependencies_of), [`node_origin`](Reactor::node_origin) and
+    /// friends. Ids are unique within one reactor, so aggregate on
+    /// `(`[`Reactor::id`]`, id)`.
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
     /// Replaces the current value and marks dependents stale, even when the new value equals
     /// the old one (compare [`set`](Signal::set)).
     #[track_caller]

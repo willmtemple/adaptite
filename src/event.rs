@@ -222,6 +222,15 @@ impl Reactor {
 }
 
 impl<T: 'static> Event<T> {
+    /// Returns this event's node id, for use with the graph queries on
+    /// [`Reactor`] — [`observer_count`](Reactor::observer_count),
+    /// [`dependencies_of`](Reactor::dependencies_of), [`node_origin`](Reactor::node_origin) and
+    /// friends. Ids are unique within one reactor, so aggregate on
+    /// `(`[`Reactor::id`]`, id)`.
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
     #[track_caller]
     fn new(reactor: Reactor) -> Self {
         let id = reactor.allocate_node();
