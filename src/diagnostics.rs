@@ -853,6 +853,153 @@ mod tests {
         );
     }
 
+    /// Runs a workload that produces every `DiagnosticEvent` variant.
+    fn exercise(reactor: &Reactor) {
+        use crate::thunk_in;
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let source = signal_in(reactor, 1_u32);
+        let parity = memo_in(reactor, {
+            let source = source.clone();
+            move || source.get() % 2
+        });
+        let doubled = thunk_in(reactor, {
+            let parity = parity.clone();
+            move || parity.get() * 2
+        });
+        let effect = reactor.effect({
+            let doubled = doubled.clone();
+            let seen = Rc::clone(&seen);
+            move || seen.borrow_mut().push(doubled.get())
+        });
+        reactor.flush_now();
+
+        source.set(2); // changes parity: recompute publishes
+        source.set(4); // coalesces into the pending run
+        reactor.flush_now();
+        source.set(6); // parity unchanged: suppressed, effect skipped
+        reactor.flush_now();
+        effect.dispose();
+        drop(doubled);
+        reactor.flush_now();
+    }
+
+    #[test]
+    fn every_event_stops_when_the_last_subscription_drops() {
+        let reactor = Reactor::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let subscription = reactor.subscribe_diagnostics({
+            let events = Rc::clone(&events);
+            move |event| events.borrow_mut().push(event)
+        });
+
+        exercise(&reactor);
+
+        // Every variant the release added must actually be reachable, or the test below proves
+        // nothing about it.
+        // Matched exhaustively on purpose: `#[non_exhaustive]` binds downstream crates, not this
+        // one, so adding a variant fails to compile here until it is covered below.
+        let names = |events: &Vec<DiagnosticEvent>| {
+            events
+                .iter()
+                .map(|event| match event {
+                    DiagnosticEvent::NodeCreated { .. } => "NodeCreated",
+                    DiagnosticEvent::NodeDisposed { .. } => "NodeDisposed",
+                    DiagnosticEvent::ReactiveWrite { .. } => "ReactiveWrite",
+                    DiagnosticEvent::ComputedInvalidated { .. } => "ComputedInvalidated",
+                    DiagnosticEvent::ComputedVerified { .. } => "ComputedVerified",
+                    DiagnosticEvent::ComputedRecomputeStarted { .. } => "ComputedRecomputeStarted",
+                    DiagnosticEvent::ComputedRecomputeFinished { .. } => {
+                        "ComputedRecomputeFinished"
+                    }
+                    DiagnosticEvent::EffectInvalidated { .. } => "EffectInvalidated",
+                    DiagnosticEvent::EffectScheduled { .. } => "EffectScheduled",
+                    DiagnosticEvent::EffectRunStarted { .. } => "EffectRunStarted",
+                    DiagnosticEvent::EffectRunFinished { .. } => "EffectRunFinished",
+                    DiagnosticEvent::EffectRunSkipped { .. } => "EffectRunSkipped",
+                    DiagnosticEvent::EffectDisposed { .. } => "EffectDisposed",
+                    DiagnosticEvent::FlushStarted { .. } => "FlushStarted",
+                    DiagnosticEvent::FlushFinished { .. } => "FlushFinished",
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let seen = names(&events.borrow());
+        for expected in [
+            "NodeCreated",
+            "NodeDisposed",
+            "ReactiveWrite",
+            "ComputedInvalidated",
+            "ComputedVerified",
+            "ComputedRecomputeStarted",
+            "ComputedRecomputeFinished",
+            "EffectInvalidated",
+            "EffectScheduled",
+            "EffectRunStarted",
+            "EffectRunFinished",
+            "EffectRunSkipped",
+            "EffectDisposed",
+            "FlushStarted",
+            "FlushFinished",
+        ] {
+            assert!(
+                seen.contains(&expected),
+                "{expected} is unreachable in the workload, so its dormancy is untested"
+            );
+        }
+        // Now the actual claim: dropping the subscription stops all of it.
+        drop(subscription);
+        assert!(!reactor.diagnostics_enabled());
+        events.borrow_mut().clear();
+
+        exercise(&reactor);
+        assert!(
+            events.borrow().is_empty(),
+            "delivery continued after the subscription was dropped: {:?}",
+            names(&events.borrow())
+        );
+    }
+
+    #[test]
+    fn flush_totals_do_not_survive_an_unsubscribed_window() {
+        let reactor = Reactor::new();
+        let source = signal_in(&reactor, 0_u32);
+        let effect = reactor.effect({
+            let source = source.clone();
+            move || {
+                let _ = source.get();
+            }
+        });
+        reactor.flush_now();
+
+        // Work performed while nothing was listening.
+        for value in 1..5 {
+            source.set(value);
+            reactor.flush_now();
+        }
+
+        let flushes = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = reactor.subscribe_diagnostics({
+            let flushes = Rc::clone(&flushes);
+            move |event| {
+                if let DiagnosticEvent::FlushFinished { stats, .. } = event {
+                    flushes.borrow_mut().push(stats);
+                }
+            }
+        });
+        reactor.flush_now();
+
+        let flushes = flushes.borrow();
+        assert_eq!(flushes.len(), 1);
+        assert!(
+            flushes[0].is_empty(),
+            "a new subscriber must not inherit totals from a window it could not observe: {:?}",
+            flushes[0]
+        );
+
+        effect.dispose();
+    }
+
     #[test]
     fn dropping_the_subscription_stops_delivery_and_disables_diagnostics() {
         let reactor = Reactor::new();

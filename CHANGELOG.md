@@ -120,6 +120,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `is_disposed` when liveness matters. `reactor_id` completes the
   `(ReactorId, NodeId)` pair that every diagnostic payload is scoped by.
 
+- [`docs/diagnostics.md`](docs/diagnostics.md) states the whole contract in one place:
+  identity and id-reuse rules, the callback contract, dormancy, pairing and panic
+  semantics for every started/finished pair, flush attribution under nesting, which
+  counters are always maintained and which follow the event stream, the measured costs,
+  and the A/B procedure for changing a hot path. It also records the trap this release hit
+  twice — a `Drop` guard constructed on a hot path is not free even when its body is a
+  no-op — with the fix pattern, so the next diagnostic added does not rediscover it.
+
 ### Changed
 
 - `Reactor::current()` now warns whenever it installs a default implicitly on a thread

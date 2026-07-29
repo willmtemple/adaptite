@@ -407,6 +407,10 @@ targets `adaptite::graph`, `adaptite::signal`, `adaptite::thunk`,
 and `adaptite::resource`. See `examples/tracing_subscriber_showcase.rs` for a
 suggested subscriber setup.
 
+These are for humans reading logs and may change in any release; several are
+debug-only and absent from optimized builds. A program that wants to *count*
+reactive work should read the typed diagnostics below instead.
+
 ## Causal diagnostics
 
 Performance tools can subscribe to a reactor's structured scheduling stream:
@@ -436,6 +440,39 @@ sink and return without reading or mutating the graph.
 Diagnostics are available in release builds. Without a subscription, the
 path is dormant and mutation/scheduling sites perform only a boolean check.
 Dropping `DiagnosticSubscription` removes the callback.
+
+## Accounting for the graph
+
+Two questions the event stream does not answer. `Reactor::graph_stats()` returns
+an `O(1)` account of what the reactor is holding — live nodes by kind, edges,
+observers, queued effects, peaks, and cumulative totals — cheap enough to call
+every frame and maintained whether or not anything is subscribed. The intended
+use is the difference between two snapshots, which turns a leak into an
+assertion:
+
+```rust
+use adaptite::{Reactor, signal_in};
+
+let reactor = Reactor::new();
+let before = reactor.graph_stats();
+
+let value = signal_in(&reactor, 0_u32);
+drop(value);
+
+let after = reactor.graph_stats();
+assert_eq!(after.nodes_created - before.nodes_created, 1);
+assert_eq!(after.live_nodes, before.live_nodes, "nothing was retained");
+```
+
+`Reactor::debug_graph()` is the walking counterpart: every node with its kind,
+origin, version and staleness, and every edge, for an inspector or a
+post-mortem rather than a per-frame check. And each `FlushFinished` event
+carries a `FlushStats` saying what that flush actually did, so a settled graph
+can be *asserted* idle rather than inferred idle from a CPU percentage.
+
+The full contract — identity, pairing and panic semantics, flush attribution,
+which counters are always maintained, and what it costs — is in
+[`docs/diagnostics.md`](docs/diagnostics.md).
 
 ## License
 

@@ -316,7 +316,7 @@ impl Reactor {
     /// Returns the source location at which `node` was created, or `None` if it is not live.
     ///
     /// Every node records its creation site via `#[track_caller]`. Until now that origin was
-    /// reachable only when adaptite chose to hand it over — in a [`ReactCycleError`], in the
+    /// reachable only when adaptite chose to hand it over — in a [`ReactCycleError`](crate::ReactCycleError), in the
     /// divergence panic, or attached to a diagnostic event. This answers for any node, which is
     /// what an inspector, a leak report, or a post-mortem needs.
     ///

@@ -75,6 +75,12 @@ jobs:
       # this exercises the reactive graph end-to-end on the real runtime.
       - name: Smoke-run examples
         run: mise run examples
+      # The benchmarks are the evidence behind the diagnostics cost contract
+      # (docs/diagnostics.md), so they must keep building and running. Timings are *not*
+      # asserted: see the note on mise's `bench-smoke` task for why a threshold on a shared
+      # runner would be worse than no threshold.
+      - name: Smoke-run benchmarks
+        run: mise run bench-smoke
 
   test-macos:
     name: Test (macOS aarch64)

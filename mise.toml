@@ -40,7 +40,10 @@ description = "Run clippy with warnings denied"
 run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 
 [tasks.doc]
-description = "Build documentation"
+description = "Build documentation, failing on broken links"
+# `-D warnings` matches CI. Moving code between modules silently breaks intra-doc links —
+# `cargo build` and `cargo test` both pass — so this belongs in the local gate, not only in CI.
+env = { RUSTDOCFLAGS = "-D warnings" }
 run = "cargo doc --workspace --all-features --no-deps"
 
 [tasks.bench]
@@ -105,6 +108,14 @@ run = "cop cop-checks/main.cop -t ."
 description = "Verify cop rule files compile"
 run = "cop verify cop-checks/"
 
+[tasks.bench-smoke]
+description = "Run every benchmark once, to prove they still build and execute"
+# Deliberately not a timing gate: both real diagnostics regressions in 0.3 were 9% and 15.7%,
+# which is inside the run-to-run variance of a shared CI runner. A threshold loose enough not to
+# flake would have caught neither, and a flaky perf gate gets disabled and then protects nothing.
+# The A/B procedure in docs/diagnostics.md is the gate; this only stops the benches from rotting.
+run = "cargo bench --bench graph -- --warm-up-time 0.1 --measurement-time 0.2 --sample-size 10"
+
 [tasks.check]
-description = "Run the full local gate (fmt, lint, test, cop)"
-depends = ["fmt", "lint", "test", "cop"]
+description = "Run the full local gate (fmt, lint, doc, test, cop)"
+depends = ["fmt", "lint", "doc", "test", "cop"]
