@@ -87,7 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency cycle surfaces as `Panicked`, because that is what it is. `changed` on the
   finish event distinguishes a memo whose comparator suppressed propagation from one that
   published, and `dependencies_before`/`dependencies_after` show a computation whose
-  reactive read set grows or churns.
+  reactive read set changes size. They do *not* detect a read set of constant size whose
+  members change — swapping 200 dependencies for 200 different ones reports 200 either
+  side, and the per-flush edge totals cannot distinguish it either, because every
+  recomputation clears and re-records its whole set. Sampling `dependencies_of` either side
+  of a recomputation, or diffing two `debug_graph` snapshots, is the tool for that.
   Adaptite deliberately does **not** report individual edge additions and removals.
   Edge recording is the hottest path in the graph — one call per tracked read — so a
   wide node would emit more diagnostic events than it does reactive work, to answer a
@@ -159,6 +163,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-op — with the fix pattern, so the next diagnostic added does not rediscover it.
 
 ### Changed
+
+- **Teardown is total.** `OwnerFrame::reset` documented that a panicking cleanup does not
+  strand its siblings; it did. A panic abandoned the teardown loop, the remaining cleanups
+  were dropped rather than run, and because cleanups ran before children were taken, **the
+  owner's children were never disposed at all** — a leak with no error attached, on the path
+  reached by every effect re-run. Every cleanup and every child now receives an attempt, in
+  reverse registration order, each under its own `catch_unwind`. The **first** panic is
+  preserved and re-raised once teardown finishes, later ones logged and dropped: subsequent
+  failures are commonly caused by the first. Teardown reached from `Drop` while the thread is
+  *already* unwinding logs the captured panic instead of re-raising it, because re-raising
+  there aborts the process — the one case where a cleanup panic is not observable as a panic,
+  and the only alternative to an abort. Fixes #28.
+- **Nested flush semantics are no longer self-contradictory.** `external_flush` documented
+  that a re-entrant `flush_now` joins the enclosing flush, while the implementation, the
+  diagnostics contract and the tests all gave it a distinct epoch. Adaptite now maintains two
+  identities: a *diagnostic flush epoch*, which a re-entrant `flush_now` does take afresh so
+  its totals stay separable, and a *logical drain*, which it does not — and the divergence
+  guard counts against the drain. Without that separation an effect that re-flushes could
+  hand itself a new epoch on every run and walk past the guard. `external_flush` nested in
+  `external_flush` still joins outright, opening no new epoch.
 
 - `Reactor::current()` now warns whenever it installs a default implicitly on a thread
   that has had one **at any earlier point**, rather than only when a previously installed

@@ -161,7 +161,10 @@ pub enum DiagnosticEvent {
     ///
     /// Emitted for every mark delivered to the node, including one that coalesces into staleness
     /// it already had — the event reports propagation *reaching* the node, which is what makes
-    /// the path from a write to an effect visible rather than only its endpoints.
+    /// the path from a write to an effect visible rather than only its endpoints. Use
+    /// [`state_changed`](Self::ComputedInvalidated::state_changed) to tell the two apart: a run of
+    /// deliveries that mostly do not change state is propagation amplification, and it is exactly
+    /// what coalesced writes look like from inside the graph.
     #[non_exhaustive]
     ComputedInvalidated {
         /// Graph containing the node.
@@ -176,6 +179,12 @@ pub enum DiagnosticEvent {
         cause: InvalidationCause,
         /// Whether the node is definitely dirty or must verify its own inputs.
         level: InvalidationLevel,
+        /// Whether this mark actually made the node staler.
+        ///
+        /// `false` means the node was already at least this stale and the mark coalesced into
+        /// what it had — the propagation reached the node and changed nothing. Marks that do not
+        /// change state also stop here: nothing is forwarded to *this* node's dependents.
+        state_changed: bool,
     },
     /// A check-marked computed node verified its inputs.
     ///
@@ -215,11 +224,21 @@ pub enum DiagnosticEvent {
     /// Always paired with a [`ComputedRecomputeStarted`](Self::ComputedRecomputeStarted), including
     /// on the unwind path, where `outcome` is [`ComputeOutcome::Panicked`].
     ///
-    /// Comparing `dependencies_before` with `dependencies_after` is how a consumer finds a
-    /// computation whose reactive read set grows or churns. Adaptite deliberately does **not**
-    /// report individual edge additions and removals: edge recording is the hottest path in the
-    /// graph — one call per tracked read — and a wide node would emit more diagnostic events than
-    /// it does reactive work, for a question these two counts already answer.
+    /// Comparing `dependencies_before` with `dependencies_after` detects a computation whose read
+    /// set **changes size** — one that grows every run is the shape behind a component that gets
+    /// slower the longer it lives.
+    ///
+    /// It does **not** detect a read set of constant size whose *members* change: swapping 200
+    /// dependencies for 200 different ones reports 200 before and 200 after. Nor do the per-flush
+    /// `edges_added`/`edges_removed` totals, because every recomputation clears and re-records its
+    /// whole edge set, so churn and stability look identical there. For that question, sample
+    /// [`Reactor::dependencies_of`](crate::Reactor::dependencies_of) either side of a
+    /// recomputation, or diff two [`Reactor::debug_graph`](crate::Reactor::debug_graph) snapshots
+    /// — both are targeted-investigation tools rather than something to run per frame.
+    ///
+    /// Adaptite deliberately does not report individual edge additions and removals: edge
+    /// recording is the hottest path in the graph — one call per tracked read — and a wide node
+    /// would emit more diagnostic events than it does reactive work.
     #[non_exhaustive]
     ComputedRecomputeFinished {
         /// Graph containing the node.

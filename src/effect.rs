@@ -327,9 +327,9 @@ impl EffectHandle {
             self_ref: RefCell::new(Weak::new()),
             owner: OwnerFrame::new(),
             #[cfg(debug_assertions)]
-            last_flush_epoch: Cell::new(u64::MAX),
+            last_drain_epoch: Cell::new(u64::MAX),
             #[cfg(debug_assertions)]
-            runs_this_flush: Cell::new(0),
+            runs_this_drain: Cell::new(0),
         });
         *inner.self_ref.borrow_mut() = Rc::downgrade(&inner);
         tracing::debug!(
@@ -466,9 +466,9 @@ struct EffectInner {
     /// Ownership frame for cleanups and nested effects created during this effect's runs.
     owner: Rc<OwnerFrame>,
     #[cfg(debug_assertions)]
-    last_flush_epoch: Cell<u64>,
+    last_drain_epoch: Cell<u64>,
     #[cfg(debug_assertions)]
-    runs_this_flush: Cell<u32>,
+    runs_this_drain: Cell<u32>,
 }
 
 impl EffectInner {
@@ -736,15 +736,17 @@ impl EffectInner {
     /// signal's equality check on the next round) is legal and settles well below this limit.
     #[cfg(debug_assertions)]
     fn check_divergence(&self) {
-        let epoch = self.reactor.flush_epoch();
-        if self.last_flush_epoch.get() != epoch {
-            self.last_flush_epoch.set(epoch);
-            self.runs_this_flush.set(1);
+        // Drain rather than flush: a re-entrant `flush_now` opens a new diagnostic epoch but must
+        // not reset this counter, or an effect that re-flushes could evade the guard entirely.
+        let epoch = self.reactor.drain_epoch();
+        if self.last_drain_epoch.get() != epoch {
+            self.last_drain_epoch.set(epoch);
+            self.runs_this_drain.set(1);
             return;
         }
 
-        let runs = self.runs_this_flush.get().saturating_add(1);
-        self.runs_this_flush.set(runs);
+        let runs = self.runs_this_drain.get().saturating_add(1);
+        self.runs_this_drain.set(runs);
         if runs > MAX_RUNS_PER_FLUSH {
             let origin = self
                 .reactor
@@ -753,7 +755,7 @@ impl EffectInner {
                 .unwrap_or_else(|| "<unknown>".into());
             panic!(
                 "adaptite: effect created at {origin} ran more than {MAX_RUNS_PER_FLUSH} times \
-                 in a single flush; this suggests a divergent reactive feedback loop (the effect \
+                 in a single drain; this suggests a divergent reactive feedback loop (the effect \
                  writes state it depends on without converging)"
             );
         }

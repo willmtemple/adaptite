@@ -1017,8 +1017,17 @@ impl Reactor {
     /// then a livelock the guard cannot see. Draining inside `external_flush` is therefore the
     /// recommended shape.
     ///
-    /// Nesting is permitted: a nested call (or a [`flush_now`](Self::flush_now) from inside `f`)
-    /// joins the enclosing flush rather than starting one.
+    /// Nesting is permitted, and the two kinds of nesting differ:
+    ///
+    /// - A nested `external_flush` **joins** the enclosing flush. The consumer already declared a
+    ///   boundary; a second one inside it is the same drain, and it opens no new epoch.
+    /// - A re-entrant [`flush_now`](Self::flush_now) from inside `f` opens its own *diagnostic*
+    ///   flush, so its work is reported separately rather than folded into the enclosing totals.
+    ///
+    /// Both stay inside the same **logical drain**, which is what the divergence guard counts
+    /// against. That separation is deliberate: an effect that writes its own dependency and then
+    /// re-flushes would otherwise hand itself a fresh epoch on every run and never trip the
+    /// guard. Diagnostic flush identity is for attribution; drain identity is for the guard.
     ///
     /// # Examples
     ///
@@ -1152,6 +1161,13 @@ impl Reactor {
     /// equal to a never-written one is the behaviour that path wants.
     pub(crate) fn version(&self, node: NodeId) -> u64 {
         self.node_version(node).unwrap_or(0)
+    }
+
+    /// Returns the identity of the logical drain in progress: the outermost flush and everything
+    /// nested inside it. Used by the divergence guard, which must not be resettable by a
+    /// re-entrant `flush_now`.
+    pub(crate) fn drain_epoch(&self) -> u64 {
+        self.inner.drain_epoch.get()
     }
 
     /// Returns the number of the currently running (or most recent) job flush.
@@ -1373,6 +1389,13 @@ pub(crate) struct ReactorInner {
     pub(crate) pending_jobs: RefCell<VecDeque<Job>>,
     flush_scheduled: Cell<bool>,
     pub(crate) flush_epoch: Cell<u64>,
+    /// Identifies one *logical drain*: the outermost flush and everything nested inside it.
+    ///
+    /// Distinct from `flush_epoch`, which identifies each flush for diagnostics. A re-entrant
+    /// `flush_now` opens its own diagnostic flush so its totals are separable, but it stays
+    /// inside the enclosing drain — otherwise an effect that re-flushes could give itself a fresh
+    /// epoch on every run and walk straight past the divergence guard.
+    pub(crate) drain_epoch: Cell<u64>,
     /// Nesting depth of active flushes, including drains a consumer opened with
     /// [`Reactor::external_flush`]. Non-zero means the current `flush_epoch` is live, so an
     /// externally scheduled effect run joins it instead of opening one of its own.
@@ -1407,6 +1430,7 @@ impl ReactorInner {
             diagnostics: RefCell::new(Vec::new()),
             observation_hooks: RefCell::new(HashMap::new()),
             counters: GraphCounters::default(),
+            drain_epoch: Cell::new(0),
             flushes: FlushAccounting::default(),
             mark_depth: Cell::new(0),
         }
@@ -1442,6 +1466,8 @@ impl ReactorInner {
             return;
         }
 
+        // Past the early return above, so this is the outermost flush: a new logical drain.
+        self.drain_epoch.set(self.drain_epoch.get().wrapping_add(1));
         self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
         self.counters.flush_opened();
         let epoch = self.flush_epoch.get();
@@ -1525,6 +1551,11 @@ impl ReactorInner {
             "reactor.flush_jobs"
         )
         .entered();
+        // A re-entrant `flush_now` is nested inside a drain that is already open, so it takes a
+        // fresh diagnostic epoch but keeps the enclosing drain identity.
+        if self.flush_depth.get() == 0 {
+            self.drain_epoch.set(self.drain_epoch.get().wrapping_add(1));
+        }
         self.flush_epoch.set(self.flush_epoch.get().wrapping_add(1));
         self.counters.flush_opened();
         let epoch = self.flush_epoch.get();
@@ -1598,338 +1629,4 @@ impl ReactorInner {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::cell::Cell;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::rc::Rc;
-
-    use runite::{queue_macrotask, run};
-
-    use super::{Reactor, current};
-    use crate::NodeKind;
-
-    #[test]
-    fn current_reactor_is_thread_local_singleton() {
-        let one = current();
-        let two = current();
-        assert!(Rc::ptr_eq(&one.inner, &two.inner));
-    }
-
-    #[test]
-    fn try_current_reports_absence_instead_of_installing_a_reactor() {
-        // The test harness gives each test a fresh thread, so nothing is installed yet.
-        assert!(
-            super::try_current().is_none(),
-            "try_current must not install a reactor"
-        );
-        assert!(
-            super::try_current().is_none(),
-            "and must still report absence after being asked once"
-        );
-
-        let installed = current();
-        let observed = super::try_current().expect("current installed a default");
-        assert_eq!(observed.id(), installed.id());
-    }
-
-    #[test]
-    fn entering_anchors_the_reactor_as_the_thread_default() {
-        let reactor = Reactor::new();
-        let expected = reactor.id();
-        let guard = reactor.enter();
-
-        // Drop every other handle: the guard alone must keep this reactor current. Without the
-        // strong anchor, `current()` here would install a fresh, unrelated graph.
-        drop(reactor);
-
-        assert_eq!(
-            current().id(),
-            expected,
-            "the entered reactor stays current with no other handle alive"
-        );
-
-        drop(guard);
-        assert!(
-            super::try_current().is_none(),
-            "dropping the guard restores the absent default"
-        );
-    }
-
-    #[test]
-    fn entering_nests_and_restores_the_previous_default() {
-        let outer = Reactor::new();
-        let inner = Reactor::new();
-        let (outer_id, inner_id) = (outer.id(), inner.id());
-
-        let outer_guard = outer.enter();
-        assert_eq!(current().id(), outer_id);
-
-        let inner_guard = inner.enter();
-        assert_eq!(current().id(), inner_id);
-
-        drop(inner_guard);
-        assert_eq!(
-            current().id(),
-            outer_id,
-            "leaving the inner reactor restores the outer one"
-        );
-
-        drop(outer_guard);
-        assert!(super::try_current().is_none());
-    }
-
-    #[test]
-    fn an_expired_default_is_replaced_by_an_unrelated_reactor() {
-        // This is the failure mode `current()` warns about, pinned so the warning keeps
-        // describing something real: nodes created on either side of the expiry cannot interact.
-        let first = current().id();
-        // No node, handle, or guard survives, so the weak cache expires.
-        let second = current().id();
-
-        assert_ne!(
-            first, second,
-            "an unanchored default is replaced once nothing keeps it alive"
-        );
-
-        // Holding any handle is enough to keep it stable.
-        let held = current();
-        assert_eq!(current().id(), held.id());
-    }
-
-    #[test]
-    fn observe_records_dependency_edges_with_versions() {
-        let reactor = Reactor::new();
-        let observer = reactor.allocate_node(NodeKind::Source);
-        let observable = reactor.allocate_node(NodeKind::Source);
-        reactor.trigger(observable);
-
-        reactor.run_in_context(observer, || {
-            reactor
-                .try_observe(observable)
-                .expect("should not detect cycle")
-        });
-
-        assert_eq!(
-            reactor.dependencies_of(observer),
-            vec![(observable, reactor.version(observable))]
-        );
-        assert_eq!(
-            reactor.inner.dependents.borrow().get(&observable),
-            Some(&[observer].into_iter().collect())
-        );
-    }
-
-    #[test]
-    fn the_public_queries_answer_why_did_this_update() {
-        use crate::{memo_in, signal_in};
-
-        let reactor = Reactor::new();
-        let left = signal_in(&reactor, 1_u32);
-        let right = signal_in(&reactor, 10_u32);
-        let total = memo_in(&reactor, {
-            let left = left.clone();
-            let right = right.clone();
-            move || left.get() + right.get()
-        });
-        assert_eq!(total.get(), 11);
-
-        // Both inputs are observed once, by the memo.
-        assert_eq!(reactor.observer_count(left.id()), 1);
-        assert_eq!(reactor.observer_count(right.id()), 1);
-        assert_eq!(reactor.dependents_of(left.id()), vec![total.id()]);
-
-        // Snapshot the edges as the memo last saw them, then move one input.
-        let recorded = reactor.dependencies_of(total.id());
-        assert_eq!(recorded.len(), 2);
-        right.set(20);
-
-        // The culprit is the dependency whose live version no longer matches the recorded one.
-        // That comparison is the whole "why did this update" mechanism, and it needs both
-        // `dependencies_of` and `node_version` to be reachable.
-        let moved = recorded
-            .iter()
-            .filter(|(node, seen)| reactor.node_version(*node) != Some(*seen))
-            .map(|(node, _)| *node)
-            .collect::<Vec<_>>();
-        assert_eq!(moved, vec![right.id()]);
-    }
-
-    #[test]
-    fn observer_counts_are_late_but_never_early() {
-        use crate::{signal_in, source_in};
-
-        let reactor = Reactor::new();
-        let toggle = signal_in(&reactor, true);
-        let watched = source_in(&reactor);
-
-        let effect = reactor.effect({
-            let toggle = toggle.clone();
-            let watched = watched.clone();
-            let reactor = reactor.clone();
-            move || {
-                if toggle.get() {
-                    reactor.observe(watched.id());
-                }
-            }
-        });
-        reactor.flush_now();
-        assert_eq!(reactor.observer_count(watched.id()), 1);
-
-        // Stopping the read does not retract the edge until the observer actually re-runs —
-        // documented as "late, never early", and the property GC sweeps depend on.
-        toggle.set(false);
-        assert_eq!(
-            reactor.observer_count(watched.id()),
-            1,
-            "the edge survives until the observer re-runs"
-        );
-        reactor.flush_now();
-        assert_eq!(reactor.observer_count(watched.id()), 0);
-        assert!(reactor.dependents_of(watched.id()).is_empty());
-
-        // Disposal retracts the observer's own edges, which is what a leak test watches.
-        toggle.set(true);
-        reactor.flush_now();
-        assert_eq!(reactor.observer_count(watched.id()), 1);
-        effect.dispose();
-        assert_eq!(reactor.observer_count(watched.id()), 0);
-    }
-
-    #[test]
-    fn node_origin_reports_the_creation_site_and_forgets_a_disposed_node() {
-        use crate::signal_in;
-
-        let reactor = Reactor::new();
-        let line = line!() + 1;
-        let value = signal_in(&reactor, 0_u32);
-
-        let origin = reactor
-            .node_origin(value.id())
-            .expect("a live node reports where it was created");
-        assert_eq!(origin.line(), line);
-        assert!(origin.file().ends_with("reactor.rs"));
-        assert_eq!(reactor.node_version(value.id()), Some(0));
-
-        let id = value.id();
-        drop(value);
-        assert_eq!(
-            reactor.node_origin(id),
-            None,
-            "a disposed node is absent, not misattributed — ids are never reused"
-        );
-        assert_eq!(reactor.node_version(id), None);
-    }
-
-    #[test]
-    fn cycle_detection_panics_with_path_and_origins() {
-        let reactor = Reactor::new();
-        let a = reactor.allocate_node(NodeKind::Source);
-        let b = reactor.allocate_node(NodeKind::Source);
-
-        let panic = catch_unwind(AssertUnwindSafe(|| {
-            reactor.run_in_context(a, || {
-                reactor.observe(b);
-                reactor.run_in_context(b, || {
-                    reactor.observe(a);
-                });
-            });
-        }))
-        .expect_err("cycle should panic");
-
-        let Some(cycle_error) = panic.downcast_ref::<String>() else {
-            panic!("panic should be a string");
-        };
-
-        assert!(
-            cycle_error.contains("reactive cycle detected"),
-            "panic should indicate cycle detected"
-        );
-
-        assert!(
-            cycle_error.contains("1 (created at")
-                && cycle_error.contains("-> 2 (created at")
-                && cycle_error.contains("reactor.rs"),
-            "panic should include the cycle path with node origins, got: {cycle_error}"
-        );
-    }
-
-    #[test]
-    fn scheduled_jobs_flush_on_runtime_microtask_queue() {
-        let observed = Rc::new(Cell::new(0usize));
-
-        queue_macrotask({
-            let observed = Rc::clone(&observed);
-            move || {
-                let reactor = Reactor::new();
-                reactor.schedule({
-                    let observed = Rc::clone(&observed);
-                    move || observed.set(1)
-                });
-                assert_eq!(observed.get(), 0);
-            }
-        });
-
-        run();
-
-        assert_eq!(observed.get(), 1);
-    }
-
-    #[test]
-    fn graph_survives_dropping_the_reactor_handle() {
-        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let keep_alive = Rc::new(std::cell::RefCell::new(None::<crate::EffectHandle>));
-
-        queue_macrotask({
-            let seen = Rc::clone(&seen);
-            let keep_alive = Rc::clone(&keep_alive);
-            move || {
-                let reactor = Reactor::new();
-                let source = crate::signal_in(&reactor, 1usize);
-                let effect = reactor.effect({
-                    let seen = Rc::clone(&seen);
-                    let source = source.clone();
-                    move || seen.borrow_mut().push(source.get())
-                });
-                *keep_alive.borrow_mut() = Some(effect);
-
-                // Nodes hold the reactor alive; the user's handle is not load-bearing.
-                drop(reactor);
-
-                runite::queue_macrotask(move || {
-                    source.set(2);
-                });
-            }
-        });
-
-        run();
-
-        assert_eq!(&*seen.borrow(), &[1, 2]);
-    }
-
-    #[test]
-    fn flush_recovers_after_a_panicking_job() {
-        let observed = Rc::new(Cell::new(0usize));
-
-        queue_macrotask({
-            let observed = Rc::clone(&observed);
-            move || {
-                let reactor = Reactor::new();
-                reactor.schedule(|| panic!("job panics"));
-                // Swallow the panic that propagates out of the microtask flush so the test can
-                // observe the reactor's recovery.
-                let result = catch_unwind(AssertUnwindSafe(|| reactor.flush_now()));
-                assert!(result.is_err(), "flush should propagate the job panic");
-
-                reactor.schedule({
-                    let observed = Rc::clone(&observed);
-                    move || observed.set(1)
-                });
-                reactor.flush_now();
-            }
-        });
-
-        run();
-
-        assert_eq!(observed.get(), 1);
-    }
-}
+mod tests;

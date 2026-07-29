@@ -103,9 +103,13 @@ the pair itself — `FlushStarted`/`FlushFinished`, `EffectRunStarted`/`EffectRu
   accounts for component output, scenes, caches and GPU resources separately.
 - Individual dependency edge additions and removals. Edge recording is the hottest path in the
   graph — one call per tracked read — so a wide node would emit more diagnostic events than it
-  performs reactive work. `dependencies_before`/`dependencies_after` on the recompute pair and
-  `edges_added`/`edges_removed` per flush answer the question that motivated the request, at
-  `O(1)`.
+  performs reactive work.
+  Be precise about what replaces it: `dependencies_before`/`dependencies_after` detect a read set
+  that changes **size**, and nothing detects a read set of constant size whose *members* change.
+  The per-flush `edges_added`/`edges_removed` totals cannot either, because every recomputation
+  clears and re-records its whole edge set, so churn and stability are indistinguishable there.
+  For identity churn, sample `Reactor::dependencies_of` either side of a recomputation or diff two
+  `Reactor::debug_graph` snapshots — targeted-investigation tools, not per-frame ones.
 - Anything through `tracing`. See [Tracing is not a contract](#tracing-is-not-a-contract).
 
 ---
@@ -186,6 +190,24 @@ Both `DiagnosticEvent` and **every one of its variants** are `#[non_exhaustive]`
 adding a field additive rather than breaking, and these payloads are expected to grow.
 
 ---
+
+## Two flush identities
+
+Flushes nest, and two different questions are asked of the nesting, so adaptite keeps two
+identities:
+
+| | Changes when | Used for |
+|---|---|---|
+| **Diagnostic flush epoch** (`flush_epoch`) | Every flush, including a re-entrant `flush_now` | Attribution — keeping a nested flush's totals separable |
+| **Logical drain** | Only the outermost flush | The divergence guard |
+
+A re-entrant `flush_now` therefore takes a fresh diagnostic epoch but stays inside the enclosing
+drain. Collapsing them either way breaks something: sharing the epoch loses per-flush attribution,
+and bumping the drain would let an effect that writes its own dependency and then re-flushes hand
+itself a new epoch on every run and never trip the guard.
+
+`external_flush` nested inside `external_flush` is different again — it joins outright and opens
+no epoch at all, because the consumer already declared that boundary.
 
 ## Flush attribution
 

@@ -531,9 +531,14 @@ fn mark_computed(
     mark: Mark,
     cause: Option<InvalidationCause>,
 ) {
-    // Reported before the coalescing check below, so the stream shows propagation *reaching* this
-    // node even when it was already at least this stale. `cause` is `Some` only while diagnostics
-    // are subscribed, which is what keeps this dormant.
+    let target = State::from(mark);
+    let previous = state.get();
+    let state_changed = previous < target;
+
+    // Reported for every delivery, not only the ones that change state, so the stream shows
+    // propagation *reaching* this node — `state_changed` is what separates a mark that did
+    // something from one that coalesced. `cause` is `Some` only while diagnostics are subscribed,
+    // which is what keeps this dormant.
     if let Some(cause) = cause
         && let Some(node_origin) = reactor.node_origin(id)
     {
@@ -544,12 +549,11 @@ fn mark_computed(
             node_origin,
             cause,
             level: mark.into(),
+            state_changed,
         });
     }
 
-    let target = State::from(mark);
-    let previous = state.get();
-    if previous >= target {
+    if !state_changed {
         return;
     }
     state.set(target);

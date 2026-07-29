@@ -183,11 +183,11 @@ fn a_panicking_cleanup_does_not_strand_the_gauge() {
         let result = catch_unwind(AssertUnwindSafe(|| handle.dispose()));
         assert!(result.is_err(), "the panic propagates to the disposer");
 
-        // NOTE: the sibling cleanup does *not* run — a panicking cleanup abandons the teardown
-        // loop, contrary to what `OwnerFrame::reset` documents. That is #28, and it is a decision
-        // rather than something to fix quietly here. Asserted as-is so this test fails loudly when
-        // #28 is resolved, whichever way it goes.
-        assert_eq!(ran.get(), 0, "see #28");
+        assert_eq!(
+            ran.get(),
+            1,
+            "the sibling cleanup still runs — teardown is total (#28)"
+        );
 
         // What #24 is responsible for holds either way: the pending set is accounted at the
         // moment it is taken, not as each entry completes, so a panic partway through cannot

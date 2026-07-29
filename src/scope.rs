@@ -2,8 +2,10 @@ use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
+
 use core::cell::{Cell, RefCell};
 use core::panic::Location;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::ownership::{self, OwnerTally};
 use crate::{NodeId, trace_targets};
@@ -111,42 +113,68 @@ impl OwnerFrame {
     /// Runs registered cleanups and disposes owned children, most recent first. Called before an
     /// effect re-runs and as part of disposal.
     ///
-    /// Cleanups and disposals run untracked (their reads must not become dependencies of
-    /// whatever observer triggered the reset), and a panicking cleanup does not strand its
-    /// siblings: the remaining teardown still runs during unwinding.
+    /// # Teardown is total
+    ///
+    /// **Every cleanup and every child receives a teardown attempt, in reverse registration
+    /// order, even when one of them panics.** Teardown is the path that releases subscriptions,
+    /// timers, file handles and child subtrees; a single misbehaving cleanup must not be able to
+    /// strand the rest, because the result is a leak with no error attached to it.
+    ///
+    /// Each entry therefore runs under its own [`catch_unwind`]. Cleanups and children are both
+    /// taken from the frame *before* any of them runs, so a cleanup that panics cannot prevent
+    /// the children being disposed either.
+    ///
+    /// # Panic precedence
+    ///
+    /// The **first** panic is preserved and re-raised once teardown has finished; later ones are
+    /// dropped after being logged. First rather than last because subsequent failures are
+    /// commonly caused by the first — the earliest failure is the one that explains the others.
+    ///
+    /// # Teardown that begins during an unwind
+    ///
+    /// `reset` is reachable from [`Drop`], so it can start while the thread is *already*
+    /// unwinding. Re-raising there would be a panic during unwinding, which aborts the process.
+    /// So when [`std::thread::panicking`] is set, a captured payload is logged at `error` and
+    /// **not** re-raised: the teardown still completes, the original panic still propagates, and
+    /// the process survives. This is the one case where a cleanup panic is not observable as a
+    /// panic, and it is the only alternative to an abort.
+    ///
+    /// Cleanups and disposals also run untracked, so their reads never become dependencies of
+    /// whatever observer triggered the reset.
     pub(crate) fn reset(&self) {
-        struct RunRemaining(Vec<Box<dyn FnOnce()>>);
+        // Both taken up front: teardown of the children must not depend on the cleanups
+        // surviving, and the ownership gauges must not depend on reaching the end of a loop that
+        // may unwind partway through.
+        let cleanups = core::mem::take(&mut *self.cleanups.borrow_mut());
+        let children = core::mem::take(&mut *self.children.borrow_mut());
+        ownership::cleanups_taken(cleanups.len());
+        ownership::children_taken(children.len());
 
-        impl Drop for RunRemaining {
-            fn drop(&mut self) {
-                while let Some(cleanup) = self.0.pop() {
-                    cleanup();
-                }
-            }
-        }
-
-        struct DisposeRemaining(Vec<Rc<dyn OwnedDisposable>>);
-
-        impl Drop for DisposeRemaining {
-            fn drop(&mut self) {
-                while let Some(child) = self.0.pop() {
-                    child.dispose_owned();
-                }
-            }
-        }
-
+        let mut first_panic: Option<Box<dyn Any + Send>> = None;
         crate::untrack(|| {
-            // Accounted at the moment each vector is taken rather than as each entry runs: the
-            // teardown guards below finish draining even while unwinding, so the gauge must not
-            // depend on reaching the end of a loop that may panic partway through.
-            let cleanups = core::mem::take(&mut *self.cleanups.borrow_mut());
-            ownership::cleanups_taken(cleanups.len());
-            drop(RunRemaining(cleanups));
-
-            let children = core::mem::take(&mut *self.children.borrow_mut());
-            ownership::children_taken(children.len());
-            drop(DisposeRemaining(children));
+            for cleanup in cleanups.into_iter().rev() {
+                capture_panic(&mut first_panic, cleanup);
+            }
+            for child in children.into_iter().rev() {
+                capture_panic(&mut first_panic, || child.dispose_owned());
+            }
         });
+
+        let Some(payload) = first_panic else {
+            return;
+        };
+        if std::thread::panicking() {
+            // Resuming here would be a panic during unwinding, which aborts. The original panic
+            // is already on its way out and carries more information than this one.
+            tracing::error!(
+                target: trace_targets::SCOPE,
+                event = "cleanup_panic_during_unwind",
+                "a reactive cleanup panicked while the thread was already unwinding; teardown \
+                 completed and the panic was discarded to avoid aborting the process"
+            );
+            return;
+        }
+        std::panic::resume_unwind(payload);
     }
 
     /// Terminally disposes the owner: resets it and rejects future children.
@@ -173,6 +201,25 @@ impl Drop for OwnerFrame {
         // Covers the case where the closure passed to `scope` panics before a handle exists:
         // registered cleanups still run when the frame unwinds.
         self.dispose();
+    }
+}
+
+/// Runs `f`, keeping the first panic it produces rather than letting it escape.
+///
+/// Teardown must reach every entry, so no single entry is allowed to unwind out of the loop.
+fn capture_panic(slot: &mut Option<Box<dyn Any + Send>>, f: impl FnOnce()) {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(f)) else {
+        return;
+    };
+    if slot.is_none() {
+        *slot = Some(payload);
+    } else {
+        tracing::error!(
+            target: trace_targets::SCOPE,
+            event = "cleanup_panic_discarded",
+            "a reactive cleanup panicked during teardown that was already failing; the first \
+             panic is the one that propagates"
+        );
     }
 }
 
