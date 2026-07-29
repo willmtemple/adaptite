@@ -143,6 +143,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `is_disposed` when liveness matters. `reactor_id` completes the
   `(ReactorId, NodeId)` pair that every diagnostic payload is scoped by.
 
+- `examples/idle_audit.rs` shows how to prove an application is idle rather than inferring
+  it from a CPU percentage: subscribe, mark the point at which start-up has settled, and read
+  the flushes. It also pins the difference between `Signal::set`, which compares and
+  suppresses an unchanged write before it reaches the graph, and `Signal::replace`, which does
+  not — the shape behind "a pane re-rendered at the frame rate because an unchanged value was
+  written every tick". Deliberately small enough to copy into an application: what counts as
+  "settled" is an application's policy, not a reactive graph's.
 - [`docs/diagnostics.md`](docs/diagnostics.md) states the whole contract in one place:
   identity and id-reuse rules, the callback contract, dormancy, pairing and panic
   semantics for every started/finished pair, flush attribution under nesting, which

@@ -123,6 +123,27 @@ unsubscribes.
 - A callback that panics unwinds through whatever reactive work was in progress. Do not panic in
   a callback.
 
+### Synchronous delivery is a feature, not an implementation detail
+
+Because a callback runs on the reactor thread at the moment the work happens, a consumer can
+attribute events to whatever ambient context it has — including context adaptite knows nothing
+about. The motivating case is joining adaptite's records to the runtime's: a `ReactiveWrite`
+callback runs *during* the write and a `FlushFinished` callback runs *during* the flush, so a
+consumer that stamps each event with the runtime's current turn identifier gets per-event turn
+attribution without adaptite holding a runtime type in its API.
+
+This matters more than it looks, because a `FlushStats` routinely spans **two** runtime turns. A
+write made from a task and the flush that drains it are in different turns — the flush runs on the
+microtask checkpoint after the writing task finished — and adaptite deliberately folds the write
+into the flush's totals so cause and effect stay in one record. Stamping the aggregate with a
+single turn id would therefore be wrong in a way that looks right.
+
+The division to hold onto:
+
+> Use the **event stream** for attribution, and the **aggregate** for volume.
+
+Which is the same division as everywhere else here: events explain causality, stats quantify it.
+
 ### Subscribing never changes behaviour
 
 Turning diagnostics on must not turn a stale-node no-op, a disposal, a panic, or a cycle into
