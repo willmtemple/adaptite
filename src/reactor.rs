@@ -28,10 +28,17 @@ thread_local! {
     /// Strong reference held for the lifetime of an [`EnterGuard`], so an explicitly entered
     /// reactor stays the thread default even when the caller holds no other handle.
     static ANCHORED_REACTOR: RefCell<Option<Rc<ReactorInner>>> = const { RefCell::new(None) };
-    /// How many times a default reactor has been installed on this thread. A second install
-    /// means the previous default expired, so nodes created before and after it are on
-    /// different graphs — the silent failure [`Reactor::current`] warns about.
-    static DEFAULT_INSTALL_COUNT: Cell<u32> = const { Cell::new(0) };
+    /// Whether this thread has *ever* had a default reactor, by any route — an explicit
+    /// [`Reactor::enter`] or an implicit install by [`Reactor::current`].
+    ///
+    /// This, rather than a count of implicit installs, is what makes the warning cover the case
+    /// a UI framework actually hits. A framework that scopes `enter` to renders and callbacks —
+    /// the correct thing for it to do — leaves the thread with *no* default in between, so a
+    /// signal created from a timer, a task, a `Drop`, or a test body is a **first** implicit
+    /// install on an empty slot rather than a replacement of an expired one. Counting installs
+    /// misses every one of those; remembering that a default once existed catches them all,
+    /// while a thread that never entered (a script, a doctest) stays quiet.
+    static HAS_HAD_DEFAULT: Cell<bool> = const { Cell::new(false) };
     static UNTRACKED_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -365,8 +372,18 @@ impl Reactor {
     /// *fresh, unrelated* reactor — and nodes created before and after that point cannot observe
     /// each other. Because writes to a node on an unflushed graph mark dependents stale without
     /// ever scheduling anything, the symptom is "this value changes and nothing reacts", with no
-    /// panic and nothing pointing at the cause. A re-install therefore logs at `warn` level on
-    /// the `adaptite::graph` target.
+    /// panic and nothing pointing at the cause.
+    ///
+    /// So: **an implicit install logs at `warn` on the `adaptite::graph` target whenever this
+    /// thread has had a default reactor at any earlier point**, by any route. The first install
+    /// on a thread that has never entered one stays at `debug`, so scripts, doctests and tests
+    /// that simply want a graph are not nagged.
+    ///
+    /// The distinction matters more than it looks. A framework that scopes [`enter`](Self::enter)
+    /// to renders and callbacks — the correct thing for it to do — leaves the thread with *no*
+    /// default in between, so state created from a timer, a task, a `Drop`, or a test body is a
+    /// first install on an empty slot rather than a replacement of an expired one. Warning only
+    /// about expiry would miss every one of those, which is the common case.
     ///
     /// Applications that own a long-lived graph should not rely on that cache at all. Hold the
     /// reactor alive explicitly with [`enter`](Self::enter), which anchors it as the thread
@@ -385,23 +402,21 @@ impl Reactor {
 
         let reactor = Self::new();
         CURRENT_REACTOR.replace(Rc::downgrade(&reactor.inner));
-        let installs = DEFAULT_INSTALL_COUNT.with(|count| {
-            let installs = count.get().wrapping_add(1);
-            count.set(installs);
-            installs
-        });
-        if installs > 1 {
-            // The previous default expired while this thread was still using the ambient
-            // constructors. Nothing is broken *yet* — but nodes created from here on are on a
-            // different graph than the ones created before, and the two can never interact.
+        let had_default = HAS_HAD_DEFAULT.replace(true);
+        if had_default {
+            // This thread has had a default before and does not have one now, so whatever owned
+            // it is out of scope. Nothing is broken *yet* — but nodes created from here on are on
+            // a different graph than the ones created before, and the two can never interact:
+            // reads and writes will work perfectly and nothing will ever re-render.
             tracing::warn!(
                 target: trace_targets::GRAPH,
                 event = "current_reactor_reinstall",
-                installs,
-                "the thread's default reactor expired and a fresh, unrelated one was installed; \
-                 nodes created before and after this point are on separate graphs. Hold the \
-                 reactor alive with Reactor::enter, or use try_current to make the absence an \
-                 error"
+                reactor_id = reactor.inner.id.get(),
+                "this thread had a default reactor earlier and has none now, so a fresh, \
+                 unrelated one was installed; nodes created from here on are on a separate graph \
+                 from the ones created before. Hold the reactor alive with Reactor::enter for as \
+                 long as ambient constructors may run, create state with reactor.signal(..) and \
+                 friends, or use try_current to make the absence an error"
             );
         } else {
             tracing::debug!(
@@ -465,6 +480,10 @@ impl Reactor {
     pub fn enter(&self) -> EnterGuard {
         let previous_default = CURRENT_REACTOR.replace(Rc::downgrade(&self.inner));
         let previous_anchor = ANCHORED_REACTOR.replace(Some(Rc::clone(&self.inner)));
+        // Entering counts as the thread having had a default, so that ambient state created after
+        // the guard drops is reported. Without this the warning only covers a default that
+        // expired, and misses the far more common case of one that is simply not held right now.
+        HAS_HAD_DEFAULT.set(true);
         tracing::debug!(
             target: trace_targets::GRAPH,
             event = "reactor_enter",

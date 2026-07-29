@@ -85,6 +85,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `is_disposed` when liveness matters. `reactor_id` completes the
   `(ReactorId, NodeId)` pair that every diagnostic payload is scoped by.
 
+### Changed
+
+- `Reactor::current()` now warns whenever it installs a default implicitly on a thread
+  that has had one **at any earlier point**, rather than only when a previously installed
+  default expired. The old rule missed the case a UI framework actually hits: a framework
+  that scopes `enter` to renders and callbacks leaves the thread with no default in
+  between, so state created from a timer, a task, a `Drop`, or a test body was a *first*
+  install on an empty slot — silently joining a graph nobody flushes, which is exactly the
+  failure the warning exists to catch. `enter()` now records that the thread has had a
+  default, and the new rule is a superset of the old one. A thread that never entered a
+  reactor stays quiet, so scripts, doctests and tests are unaffected.
+
 ### Breaking
 
 - Every variant of `DiagnosticEvent` is now `#[non_exhaustive]`, not just the enum
