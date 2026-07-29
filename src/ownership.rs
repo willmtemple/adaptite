@@ -391,6 +391,10 @@ mod tests {
     use super::*;
     use crate::{Reactor, on_cleanup, scope};
 
+    // The audit's positive path only exists where the registry does. In a build with
+    // `debug_assertions` off, `audit_ownership` correctly answers `Unavailable`, so asserting
+    // `Consistent` here would be asserting that the build is a debug build.
+    #[cfg(debug_assertions)]
     #[test]
     fn the_audit_detects_a_gauge_that_has_drifted() {
         // Every other ownership test asserts the audit stays quiet, which cannot distinguish "the
@@ -439,6 +443,30 @@ mod tests {
                 "registry retained {} entries for {live} live owners",
                 registry_len()
             );
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    #[test]
+    fn the_audit_reports_unavailable_rather_than_consistent_without_a_registry() {
+        // `Unavailable` and `Consistent` must never be confused: the whole reason the result is a
+        // named enum rather than `Option<Vec<_>>` is that "cannot say" must not read as "nothing
+        // wrong". This asserts whichever answer this build owes, so it is meaningful in both.
+        std::thread::spawn(|| {
+            let (_handle, ()) = scope(|| {});
+            let audit = audit_ownership();
+            if cfg!(debug_assertions) {
+                assert_eq!(audit, OwnershipAudit::Consistent);
+            } else {
+                assert_eq!(
+                    audit,
+                    OwnershipAudit::Unavailable,
+                    "without a registry the honest answer is `cannot say`"
+                );
+            }
+            // Either way the assertion helper must not panic on a healthy graph.
+            debug_assert_ownership_consistent();
         })
         .join()
         .expect("test thread panicked");

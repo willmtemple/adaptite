@@ -108,6 +108,13 @@ run = "cop cop-checks/main.cop -t ."
 description = "Verify cop rule files compile"
 run = "cop verify cop-checks/"
 
+[tasks.test-release]
+description = "Run the tests against the optimized profile"
+# adaptite genuinely behaves differently there: the divergence guard, the ownership audit
+# registry and the cross-reactor assert are all `debug_assertions`-gated, so a release run
+# executes different code. A test asserting debug-only behaviour shipped broken here once.
+run = "cargo test --release --workspace --all-features"
+
 [tasks.lint-release]
 description = "Clippy against the optimized profile, where debug-only paths compile out"
 # The debug lint cannot see code that is only dead when `debug_assertions` is off — the
@@ -123,8 +130,8 @@ description = "Run every benchmark once, to prove they still build and execute"
 run = "cargo bench --bench graph -- --warm-up-time 0.1 --measurement-time 0.2 --sample-size 10"
 
 [tasks.check]
-description = "Run the full local gate (fmt, lint, lint-release, doc, test, cop)"
-depends = ["fmt", "lint", "lint-release", "doc", "test", "cop"]
+description = "Run the full local gate (fmt, lint, lint-release, doc, test, test-release, cop)"
+depends = ["fmt", "lint", "lint-release", "doc", "test", "test-release", "cop"]
 
 [tasks.msrv]
 description = "Build and test against the MSRV declared in Cargo.toml"

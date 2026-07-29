@@ -181,6 +181,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`untrack` leaked into computed nodes, freezing them permanently.** `UNTRACKED_DEPTH` is
+  a thread-global counter and `run_in_context` never reset it, so a `Thunk` or `Memo` whose
+  first recomputation happened inside an untracked region recorded **zero dependencies**,
+  settled clean, and was never invalidated again — silently and permanently stale, for every
+  reader, not only the untracked one. `untrack` means "do not record this read for whoever is
+  currently observing"; entering a computation now starts a fresh tracking scope, which is
+  what Solid and Leptos do.
+  This was reachable from entirely ordinary code, because the crate runs consumer callbacks
+  untracked in seven places — `watch` handlers, `Event` draining and immediate subscribers,
+  cleanups, memo comparators, `Signal::set`'s equality check, and `Resource` fetch closures.
+  A `watch` handler reading a memo was enough: the memo froze at its first value and
+  `.get()` returned it forever, everywhere. Nothing in the diagnostics could distinguish a
+  frozen node from a healthy constant one except a dependency count of zero.
+
 - **A cleanup panicking during thread teardown aborted the process.** Every ownership
   counter reached its thread-local with `LocalKey::with`, which *panics* once that value has
   been destroyed — and a panic in a destructor is a non-unwinding abort. Thread-local

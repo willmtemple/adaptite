@@ -46,6 +46,12 @@ jobs:
       # above. Two real dead-code findings came from this before it was a CI step.
       - name: Clippy (release profile)
         run: cargo clippy --release --workspace --all-targets -- -D warnings
+      # Not redundant with the debug test job: the divergence guard, the ownership audit
+      # registry and the cross-reactor assert are all `debug_assertions`-gated, so this runs
+      # genuinely different code. A test asserting debug-only behaviour shipped broken here
+      # once and no job noticed. Reuses the release artifacts the clippy step just built.
+      - name: Test (release profile)
+        run: cargo test --release --workspace
       # Advisory: an application can only reach the runite minor adaptite
       # declares, so a new runite minor is invisible downstream until adaptite
       # releases against it. Non-blocking because it depends on the network and

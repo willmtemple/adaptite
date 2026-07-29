@@ -275,6 +275,63 @@ fn a_nested_flush_takes_a_new_epoch_but_stays_in_the_same_drain() {
 }
 
 #[test]
+fn a_computation_that_first_runs_untracked_still_records_its_dependencies() {
+    use crate::{memo_in, signal_in, untrack, watch_in};
+    use std::cell::RefCell;
+
+    // `untrack` means "do not record this read for whoever is currently observing". It must not
+    // leak into a computed node that happens to recompute inside it: such a node would record
+    // zero dependencies, settle clean, and never be invalidated again — permanently and silently
+    // stale, for every reader, not just the untracked one.
+    let reactor = Reactor::new();
+    let base = signal_in(&reactor, 1_u64);
+    let doubled = memo_in(&reactor, {
+        let base = base.clone();
+        move || base.get() * 2
+    });
+
+    untrack(|| assert_eq!(doubled.get(), 2));
+    assert_eq!(
+        reactor.dependency_count(doubled.id()),
+        1,
+        "the memo's own read of `base` belongs to the memo, untracked caller or not"
+    );
+
+    base.set(50);
+    assert_eq!(doubled.get(), 100, "the memo must still be reactive");
+
+    // The path a consumer actually takes: handlers run untracked by design, so any of them may be
+    // the first to touch a stale memo. `watch`, `Event::on`, cleanups, comparators and `Resource`
+    // fetch closures are all in this position.
+    let tick = signal_in(&reactor, 0_u64);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let watcher = watch_in(
+        &reactor,
+        {
+            let tick = tick.clone();
+            move || tick.get()
+        },
+        {
+            let doubled = doubled.clone();
+            let seen = Rc::clone(&seen);
+            move |_, _| seen.borrow_mut().push(doubled.get())
+        },
+    );
+    reactor.flush_now();
+
+    base.set(21);
+    tick.set(1);
+    reactor.flush_now();
+    assert_eq!(
+        *seen.borrow(),
+        [100, 42],
+        "a memo first read from an untracked handler must keep updating"
+    );
+
+    watcher.dispose();
+}
+
+#[test]
 fn cycle_detection_panics_with_path_and_origins() {
     let reactor = Reactor::new();
     let a = reactor.allocate_node(NodeKind::Source);

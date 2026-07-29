@@ -526,12 +526,23 @@ impl Reactor {
         self.inner.stack.borrow_mut().push(observer);
         let inserted = self.inner.active_computations.borrow_mut().insert(observer);
         debug_assert!(inserted, "observer should not already be active");
+
+        // Entering a computation starts a fresh tracking scope. `untrack` says "do not record
+        // this read for whoever is currently observing" — it must not mean "and also record
+        // nothing for any node that happens to recompute inside it". Without this, a computed
+        // node first refreshed inside an untracked region records *zero* dependencies, settles
+        // clean, and is never invalidated again: silently and permanently stale. That is
+        // reachable from ordinary code, because the crate itself runs consumer callbacks
+        // untracked — `watch` and `Event` handlers, cleanups, comparators, `Resource` fetches —
+        // and any of them may be the first to read a stale memo.
+        let previous_untracked = UNTRACKED_DEPTH.with(|depth| depth.replace(0));
         #[cfg(debug_assertions)]
         let previous_running =
             RUNNING_REACTOR.with(|running| running.replace(Rc::as_ptr(&self.inner).cast::<()>()));
 
         struct Guard<'a> {
             inner: &'a ReactorInner,
+            previous_untracked: u32,
             #[cfg(debug_assertions)]
             previous_running: *const (),
         }
@@ -544,6 +555,7 @@ impl Reactor {
                     let removed = self.inner.active_computations.borrow_mut().remove(&node);
                     debug_assert!(removed, "observer should have been active");
                 }
+                UNTRACKED_DEPTH.with(|depth| depth.set(self.previous_untracked));
                 #[cfg(debug_assertions)]
                 RUNNING_REACTOR.with(|running| running.set(self.previous_running));
             }
@@ -551,6 +563,7 @@ impl Reactor {
 
         let _guard = Guard {
             inner: &self.inner,
+            previous_untracked,
             #[cfg(debug_assertions)]
             previous_running,
         };
