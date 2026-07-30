@@ -40,7 +40,10 @@ description = "Run clippy with warnings denied"
 run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 
 [tasks.doc]
-description = "Build documentation"
+description = "Build documentation, failing on broken links"
+# `-D warnings` matches CI. Moving code between modules silently breaks intra-doc links —
+# `cargo build` and `cargo test` both pass — so this belongs in the local gate, not only in CI.
+env = { RUSTDOCFLAGS = "-D warnings" }
 run = "cargo doc --workspace --all-features --no-deps"
 
 [tasks.bench]
@@ -65,7 +68,7 @@ shell = "bash -c"
 run = """
 set -euo pipefail
 for ex in spreadsheet stock_ticker screen_router signal_thunk_showcase \
-          tracing_subscriber_showcase readme_md_01 readme_md_02 readme_md_03; do
+          tracing_subscriber_showcase idle_audit readme_md_01 readme_md_02 readme_md_03; do
   echo "== example: $ex =="
   cargo run --quiet --example "$ex"
 done
@@ -84,8 +87,13 @@ set -euo pipefail
 declared="$(cargo metadata --format-version 1 --no-deps \
   | grep -o '"name":"runite","source":"[^"]*","req":"[^"]*"' \
   | grep -o '"req":"[^"]*"' | cut -d'"' -f4)"
+# The sparse index is newline-delimited JSON in *publication* order and it keeps yanked
+# entries, so the last line is the most recently uploaded version, not the highest one. This
+# used to read `| tail -1`, which a backported patch to an older minor, a prerelease, or a
+# yank each turn into a false failure against a perfectly current dependency. The helper
+# filters to stable, unyanked releases and sorts by semver; tests/release_fixes.rs pins it.
 latest="$(curl -sSf https://index.crates.io/ru/ni/runite \
-  | grep -o '"vers":"[^"]*"' | cut -d'"' -f4 | tail -1)"
+  | bash "${MISE_PROJECT_ROOT:-.}/.github/scripts/latest-stable-version.sh")"
 echo "declared: ${declared}   latest published: ${latest}"
 # Compare minors only: a patch release needs no manifest change.
 declared_minor="$(echo "${declared}" | tr -d '^~' | cut -d. -f1,2)"
@@ -97,6 +105,35 @@ if [ "${declared_minor}" != "${latest_minor}" ]; then
 fi
 """
 
+[tasks.min-versions]
+description = "Resolve every direct dependency at its declared floor and build against it"
+# A floor in Cargo.toml is a promise that the crate works there, and nothing else checks it:
+# normal resolution always takes the *maximum*, so a floor can be years wrong and every gate
+# stays green. `tracing = "0.1"` was exactly that -- runite calls `tracing::enabled!`, which
+# landed in 0.1.30, so the declared floor named 39 versions the crate cannot build against.
+#
+# Scope is `--lib` on purpose. `-Z direct-minimal-versions` minimises dev-dependencies too,
+# and criterion's and tracing-subscriber's own floors reach ancient proc-macro2 and
+# sharded-slab releases that no current rustc compiles. That is an upstream fact about the
+# test tooling, and no consumer of adaptite ever resolves it -- dev-dependencies are not part
+# of the published dependency graph. `--lib` checks the part that is.
+#
+# Needs nightly and the network, so this is not part of `check`; CI runs it advisory-only.
+shell = "bash -c"
+run = '''
+set -euo pipefail
+root="${MISE_PROJECT_ROOT:-.}"
+rustup toolchain install nightly --profile minimal --no-self-update
+# generate-lockfile rewrites Cargo.lock in place; put the committed one back on any exit.
+backup="$(mktemp)"
+cp "${root}/Cargo.lock" "${backup}"
+trap 'cp "${backup}" "${root}/Cargo.lock"; rm -f "${backup}"' EXIT
+cargo +nightly -Z direct-minimal-versions generate-lockfile
+echo "== resolved floors =="
+cargo tree --depth 1 --edges normal
+cargo +nightly -Z direct-minimal-versions build --lib --locked
+'''
+
 [tasks.cop]
 description = "Run Agent Cop static-analysis checks"
 run = "cop cop-checks/main.cop -t ."
@@ -105,6 +142,40 @@ run = "cop cop-checks/main.cop -t ."
 description = "Verify cop rule files compile"
 run = "cop verify cop-checks/"
 
+[tasks.test-release]
+description = "Run the tests against the optimized profile"
+# adaptite genuinely behaves differently there: the divergence guard, the ownership audit
+# registry and the cross-reactor assert are all `debug_assertions`-gated, so a release run
+# executes different code. A test asserting debug-only behaviour shipped broken here once.
+run = "cargo test --release --workspace --all-features"
+
+[tasks.lint-release]
+description = "Clippy against the optimized profile, where debug-only paths compile out"
+# The debug lint cannot see code that is only dead when `debug_assertions` is off — the
+# divergence guard and the ownership audit registry both have that shape.
+run = "cargo clippy --release --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.bench-smoke]
+description = "Run every benchmark once, to prove they still build and execute"
+# Deliberately not a timing gate: both real diagnostics regressions in 0.3 were 9% and 15.7%,
+# which is inside the run-to-run variance of a shared CI runner. A threshold loose enough not to
+# flake would have caught neither, and a flaky perf gate gets disabled and then protects nothing.
+# The A/B procedure in docs/diagnostics.md is the gate; this only stops the benches from rotting.
+run = "cargo bench --bench graph -- --warm-up-time 0.1 --measurement-time 0.2 --sample-size 10"
+
 [tasks.check]
-description = "Run the full local gate (fmt, lint, test, cop)"
-depends = ["fmt", "lint", "test", "cop"]
+description = "Run the full local gate (fmt, lint, lint-release, doc, test, test-release, cop)"
+depends = ["fmt", "lint", "lint-release", "doc", "test", "test-release", "cop"]
+
+[tasks.msrv]
+description = "Build and test against the MSRV declared in Cargo.toml"
+# The version is read from the manifest rather than repeated here, so the two cannot drift.
+shell = "bash -c"
+run = '''
+set -euo pipefail
+version="$(grep '^rust-version' Cargo.toml | cut -d'"' -f2)"
+echo "declared MSRV: ${version}"
+rustup toolchain install "${version}" --profile minimal --no-self-update
+cargo "+${version}" build --workspace --all-targets
+cargo "+${version}" test --workspace
+'''

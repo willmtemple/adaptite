@@ -49,9 +49,9 @@ Because that scheduling goes through runite's thread-local queues, adaptite and
 the application must resolve the **same** runite: two copies in one dependency
 tree means two queues, and adaptite's reactive work is flushed by a runtime
 nobody is driving. Adaptite therefore depends on a single runite minor at a time
-(`runite = "0.2"` for adaptite 0.2), and reaching a newer runite minor requires
-an adaptite release against it. An application should not pin runite itself; take
-whatever adaptite resolves.
+— the exact requirement is in adaptite's `Cargo.toml` — and reaching a newer
+runite minor requires an adaptite release against it. An application should not
+pin runite itself; take whatever adaptite resolves.
 
 Adaptite does not function across thread boundaries. It tracks dependencies
 between entities on the same thread only. Async work feeds the graph from the
@@ -120,11 +120,12 @@ assert_eq!(*painted.borrow(), [1]);
 # effect.dispose();
 ```
 
-Draining inside `Reactor::external_flush` gives the whole drain one flush epoch,
-which keeps the debug divergence guard meaningful across it and reports the
-drain to diagnostic consumers as a single flush. A run executed outside any
-flush opens one of its own. `EffectRun::run` must happen on the reactor's
-thread — verification and the effect body always do.
+Draining inside `Reactor::external_flush` reports the whole drain to diagnostic
+consumers as a single flush rather than one per effect. A run executed outside
+any flush opens one of its own. (The divergence guard counts per *drain* rather
+than per flush, so it stays meaningful across nested flushes either way.)
+`EffectRun::run` must happen on the reactor's thread — verification and the
+effect body always do.
 
 Discarding an `EffectRun` instead of running it is legal: the effect keeps its
 dirty mark and is scheduled again on its next invalidation, so a lane may drop
@@ -135,9 +136,12 @@ work for a subtree that is no longer visible without stranding it.
 An effect may write state it depends on, as long as the loop converges — for
 example clamping a value, normalizing input, or syncing two representations.
 Convergence is reached when the rewritten value is equal to the existing one
-and the write is suppressed. A loop that never converges is a bug: in debug
-builds, an effect that runs more than 100 times in a single flush panics with
-the effect's creation site instead of hanging the event loop.
+and the write is suppressed. A loop that never converges is a bug: an effect
+that runs more than 100 times in a single *drain* — the outermost flush and
+everything nested inside it — panics with the effect's creation site instead of
+hanging the event loop. **This guard is enforced in every build, release
+included** (it was debug-only before 0.3, so a release build hung instead);
+convergent feedback settles far below the limit and is unaffected.
 
 Synchronous read cycles (a thunk whose computation reads itself, directly or
 transitively) have no convergent interpretation and always panic, reporting
@@ -407,6 +411,10 @@ targets `adaptite::graph`, `adaptite::signal`, `adaptite::thunk`,
 and `adaptite::resource`. See `examples/tracing_subscriber_showcase.rs` for a
 suggested subscriber setup.
 
+These are for humans reading logs and may change in any release; several are
+debug-only and absent from optimized builds. A program that wants to *count*
+reactive work should read the typed diagnostics below instead.
+
 ## Causal diagnostics
 
 Performance tools can subscribe to a reactor's structured scheduling stream:
@@ -436,6 +444,47 @@ sink and return without reading or mutating the graph.
 Diagnostics are available in release builds. Without a subscription, the
 path is dormant and mutation/scheduling sites perform only a boolean check.
 Dropping `DiagnosticSubscription` removes the callback.
+
+## Accounting for the graph
+
+Two questions the event stream does not answer. `Reactor::graph_stats()` returns
+an `O(1)` account of what the reactor is holding — live nodes by kind, edges,
+observers, queued effects, peaks, and cumulative totals — cheap enough to call
+every frame and maintained whether or not anything is subscribed. The intended
+use is the difference between two snapshots, which turns a leak into an
+assertion:
+
+```rust
+use adaptite::{Reactor, signal_in};
+
+let reactor = Reactor::new();
+let before = reactor.graph_stats();
+
+let value = signal_in(&reactor, 0_u32);
+drop(value);
+
+let after = reactor.graph_stats();
+assert_eq!(after.nodes_created - before.nodes_created, 1);
+assert_eq!(after.live_nodes, before.live_nodes, "nothing was retained");
+```
+
+`Reactor::graph_snapshot()` is the walking counterpart: every node with its kind,
+origin, version and staleness, and every edge, for an inspector or a
+post-mortem rather than a per-frame check. And each `FlushFinished` event
+carries a `FlushStats` saying what that flush actually did, so a settled graph
+can be *asserted* idle rather than inferred idle from a CPU percentage.
+
+A graph can be clean and still leak, because ownership retains what the graph
+never sees — an effect that never re-runs keeps every cleanup it registered.
+`ownership_stats()` reports live owner frames, pending cleanups and owned
+children for the calling thread, and in tests
+`debug_assert_ownership_consistent()` checks those counts against a walk of the
+live owner tree.
+
+The full contract — identity, pairing and panic semantics, flush attribution,
+which counters are always maintained, and what it costs — is in
+[`docs/diagnostics.md`](https://github.com/willmtemple/adaptite/blob/main/docs/diagnostics.md)
+(also shipped inside the crate, and in the repository next to this file).
 
 ## License
 

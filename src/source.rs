@@ -1,6 +1,6 @@
 use alloc::rc::Rc;
 
-use crate::{NodeId, Reactor, current, trace_targets};
+use crate::{NodeId, NodeKind, Reactor, current, trace_targets};
 
 /// Creates a low-level reactive source node in the current reactor.
 #[track_caller]
@@ -104,6 +104,21 @@ impl Reactor {
     /// Hooks are unregistered when the `Source` is dropped, and a callback already queued at that
     /// point is cancelled.
     ///
+    /// # Do not let a hook capture its own `Source`
+    ///
+    /// Because the registry is keyed by node and only `Source`'s own drop removes the entry, a
+    /// hook that holds the `Source` it belongs to forms a cycle that retains the whole reactor for
+    /// the life of the process. It is easy to reach by accident: the node does not exist yet when
+    /// the hooks are supplied, so the natural shape is an `Rc<RefCell<Option<Source<T>>>>` slot
+    /// filled in afterwards, and capturing that slot by `Rc` closes the loop. Capture a
+    /// [`Weak`](alloc::rc::Weak) of it instead — that breaks the cycle at no cost.
+    ///
+    /// This is a leak the 0.3 instrumentation structurally **cannot** see: no owner frame is
+    /// created for a `Source`, so `ownership_stats()` counts nothing, and `graph_stats()` is
+    /// reachable only through the very handle that leaked. When checking for it, flush after the
+    /// last observer leaves — a queued-but-undelivered hook job holds its own reference and looks
+    /// like a leak that is not there.
+    ///
     /// # Staleness
     ///
     /// "Observed" here means *any recorded dependency edge*, which reflects each observer's most
@@ -160,7 +175,7 @@ impl Reactor {
 impl Source {
     #[track_caller]
     fn new(reactor: Reactor) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Source);
         tracing::debug!(
             target: trace_targets::GRAPH,
             event = "create_source",

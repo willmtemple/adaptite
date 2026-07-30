@@ -1,7 +1,9 @@
 use alloc::rc::Rc;
 use core::cell::RefCell;
 
-use crate::{NodeId, Reactor, current, trace_targets};
+use core::panic::Location;
+
+use crate::{DiagnosticEvent, NodeId, NodeKind, Reactor, current, trace_targets};
 
 /// Creates a [`Signal`] in the current thread's default reactor.
 ///
@@ -65,10 +67,36 @@ impl Reactor {
     }
 }
 
+/// Reports a write a source's equality check threw away.
+///
+/// Cold, and called behind a [`Reactor::diagnostics_enabled`] check at the site, so a suppressed
+/// write pays one cell load when nothing is listening.
+#[cold]
+#[inline(never)]
+fn report_suppressed_write(
+    reactor: &Reactor,
+    node: NodeId,
+    write_origin: &'static Location<'static>,
+) {
+    reactor.record_flush(|stats| {
+        stats.writes_suppressed = stats.writes_suppressed.saturating_add(1);
+    });
+    let Some(node_origin) = reactor.node_origin(node) else {
+        return;
+    };
+    reactor.emit_diagnostic(DiagnosticEvent::WriteSuppressed {
+        reactor: reactor.diagnostic_id(),
+        node,
+        kind: NodeKind::Signal,
+        node_origin,
+        write_origin,
+    });
+}
+
 impl<T: 'static> Signal<T> {
     #[track_caller]
     fn new(reactor: Reactor, initial: T) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Signal);
         tracing::debug!(
             target: trace_targets::SIGNAL,
             event = "create_signal",
@@ -105,6 +133,11 @@ impl<T: 'static> Signal<T> {
     }
 
     /// Runs `f` with a shared reference to the current value without recording a dependency.
+    ///
+    /// # Panics
+    ///
+    /// A shared borrow is held while `f` runs, exactly as in [`with`](Signal::with): writing this
+    /// same signal (`set`, `replace`, or `update`) from inside `f` panics with a borrow error.
     pub fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let value = self.inner.value.borrow();
         f(&value)
@@ -115,8 +148,25 @@ impl<T: 'static> Signal<T> {
         self.inner.reactor.clone()
     }
 
+    /// Returns this signal's node id, for use with the graph queries on
+    /// [`Reactor`] — [`observer_count`](Reactor::observer_count),
+    /// [`dependencies_of`](Reactor::dependencies_of), [`node_origin`](Reactor::node_origin) and
+    /// friends. Ids are unique within one reactor, so aggregate on
+    /// `(`[`Reactor::id`]`, id)`.
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
     /// Replaces the current value and marks dependents stale, even when the new value equals
     /// the old one (compare [`set`](Signal::set)).
+    ///
+    /// # Panics
+    ///
+    /// The value is swapped through a mutable borrow, so writing this same signal from inside a
+    /// closure that already holds one — [`with`](Signal::with), [`with_peek`](Signal::with_peek)
+    /// or [`update`](Signal::update) on *this* signal — panics with a borrow error. The panic is
+    /// std's bare `RefCell already borrowed`, but `#[track_caller]` attributes it to this call
+    /// site, so the offending write is named by line in every build.
     #[track_caller]
     pub fn replace(&self, value: T) -> T {
         let previous = self.inner.value.replace(value);
@@ -175,16 +225,42 @@ impl<T: PartialEq + 'static> Signal<T> {
     ///
     /// The equality check runs untracked, so a `PartialEq` implementation that reads reactive
     /// state records no dependencies for the currently running observer.
+    ///
+    /// # Panics
+    ///
+    /// A write borrows the value twice over: the equality check takes a shared borrow, and a write
+    /// that survives it takes a mutable one. So writing this same signal from inside a closure that
+    /// already holds a borrow — [`with`](Signal::with), [`with_peek`](Signal::with_peek) or
+    /// [`update`](Signal::update) on *this* signal — panics with a borrow error, as does a
+    /// `PartialEq` implementation that writes the very signal it was asked to compare. The panic is
+    /// std's bare `RefCell already borrowed`, but `#[track_caller]` attributes it to this call
+    /// site, so the offending write is named by line in every build.
     #[track_caller]
     pub fn set(&self, value: T) -> Option<T> {
         // Compare under a shared borrow, without tracking: a `PartialEq` impl that reads
         // reactive state must neither conflict with this signal's own borrow nor record
         // dependencies for whatever observer is performing the write.
+        //
+        // A collision here is deliberately *not* routed through a named diagnosis the way
+        // `Thunk`/`Memo` are (`report_value_busy`). That reporter earns its keep because a computed
+        // node collides inside adaptite — `recompute_inner`, reached by an innocent-looking read —
+        // and panics at a location the consumer never chose. Every `Signal` write path is
+        // `#[track_caller]`, so std's own borrow panic already names the offending
+        // `set`/`replace`/`update` line, in release as well as debug (measured). A `#[cold]`
+        // reporter would have to re-thread `Location::caller()` just to hold that ground, and would
+        // buy a longer sentence on the hottest write path. Documented instead; see `# Panics`.
         let unchanged = {
             let current = self.inner.value.borrow();
             crate::untrack(|| *current == value)
         };
         if unchanged {
+            // Reported in ordinary builds, not only under `debug_assertions`: the producer ran
+            // and its output was discarded, and that is exactly the work an optimized build needs
+            // to be able to see. A signal written eighty times and changed fourteen is a sampler
+            // running too fast, and the propagation stream cannot show it — nothing propagated.
+            if self.inner.reactor.diagnostics_enabled() {
+                report_suppressed_write(&self.inner.reactor, self.inner.id, Location::caller());
+            }
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::SIGNAL,

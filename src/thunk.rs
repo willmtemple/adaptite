@@ -1,9 +1,13 @@
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
+use core::panic::Location;
 
 use crate::reactor::{Mark, ObserverHook, State};
-use crate::{InvalidationCause, NodeId, Reactor, current, trace_targets};
+use crate::{
+    ComputeOutcome, DiagnosticEvent, InvalidationCause, NodeId, NodeKind, Reactor, current,
+    trace_targets,
+};
 
 type ComputeFn<T> = dyn Fn() -> T + 'static;
 type ComputePrevFn<T> = dyn Fn(Option<&T>) -> T + 'static;
@@ -333,7 +337,7 @@ impl Reactor {
 impl<T: 'static> Thunk<T> {
     #[track_caller]
     fn new(reactor: Reactor, compute: impl Fn() -> T + 'static) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Thunk);
         let inner = Rc::new(ThunkInner {
             reactor: reactor.clone(),
             id,
@@ -384,6 +388,15 @@ impl<T: 'static> Thunk<T> {
         self.inner.reactor.clone()
     }
 
+    /// Returns this thunk's node id, for use with the graph queries on
+    /// [`Reactor`] — [`observer_count`](Reactor::observer_count),
+    /// [`dependencies_of`](Reactor::dependencies_of), [`node_origin`](Reactor::node_origin) and
+    /// friends. Ids are unique within one reactor, so aggregate on
+    /// `(`[`Reactor::id`]`, id)`.
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
     /// Runs `f` with a shared reference to the current computed value without recording a
     /// dependency. The thunk is still brought up to date before `f` runs.
     ///
@@ -419,7 +432,7 @@ impl<T: 'static> Memo<T> {
         equals: impl Fn(&T, &T) -> bool + 'static,
         compute: impl Fn(Option<&T>) -> T + 'static,
     ) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Memo);
         let inner = Rc::new(MemoInner {
             reactor: reactor.clone(),
             id,
@@ -472,6 +485,15 @@ impl<T: 'static> Memo<T> {
         self.inner.reactor.clone()
     }
 
+    /// Returns this memo's node id, for use with the graph queries on
+    /// [`Reactor`] — [`observer_count`](Reactor::observer_count),
+    /// [`dependencies_of`](Reactor::dependencies_of), [`node_origin`](Reactor::node_origin) and
+    /// friends. Ids are unique within one reactor, so aggregate on
+    /// `(`[`Reactor::id`]`, id)`.
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
     /// Runs `f` with a shared reference to the current computed value without recording a
     /// dependency. The memo is still brought up to date before `f` runs.
     ///
@@ -505,19 +527,143 @@ impl<T: Clone + 'static> Memo<T> {
 fn mark_computed(
     reactor: &Reactor,
     id: NodeId,
+    kind: NodeKind,
     state: &Cell<State>,
     mark: Mark,
     cause: Option<InvalidationCause>,
 ) {
     let target = State::from(mark);
     let previous = state.get();
-    if previous >= target {
+    let state_changed = previous < target;
+
+    // Reported for every delivery, not only the ones that change state, so the stream shows
+    // propagation *reaching* this node — `state_changed` is what separates a mark that did
+    // something from one that coalesced. `cause` is `Some` only while diagnostics are subscribed,
+    // which is what keeps this dormant.
+    if let Some(cause) = cause
+        && let Some(node_origin) = reactor.node_origin(id)
+    {
+        reactor.emit_diagnostic(DiagnosticEvent::ComputedInvalidated {
+            reactor: reactor.diagnostic_id(),
+            node: id,
+            kind,
+            node_origin,
+            cause,
+            level: mark.into(),
+            flush_epoch: reactor.flush_epoch(),
+            state_changed,
+        });
+    }
+
+    if !state_changed {
         return;
     }
     state.set(target);
     if previous == State::Clean {
         reactor.mark_dependents(id, Mark::Check, cause);
     }
+}
+
+/// Emits the paired recompute events, closing the pair even when the computation unwinds.
+///
+/// Opens as [`ComputeOutcome::Panicked`] and is corrected by [`completed`](Self::completed) on the
+/// way out — the same shape as [`crate::reactor::DirtyOnUnwind`], and for the same reason: the
+/// unwind path is the one that must not be forgotten.
+/// Constructed only when diagnostics are subscribed. Recomputation is hot enough that the
+/// dormant path must not acquire a drop obligation at all — a guard that exists and does nothing
+/// still costs, measurably, so the branch is at the call site and this type lives on the cold
+/// side of it.
+struct RecomputeSpan<'a> {
+    reactor: &'a Reactor,
+    node: NodeId,
+    kind: NodeKind,
+    /// Captured once at open: the node can be disposed before the span closes, and a trace sink
+    /// still needs to know where it came from.
+    node_origin: &'static Location<'static>,
+    flush_epoch: u64,
+    changed: bool,
+    outcome: ComputeOutcome,
+}
+
+impl<'a> RecomputeSpan<'a> {
+    fn open(reactor: &'a Reactor, node: NodeId, kind: NodeKind) -> Self {
+        let flush_epoch = reactor.flush_epoch();
+        let node_origin = reactor
+            .node_origin(node)
+            .unwrap_or_else(|| Location::caller());
+        reactor.record_flush(|stats| {
+            stats.computed_recomputed = stats.computed_recomputed.saturating_add(1);
+        });
+        reactor.emit_diagnostic(DiagnosticEvent::ComputedRecomputeStarted {
+            reactor: reactor.diagnostic_id(),
+            node,
+            kind,
+            node_origin,
+            flush_epoch,
+            dependencies_before: reactor.dependency_count(node),
+        });
+        Self {
+            reactor,
+            node,
+            kind,
+            node_origin,
+            flush_epoch,
+            changed: false,
+            outcome: ComputeOutcome::Panicked,
+        }
+    }
+
+    fn completed(&mut self, changed: bool) {
+        self.outcome = ComputeOutcome::Completed;
+        self.changed = changed;
+        self.reactor.record_flush(|stats| {
+            if changed {
+                stats.computed_changed = stats.computed_changed.saturating_add(1);
+            } else {
+                stats.computed_suppressed = stats.computed_suppressed.saturating_add(1);
+            }
+        });
+    }
+}
+
+impl Drop for RecomputeSpan<'_> {
+    fn drop(&mut self) {
+        self.reactor
+            .emit_diagnostic(DiagnosticEvent::ComputedRecomputeFinished {
+                reactor: self.reactor.diagnostic_id(),
+                node: self.node,
+                kind: self.kind,
+                node_origin: self.node_origin,
+                flush_epoch: self.flush_epoch,
+                // On the unwind path this reports the edges recorded before the panic, which is
+                // what the node is actually holding.
+                dependencies_after: self.reactor.dependency_count(self.node),
+                changed: self.changed,
+                outcome: self.outcome,
+            });
+    }
+}
+
+/// Reports the outcome of verifying a check-marked computed node.
+///
+/// Cold, and called behind a [`Reactor::diagnostics_enabled`] check at the site, so verification
+/// pays one cell load when nothing is listening.
+#[cold]
+#[inline(never)]
+fn report_verification(reactor: &Reactor, node: NodeId, kind: NodeKind, recomputed: bool) {
+    reactor
+        .record_flush(|stats| stats.computed_verified = stats.computed_verified.saturating_add(1));
+    let Some(node_origin) = reactor.node_origin(node) else {
+        return;
+    };
+    reactor.emit_diagnostic(DiagnosticEvent::ComputedVerified {
+        reactor: reactor.diagnostic_id(),
+        node,
+        kind,
+        node_origin,
+        flush_epoch: reactor.flush_epoch(),
+        recomputed,
+    });
 }
 
 impl<T> core::fmt::Debug for Thunk<T> {
@@ -549,7 +695,11 @@ impl<T> ThunkInner<T> {
         match self.state.get() {
             State::Clean => {}
             State::Check => {
-                if self.reactor.dependencies_changed(self.id) {
+                let changed = self.reactor.dependencies_changed(self.id);
+                if self.reactor.diagnostics_enabled() {
+                    report_verification(&self.reactor, self.id, NodeKind::Thunk, changed);
+                }
+                if changed {
                     self.recompute();
                 } else {
                     self.state.set(State::Clean);
@@ -560,6 +710,16 @@ impl<T> ThunkInner<T> {
     }
 
     fn recompute(&self) {
+        if !self.reactor.diagnostics_enabled() {
+            self.recompute_inner();
+            return;
+        }
+        let mut report = RecomputeSpan::open(&self.reactor, self.id, NodeKind::Thunk);
+        self.recompute_inner();
+        report.completed(true);
+    }
+
+    fn recompute_inner(&self) {
         let _span = tracing::debug_span!(
             target: trace_targets::THUNK,
             "thunk.recompute",
@@ -576,10 +736,35 @@ impl<T> ThunkInner<T> {
         };
         let next = self.reactor.run_in_context(self.id, || (self.compute)());
         guard.armed = false;
-        *self.value.borrow_mut() = Some(next);
+        match self.value.try_borrow_mut() {
+            Ok(mut slot) => *slot = Some(next),
+            Err(_) => report_value_busy(&self.reactor, self.id, "thunk"),
+        }
         // A thunk has no equality comparator, so every recomputation counts as a change.
         self.reactor.bump_version(self.id);
     }
+}
+
+/// Reports a recomputation that collided with a live borrow of the cached value.
+///
+/// Reachable from ordinary code: a closure passed to `with` or `with_peek` holds a shared borrow
+/// of the value for its whole body, so invalidating that same node and reading it back inside the
+/// closure forces a recomputation that must replace the value the closure is still holding.
+/// Without this the consumer sees a bare `RefCell already borrowed` naming neither the node, its
+/// origin, nor `with` — an implementation detail they never chose, in a build with no debug info.
+#[cold]
+#[inline(never)]
+fn report_value_busy(reactor: &Reactor, id: NodeId, kind: &str) -> ! {
+    let origin = reactor
+        .node_origin(id)
+        .map(|location| location.to_string())
+        .unwrap_or_else(|| "<unknown>".into());
+    panic!(
+        "adaptite: the {kind} created at {origin} had to recompute while its cached value was \
+         still borrowed. A closure passed to `with` or `with_peek` holds that borrow for its \
+         whole body, so invalidating this {kind} and reading it back from inside the closure \
+         cannot work. Clone or copy what you need out of the closure, then invalidate"
+    )
 }
 
 struct MemoInner<T> {
@@ -596,7 +781,11 @@ impl<T> MemoInner<T> {
         match self.state.get() {
             State::Clean => {}
             State::Check => {
-                if self.reactor.dependencies_changed(self.id) {
+                let changed = self.reactor.dependencies_changed(self.id);
+                if self.reactor.diagnostics_enabled() {
+                    report_verification(&self.reactor, self.id, NodeKind::Memo, changed);
+                }
+                if changed {
                     self.recompute();
                 } else {
                     self.state.set(State::Clean);
@@ -609,6 +798,16 @@ impl<T> MemoInner<T> {
     }
 
     fn recompute(&self) {
+        if !self.reactor.diagnostics_enabled() {
+            self.recompute_inner();
+            return;
+        }
+        let mut report = RecomputeSpan::open(&self.reactor, self.id, NodeKind::Memo);
+        let changed = self.recompute_inner();
+        report.completed(changed);
+    }
+
+    fn recompute_inner(&self) -> bool {
         let _span = tracing::debug_span!(
             target: trace_targets::MEMO,
             "memo.recompute",
@@ -639,7 +838,10 @@ impl<T> MemoInner<T> {
                 None => true,
             }
         };
-        *self.value.borrow_mut() = Some(next);
+        match self.value.try_borrow_mut() {
+            Ok(mut slot) => *slot = Some(next),
+            Err(_) => report_value_busy(&self.reactor, self.id, "memo"),
+        }
         if changed {
             self.reactor.bump_version(self.id);
         }
@@ -650,6 +852,7 @@ impl<T> MemoInner<T> {
             changed,
             "recomputed memo"
         );
+        changed
     }
 }
 
@@ -663,11 +866,22 @@ impl<T: 'static> ObserverHook for ThunkInner<T> {
             ?mark,
             "marking thunk stale"
         );
-        mark_computed(&self.reactor, self.id, &self.state, mark, cause);
+        mark_computed(
+            &self.reactor,
+            self.id,
+            NodeKind::Thunk,
+            &self.state,
+            mark,
+            cause,
+        );
     }
 
     fn refresh(&self) {
         ThunkInner::refresh(self);
+    }
+
+    fn state(&self) -> State {
+        self.state.get()
     }
 }
 
@@ -688,11 +902,22 @@ impl<T: 'static> ObserverHook for MemoInner<T> {
             ?mark,
             "marking memo stale"
         );
-        mark_computed(&self.reactor, self.id, &self.state, mark, cause);
+        mark_computed(
+            &self.reactor,
+            self.id,
+            NodeKind::Memo,
+            &self.state,
+            mark,
+            cause,
+        );
     }
 
     fn refresh(&self) {
         MemoInner::refresh(self);
+    }
+
+    fn state(&self) -> State {
+        self.state.get()
     }
 }
 

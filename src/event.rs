@@ -3,10 +3,14 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
-use hashbrown::HashMap;
+// A `BTreeMap` rather than a hash map: subscriber ids come from a monotonic counter, so
+// ordered iteration *is* registration order. `Event::on` feeds its queue from an ordinary
+// immediate subscriber, so with hash iteration a re-entrant `emit` could enqueue values out of
+// emission order — contradicting the documented guarantee — and the order varied per process.
+use alloc::collections::BTreeMap;
 
 use crate::scope::{OwnedDisposable, adopt_into_current};
-use crate::{NodeId, Reactor, current, trace_targets};
+use crate::{NodeId, NodeKind, Reactor, current, trace_targets};
 
 type SubscriberFn<T> = dyn Fn(&T) + 'static;
 
@@ -222,9 +226,18 @@ impl Reactor {
 }
 
 impl<T: 'static> Event<T> {
+    /// Returns this event's node id, for use with the graph queries on
+    /// [`Reactor`] — [`observer_count`](Reactor::observer_count),
+    /// [`dependencies_of`](Reactor::dependencies_of), [`node_origin`](Reactor::node_origin) and
+    /// friends. Ids are unique within one reactor, so aggregate on
+    /// `(`[`Reactor::id`]`, id)`.
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
     #[track_caller]
     fn new(reactor: Reactor) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Event);
         tracing::debug!(
             target: trace_targets::EVENT,
             event = "create_event",
@@ -324,10 +337,10 @@ impl<T> Drop for EventInner<T> {
 
 impl Subscription {
     #[track_caller]
-    fn new(cancel: impl Fn() + 'static) -> Self {
+    fn new(cancel: impl FnOnce() + 'static) -> Self {
         let inner = Rc::new(SubscriptionInner {
             active: Cell::new(true),
-            cancel: Box::new(cancel),
+            cancel: RefCell::new(Some(Box::new(cancel))),
         });
         // If an owner (an enclosing effect run or scope) is active, it keeps this subscription
         // alive and cancels it. Crucially, for `on` this ties the queue-feeding direct
@@ -349,9 +362,15 @@ impl Subscription {
         self.inner.active.get()
     }
 
-    /// Consumes the subscription and leaks it, keeping the subscriber active for the remainder
-    /// of the program. You CANNOT recover a `Subscription` after calling this method, so be sure
-    /// to call it on a subscription you will never need to cancel.
+    /// Consumes the handle without cancelling the subscription, letting an unowned subscriber
+    /// stay active for the remainder of the program.
+    ///
+    /// This forfeits only the handle's lifetime management: a subscription created inside an
+    /// owner (an effect's run, or a [`crate::scope`]) is still cancelled with that owner — `leak`
+    /// is not a way to detach from it, and calling it there costs an allocation without buying
+    /// any lifetime. The same carve-out as [`crate::EffectHandle::leak`]. You CANNOT recover a
+    /// `Subscription` after calling this method, so be sure to call it on a subscription you will
+    /// never need to cancel.
     pub fn leak(self) {
         core::mem::forget(self);
     }
@@ -377,17 +396,30 @@ struct EventInner<T> {
     reactor: Reactor,
     id: NodeId,
     next_subscriber: Cell<usize>,
-    subscribers: RefCell<HashMap<usize, Rc<SubscriberFn<T>>>>,
+    subscribers: RefCell<BTreeMap<usize, Rc<SubscriberFn<T>>>>,
 }
 
 struct SubscriptionInner {
     active: Cell<bool>,
-    cancel: Box<dyn Fn() + 'static>,
+    /// Runs once, and is released as it runs.
+    ///
+    /// `FnOnce` in an `Option` rather than a `Fn`, because what this closure captures is not
+    /// incidental: for [`Event::subscribe`] it is an `Rc<EventInner>`, and for [`Reactor::on`] it
+    /// is the draining [`crate::EffectHandle`] and the consumer's handler as well. Keeping it
+    /// after cancellation means a `Subscription` the consumer has explicitly cancelled — and
+    /// which reports `is_active() == false` — still pins its event's graph node and the whole
+    /// handler environment, for as long as any handle is held. `DiagnosticSubscription` in
+    /// `crate::diagnostics` has always had this shape; this is the same reasoning.
+    cancel: RefCell<Option<Box<dyn FnOnce() + 'static>>>,
 }
 
 impl OwnedDisposable for SubscriptionInner {
     fn dispose_owned(&self) {
         self.unsubscribe();
+    }
+
+    fn is_disposed_owned(&self) -> bool {
+        !self.active.get()
     }
 }
 
@@ -402,13 +434,77 @@ impl SubscriptionInner {
             event = "unsubscribe",
             "cancelling subscription"
         );
-        (self.cancel)();
+        // Taken before it is called, not after: the borrow must not be held while consumer code
+        // runs (cancelling `on` disposes an effect, which runs cleanups), and a closure that
+        // panics must still be released rather than left to pin its event forever.
+        let cancel = self.cancel.borrow_mut().take();
+        if let Some(cancel) = cancel {
+            cancel();
+        }
     }
 }
 
 impl Drop for SubscriptionInner {
     fn drop(&mut self) {
         self.unsubscribe();
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    use crate::{Reactor, event_in};
+
+    #[test]
+    fn immediate_subscribers_run_in_registration_order() {
+        // Hash iteration made this arbitrary and different on every process run, so a consumer
+        // registering a logger before a handler had no guarantee about which ran first.
+        let reactor = Reactor::new();
+        let stream = event_in::<u32>(&reactor);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let _subs = (0..8)
+            .map(|i| {
+                let seen = Rc::clone(&seen);
+                stream.subscribe(move |_| seen.borrow_mut().push(i))
+            })
+            .collect::<Vec<_>>();
+        stream.emit(1);
+
+        assert_eq!(*seen.borrow(), [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn a_re_entrant_emit_still_drains_in_emission_order() {
+        // `on` documents delivery "in emission order". Its queue is fed by an ordinary immediate
+        // subscriber, so when another subscriber re-emits, the two enqueues raced in hash order:
+        // the nested value could be queued first and delivered before the value that caused it.
+        let reactor = Reactor::new();
+        let stream = event_in::<u32>(&reactor);
+        let drained = Rc::new(RefCell::new(Vec::new()));
+
+        let _drain = reactor.on(&stream, {
+            let drained = Rc::clone(&drained);
+            move |value| drained.borrow_mut().push(*value)
+        });
+        let _echo = stream.subscribe({
+            let stream = stream.clone();
+            move |value| {
+                if *value < 100 {
+                    stream.emit(value + 100);
+                }
+            }
+        });
+
+        stream.emit(1);
+        reactor.flush_now();
+        assert_eq!(
+            *drained.borrow(),
+            [1, 101],
+            "the value that triggered the nested emit must be delivered first"
+        );
     }
 }
 

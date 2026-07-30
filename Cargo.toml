@@ -1,6 +1,6 @@
 [package]
 name = "adaptite"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Fine-grained reactivity (signals, thunks, memos, effects, events) for the runite runtime"
@@ -22,6 +22,13 @@ exclude = [
   "mise.toml",
   "rust-toolchain.toml",
   "ROADMAP.md",
+  # Process record of the 0.3 review with downstream consumers: quotes their repositories,
+  # names unreleased plans, and answers questions a crates.io user never asked. `docs/` is
+  # otherwise user-facing (the diagnostics contract, migration guides) and does ship.
+  "/docs/0.3-consumer-responses.md",
+  # Design survey of other reactive systems: useful for deciding what to build, not for using
+  # the crate, and it quotes other projects at length.
+  "/docs/prior-art.md",
 ]
 
 [dependencies]
@@ -30,8 +37,13 @@ exclude = [
 # resolve the same runite the application does, or reactive work lands on a
 # microtask queue nobody drains. Track one runite minor at a time and cut an
 # adaptite release for each; see `mise run runite-current` for the drift check.
-runite = "0.2"
-tracing = { version = "0.1", default-features = false }
+runite = "0.3"
+# The floors below are the lowest versions that actually build and pass the suite, not the
+# lowest that parse. `tracing = "0.1"` was unsatisfiable: runite calls `tracing::enabled!`,
+# which landed in 0.1.30, so a minimal-versions resolve picked 0.1.0 and then failed on
+# runite's `std` feature. `mise run min-versions` re-checks this.
+tracing = { version = "0.1.30", default-features = false }
+# 0.17.0 is the oldest published 0.17.x and it builds and tests clean, so `0.17` is exact.
 hashbrown = "0.17"
 
 [dev-dependencies]

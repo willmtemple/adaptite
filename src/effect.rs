@@ -9,11 +9,15 @@ use crate::scope::{
     OwnedDisposable, OwnerFrame, adopt_into_current, build_error_info, error_handler_for,
     with_owner,
 };
-use crate::{DiagnosticEvent, InvalidationCause, NodeId, Reactor, current, trace_targets};
+use crate::{
+    DiagnosticEvent, InvalidationCause, NodeId, NodeKind, Reactor, ReactorId, current,
+    trace_targets,
+};
 
 /// Maximum number of times a single effect may run within one job flush before the reactor
-/// assumes it is caught in a divergent feedback loop (debug builds only).
-#[cfg(debug_assertions)]
+/// assumes it is caught in a divergent feedback loop.
+///
+/// Enforced in every build. Convergent feedback settles far below this.
 const MAX_RUNS_PER_FLUSH: u32 = 100;
 
 /// Creates an effect in the current thread's default reactor.
@@ -35,11 +39,17 @@ const MAX_RUNS_PER_FLUSH: u32 = 100;
 ///
 /// # Panics
 ///
-/// Debug builds panic when the effect runs more than 100 times within a single flush, which
-/// indicates a divergent feedback loop: the effect writes state it (transitively) depends on
-/// with a value that never converges. The panic message names the effect's creation site.
-/// Convergent feedback (for example clamping, where the rewritten value is suppressed by the
-/// signal's equality check) is legal and settles well below the limit.
+/// Panics — in **every** build, release included — when the effect runs more than 100 times
+/// within a single *drain*: the outermost flush and everything nested inside it, so a re-entrant
+/// [`Reactor::flush_now`] cannot reset the count. That indicates a divergent feedback loop: the
+/// effect writes state it (transitively) depends on with a value that never converges. The panic
+/// message names the effect's creation site. Convergent feedback (for example clamping, where the
+/// rewritten value is suppressed by the signal's equality check) is legal and settles well below
+/// the limit.
+///
+/// The guard is deliberately not scoped to `debug_assertions`. The alternative to panicking in a
+/// release build is not that the application carries on — it is a flush that never returns, with
+/// no panic, no log and nothing for a user to report.
 ///
 /// Both behaviors above describe an effect with no enclosing error boundary. Under a
 /// [`crate::scope_catch`], any panic from this effect — from its body or from dependency
@@ -177,7 +187,6 @@ impl EffectRun {
         // divergence guard does not accumulate unrelated runs into whichever epoch the reactor's
         // last microtask flush happened to leave behind.
         let reactor = effect.reactor.clone();
-        reactor.begin_flush();
 
         struct Guard<'a>(&'a Reactor);
 
@@ -187,7 +196,15 @@ impl EffectRun {
             }
         }
 
+        // Armed *before* the flush is opened, for the same reason as `Reactor::external_flush`:
+        // `begin_flush` increments `flush_depth` first and calls consumer code — the
+        // `FlushStarted` subscriber — last. Constructing the guard afterwards meant a panic
+        // escaping that subscriber stranded `flush_depth` at 1 for the rest of the process, and
+        // a stranded depth freezes `drain_epoch`, so the divergence guard then panicked on the
+        // 101st ordinary run of whatever innocent effect came next. Arming first costs nothing:
+        // the guard's only job is the matching decrement, and `end_flush` saturates.
         let _guard = Guard(&reactor);
+        reactor.begin_flush();
         effect.run_scheduled();
     }
 
@@ -215,7 +232,7 @@ impl Drop for EffectRun {
     /// invalidation schedules it afresh and the missed change is not lost.
     fn drop(&mut self) {
         if let Some(effect) = self.effect.upgrade() {
-            effect.scheduled.set(false);
+            effect.unlatch_scheduled();
         }
     }
 }
@@ -245,6 +262,11 @@ impl Reactor {
     ///
     /// The effect is scheduled immediately and then re-scheduled whenever one of its dependencies
     /// changes.
+    ///
+    /// # Panics
+    ///
+    /// In every build, release included, when the effect runs more than 100 times within a single
+    /// drain — a divergent feedback loop. The free function `effect` documents the guard in full.
     #[track_caller]
     pub fn effect(&self, f: impl Fn() + 'static) -> EffectHandle {
         EffectHandle::new(self.clone(), None, f)
@@ -257,6 +279,11 @@ impl Reactor {
     /// drained in whatever order and at whatever moment suits the host — instead of adaptite
     /// imposing a phase list. See [`EffectScheduler`] for the contract and
     /// [`external_flush`](Self::external_flush) for draining a queue as one flush.
+    ///
+    /// # Panics
+    ///
+    /// In every build, release included, when the effect runs more than 100 times within a single
+    /// drain — a divergent feedback loop. The free function `effect` documents the guard in full.
     ///
     /// # Examples
     ///
@@ -312,7 +339,7 @@ impl EffectHandle {
         scheduler: Option<Rc<dyn EffectScheduler>>,
         effect: impl Fn() + 'static,
     ) -> Self {
-        let id = reactor.allocate_node();
+        let id = reactor.allocate_node(NodeKind::Effect);
         let inner = Rc::new(EffectInner {
             reactor: reactor.clone(),
             id,
@@ -320,13 +347,13 @@ impl EffectHandle {
             scheduler,
             state: Cell::new(State::Dirty),
             scheduled: Cell::new(false),
+            rerun_after_current: Cell::new(false),
+            running: Cell::new(false),
             disposed: Cell::new(false),
             self_ref: RefCell::new(Weak::new()),
             owner: OwnerFrame::new(),
-            #[cfg(debug_assertions)]
-            last_flush_epoch: Cell::new(u64::MAX),
-            #[cfg(debug_assertions)]
-            runs_this_flush: Cell::new(0),
+            last_drain_epoch: Cell::new(u64::MAX),
+            runs_this_drain: Cell::new(0),
         });
         *inner.self_ref.borrow_mut() = Rc::downgrade(&inner);
         tracing::debug!(
@@ -360,6 +387,20 @@ impl EffectHandle {
     /// Disposes the effect immediately: runs cleanups registered during its last run, disposes
     /// nested effects and scopes it owns, and unhooks it from the graph. A run already queued
     /// for the next flush is skipped. Disposing an already-disposed effect is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Teardown is total, so a panicking cleanup does not strand the rest: every cleanup and
+    /// every owned child gets an attempt regardless, and the effect is unhooked from the graph
+    /// either way. But the failure is not swallowed — the **first** panic captured during
+    /// teardown is re-raised out of this call once teardown has finished, and later ones are
+    /// logged at `error` and dropped. So `dispose` can unwind with a payload thrown by consumer
+    /// code, not by adaptite.
+    ///
+    /// The exception is teardown that begins while the thread is *already* unwinding — this
+    /// method reached from a `Drop` during a panic. Re-raising there would abort the process, so
+    /// the payload is logged instead and the original panic continues to propagate. See
+    /// `docs/MIGRATING-0.3.md` ("Behaviour change: teardown is total") for the full contract.
     ///
     /// # Examples
     ///
@@ -396,6 +437,49 @@ impl EffectHandle {
     pub fn is_disposed(&self) -> bool {
         self.inner.disposed.get()
     }
+
+    /// Returns the effect's node identity, stable for as long as the effect exists.
+    ///
+    /// This is the same id [`EffectRun::id`] reports, available from the moment the effect is
+    /// created rather than from its first scheduled run — which is what lets a consumer key a
+    /// retained structure by effect without bookkeeping around the initial run.
+    ///
+    /// Node ids are process-local and **never reused**: the allocator is a monotonic counter and
+    /// disposal does not return an id to it. An id kept past disposal therefore dangles, but it
+    /// can never come to mean a different node. Pair it with [`is_disposed`](Self::is_disposed)
+    /// when liveness matters. The id grants no access to the graph.
+    ///
+    /// [`NodeId`] is unique only within one reactor, so aggregate on
+    /// `(`[`reactor_id`](Self::reactor_id)`, id)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use adaptite::Reactor;
+    ///
+    /// let reactor = Reactor::new();
+    /// let effect = reactor.effect(|| {});
+    ///
+    /// // Stable across runs and across disposal.
+    /// let id = effect.id();
+    /// reactor.flush_now();
+    /// assert_eq!(effect.id(), id);
+    /// effect.dispose();
+    /// assert_eq!(effect.id(), id);
+    ///
+    /// assert_eq!(effect.reactor_id(), reactor.id());
+    /// ```
+    pub fn id(&self) -> NodeId {
+        self.inner.id
+    }
+
+    /// Returns the identity of the reactor this effect belongs to.
+    ///
+    /// Diagnostic payloads are scoped `(ReactorId, NodeId)`; this is the half a handle could not
+    /// supply before.
+    pub fn reactor_id(&self) -> ReactorId {
+        self.inner.reactor.id()
+    }
 }
 
 impl core::fmt::Debug for EffectHandle {
@@ -415,21 +499,60 @@ struct EffectInner {
     scheduler: Option<Rc<dyn EffectScheduler>>,
     state: Cell<State>,
     scheduled: Cell<bool>,
+    /// Set when a run was requested while this effect was already running, so the run can be
+    /// re-queued once the current one finishes instead of re-entering it.
+    rerun_after_current: Cell<bool>,
+    /// Set for the whole of a run — teardown *and* body — so re-entry is deferred across both.
+    ///
+    /// The reactor's tracked-computation window opens at the body, but `OwnerFrame::reset` runs
+    /// consumer cleanups before it, and a cleanup that writes a dependency and flushes reaches
+    /// this effect while its previous generation of children and cleanups is still being taken
+    /// down. Re-entering there is as incoherent as re-entering the body: both generations end up
+    /// live at once.
+    running: Cell<bool>,
     disposed: Cell<bool>,
     self_ref: RefCell<Weak<EffectInner>>,
     /// Ownership frame for cleanups and nested effects created during this effect's runs.
     owner: Rc<OwnerFrame>,
-    #[cfg(debug_assertions)]
-    last_flush_epoch: Cell<u64>,
-    #[cfg(debug_assertions)]
-    runs_this_flush: Cell<u32>,
+    /// Divergence guard state. Deliberately *not* `cfg(debug_assertions)`: a runaway loop in a
+    /// release build is a frozen application with no output, which is the worst failure mode a UI
+    /// host can have and the one configuration where adaptite used to say nothing.
+    last_drain_epoch: Cell<u64>,
+    runs_this_drain: Cell<u32>,
 }
 
 impl EffectInner {
+    /// Claims the "a run is pending" latch, returning `true` if one already was.
+    ///
+    /// The latch and the reactor's queued-effect gauge are the same fact, so they move together
+    /// here rather than at each of the four sites that touch the latch — the gauge cannot drift
+    /// from the thing it reports.
+    fn latch_scheduled(&self) -> bool {
+        let already = self.scheduled.replace(true);
+        if !already {
+            self.reactor.counters().effect_queued();
+        }
+        already
+    }
+
+    /// Releases the latch, whether the pending run was executed or discarded.
+    fn unlatch_scheduled(&self) {
+        if self.scheduled.replace(false) {
+            self.reactor.counters().effect_unqueued();
+        }
+    }
+
     fn schedule(&self) {
-        let skipped = self.disposed.get() || self.scheduled.replace(true);
+        let skipped = self.disposed.get() || self.latch_scheduled();
+        self.reactor.record_flush(|stats| {
+            if skipped {
+                stats.effects_coalesced = stats.effects_coalesced.saturating_add(1);
+            } else {
+                stats.effects_queued = stats.effects_queued.saturating_add(1);
+            }
+        });
         if self.reactor.diagnostics_enabled()
-            && let Some(effect_origin) = self.reactor.origin(self.id)
+            && let Some(effect_origin) = self.reactor.node_origin(self.id)
         {
             self.reactor
                 .emit_diagnostic(DiagnosticEvent::EffectScheduled {
@@ -510,7 +633,7 @@ impl EffectInner {
             return;
         };
 
-        let origin = self.reactor.origin(self.id);
+        let origin = self.reactor.node_origin(self.id);
         tracing::warn!(
             target: trace_targets::EFFECT,
             event = "effect_panicked",
@@ -527,11 +650,28 @@ impl EffectInner {
 
     fn run_scheduled_inner(self: &Rc<Self>) {
         if self.disposed.get() {
-            self.scheduled.set(false);
+            self.unlatch_scheduled();
             return;
         }
 
-        self.scheduled.set(false);
+        self.unlatch_scheduled();
+
+        // A nested flush can reach an effect that is already running — an effect that writes a
+        // dependency and then calls `flush_now` does exactly that, and both halves of it are
+        // documented as legal. Re-entering cannot be tracked coherently, because the inner run
+        // clears the dependency set the outer run is still recording. So defer: remember that a
+        // run is owed and re-queue it once the current run finishes. The state mark is left
+        // alone, so the deferred run still sees why it was scheduled.
+        //
+        // `running` covers the whole run and `is_computation_active` only the tracked window
+        // inside it; the wider one is the load-bearing test, because teardown runs consumer
+        // cleanups before the tracked window opens and re-entry from a cleanup would otherwise
+        // slip through and leave two generations of children and cleanups live at once.
+        if self.running.get() || self.reactor.is_computation_active(self.id) {
+            self.rerun_after_current.set(true);
+            return;
+        }
+
         let state = self.state.get();
         self.state.set(State::Clean);
 
@@ -584,6 +724,9 @@ impl EffectInner {
                         flush_epoch: self.reactor.flush_epoch(),
                     });
             }
+            self.reactor.record_flush(|stats| {
+                stats.effects_skipped = stats.effects_skipped.saturating_add(1);
+            });
             #[cfg(debug_assertions)]
             tracing::trace!(
                 target: trace_targets::EFFECT,
@@ -594,7 +737,6 @@ impl EffectInner {
             return;
         }
 
-        #[cfg(debug_assertions)]
         self.check_divergence();
 
         let _span = tracing::debug_span!(
@@ -606,7 +748,7 @@ impl EffectInner {
         let reactor_id = self.reactor.diagnostic_id();
         let flush_epoch = self.reactor.flush_epoch();
         let diagnostics_enabled = self.reactor.diagnostics_enabled();
-        if diagnostics_enabled && let Some(effect_origin) = self.reactor.origin(self.id) {
+        if diagnostics_enabled && let Some(effect_origin) = self.reactor.node_origin(self.id) {
             self.reactor
                 .emit_diagnostic(DiagnosticEvent::EffectRunStarted {
                     reactor: reactor_id,
@@ -615,6 +757,8 @@ impl EffectInner {
                     flush_epoch,
                 });
         }
+        self.reactor
+            .record_flush(|stats| stats.effects_run = stats.effects_run.saturating_add(1));
         struct DiagnosticRunGuard<'a> {
             reactor: &'a Reactor,
             reactor_id: crate::ReactorId,
@@ -641,41 +785,81 @@ impl EffectInner {
             flush_epoch,
             enabled: diagnostics_enabled,
         };
+        // The run window opens *here*, before teardown, not at `run_in_context` below: `reset`
+        // runs consumer cleanups and child disposals, and a run that arrives during those has the
+        // same reason to be deferred as one that arrives during the body. Cleared by the guard so
+        // an unwinding cleanup or body still closes the window.
+        struct RunWindow<'a>(&'a Cell<bool>);
+
+        impl Drop for RunWindow<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+
+        self.running.set(true);
+        let _run_window = RunWindow(&self.running);
+
         // Run cleanups from the previous run and dispose nested effects it created, then run
         // with this effect as the innermost owner so new cleanups and children register here.
         self.owner.reset();
 
+        // Teardown runs user cleanups, which may have disposed this effect — a cleanup that
+        // disposes the scope owning it, or the effect's own handle. The owner is torn down and
+        // rejects children by then, so a body run here would register cleanups that fire
+        // immediately and children that are disposed on the spot. Same reason as the check above
+        // the verification block; `reset` is just as capable of disposing us as verification is.
+        //
+        // `EffectRunStarted` and `effects_run` are already accounted for above and are left
+        // alone: the run did start and did perform its teardown, and the run pair still closes
+        // through the guard. Only the body is abandoned.
+        if self.disposed.get() {
+            return;
+        }
+
         with_owner(&self.owner, || {
             self.reactor.run_in_context(self.id, || (self.effect)())
         });
+
+        // A run requested while this one was in progress was deferred rather than re-entered.
+        // Queue it now. `schedule` coalesces, so a write that also scheduled normally does not
+        // produce two runs.
+        if self.rerun_after_current.replace(false) && !self.disposed.get() {
+            self.schedule();
+        }
     }
 
-    /// Panics when this effect keeps re-running within a single flush, which indicates a
+    /// Panics when this effect keeps re-running within a single drain, which indicates a
     /// divergent feedback loop: the effect writes state it (transitively) depends on with a
     /// value that never converges.
     ///
     /// Convergent feedback (for example clamping, where the rewritten value is suppressed by the
     /// signal's equality check on the next round) is legal and settles well below this limit.
-    #[cfg(debug_assertions)]
+    ///
+    /// Checked in **every** build. The alternative to panicking here is not "the application
+    /// carries on" — it is `flush_now` never returning, with no panic, no log and nothing for the
+    /// user to report. A panic is strictly more recoverable and more attributable than a freeze.
     fn check_divergence(&self) {
-        let epoch = self.reactor.flush_epoch();
-        if self.last_flush_epoch.get() != epoch {
-            self.last_flush_epoch.set(epoch);
-            self.runs_this_flush.set(1);
+        // Drain rather than flush: a re-entrant `flush_now` opens a new diagnostic epoch but must
+        // not reset this counter, or an effect that re-flushes could evade the guard entirely.
+        let epoch = self.reactor.drain_epoch();
+        if self.last_drain_epoch.get() != epoch {
+            self.last_drain_epoch.set(epoch);
+            self.runs_this_drain.set(1);
             return;
         }
 
-        let runs = self.runs_this_flush.get().saturating_add(1);
-        self.runs_this_flush.set(runs);
+        let runs = self.runs_this_drain.get().saturating_add(1);
+        self.runs_this_drain.set(runs);
         if runs > MAX_RUNS_PER_FLUSH {
             let origin = self
                 .reactor
-                .origin(self.id)
+                .node_origin(self.id)
                 .map(|location| location.to_string())
                 .unwrap_or_else(|| "<unknown>".into());
             panic!(
                 "adaptite: effect created at {origin} ran more than {MAX_RUNS_PER_FLUSH} times \
-                 in a single flush; this suggests a divergent reactive feedback loop (the effect \
+                 in a single drain; this suggests a divergent reactive feedback loop (the effect \
                  writes state it depends on without converging)"
             );
         }
@@ -699,9 +883,38 @@ impl EffectInner {
                     effect: self.id,
                 });
         }
+        self.reactor.record_flush(|stats| {
+            stats.effects_disposed = stats.effects_disposed.saturating_add(1);
+        });
+
+        // Release the pending-run latch here rather than leaving it to the queued run. That run
+        // holds only a `Weak`, so if this effect is dropped before the run is reached — an
+        // unowned handle dropped before the first flush is the common case — the upgrade fails
+        // and nothing ever decrements the reactor's queued-effect gauge. Idempotent: a later
+        // `run_scheduled_inner` unlatch becomes a no-op.
+        self.unlatch_scheduled();
+
+        // Unhook from the graph even if owner teardown unwinds. `disposed` is already set, so
+        // there is no second attempt, and an effect left registered keeps its node metadata and
+        // every edge it recorded for the reactor's lifetime — which is exactly the retention the
+        // 0.3 gauges are supposed to make visible, manufactured by adaptite itself.
+        struct UnhookOnUnwind<'a> {
+            reactor: &'a Reactor,
+            id: NodeId,
+        }
+
+        impl Drop for UnhookOnUnwind<'_> {
+            fn drop(&mut self) {
+                self.reactor.unregister_observer(self.id);
+                self.reactor.dispose(self.id);
+            }
+        }
+
+        let _unhook = UnhookOnUnwind {
+            reactor: &self.reactor,
+            id: self.id,
+        };
         self.owner.dispose();
-        self.reactor.unregister_observer(self.id);
-        self.reactor.dispose(self.id);
     }
 }
 
@@ -709,12 +922,20 @@ impl OwnedDisposable for EffectInner {
     fn dispose_owned(&self) {
         self.dispose();
     }
+
+    /// An effect disposed through its own handle is still held by its owner until the owner says
+    /// otherwise, and `dispose` does not drop `effect` — the closure and everything it captured
+    /// live as long as this `EffectInner` does. Reporting disposal lets a long-lived owner
+    /// release it. See `OwnerFrame::release_disposed_children`.
+    fn is_disposed_owned(&self) -> bool {
+        self.disposed.get()
+    }
 }
 
 impl ObserverHook for EffectInner {
     fn mark(&self, mark: Mark, cause: Option<InvalidationCause>) {
         if let Some(cause) = cause
-            && let Some(effect_origin) = self.reactor.origin(self.id)
+            && let Some(effect_origin) = self.reactor.node_origin(self.id)
         {
             self.reactor
                 .emit_diagnostic(DiagnosticEvent::EffectInvalidated {
@@ -731,6 +952,10 @@ impl ObserverHook for EffectInner {
         }
         self.schedule();
     }
+
+    fn state(&self) -> State {
+        self.state.get()
+    }
 }
 
 impl Drop for EffectInner {
@@ -741,6 +966,60 @@ impl Drop for EffectInner {
 
 #[cfg(test)]
 mod tests {
+    /// `EffectRun::run` opens its own flush when it runs outside one, and `begin_flush` calls
+    /// consumer code (the `FlushStarted` subscriber) as its last act. The guard that closes the
+    /// flush used to be constructed *after* that call returned, so a panic escaping the
+    /// subscriber stranded `flush_depth` at 1 for the rest of the process — freezing
+    /// `drain_epoch` and eventually making the divergence guard accuse an innocent effect. This
+    /// is the custom-scheduler twin of the `external_flush` case, and it survived the fix to
+    /// that one because the two live in different files.
+    #[test]
+    fn a_panicking_flush_started_subscriber_does_not_strand_a_scheduled_run() {
+        let reactor = Reactor::new();
+        let pending: std::rc::Rc<std::cell::RefCell<Vec<crate::EffectRun>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let signal = reactor.signal(0_u32);
+        let handle = reactor.effect_with(
+            {
+                let pending = std::rc::Rc::clone(&pending);
+                move |run: crate::EffectRun| pending.borrow_mut().push(run)
+            },
+            {
+                let signal = signal.clone();
+                move || {
+                    let _ = signal.get();
+                }
+            },
+        );
+        // Execute the creation run so the effect actually records its dependency on `signal`.
+        for run in pending.borrow_mut().drain(..).collect::<Vec<_>>() {
+            run.run();
+        }
+
+        // Queue the run BEFORE subscribing, so the only `FlushStarted` the subscriber ever sees
+        // is the one `EffectRun::run` opens for itself.
+        signal.set(1);
+        reactor.flush_now();
+        let queued: Vec<_> = pending.borrow_mut().drain(..).collect();
+        assert_eq!(queued.len(), 1, "the scheduler received the ready run");
+
+        let boom = std::cell::Cell::new(true);
+        let sub = reactor.subscribe_diagnostics(move |event| {
+            if matches!(event, crate::DiagnosticEvent::FlushStarted { .. }) && boom.replace(false) {
+                panic!("subscriber panicked");
+            }
+        });
+        for run in queued {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.run()));
+        }
+        drop(sub);
+        assert!(
+            !reactor.in_flush(),
+            "flush_depth was stranded at 1 by the panic"
+        );
+        let _ = handle;
+    }
+
     use std::cell::{Cell as Counter, RefCell};
     use std::rc::Rc;
 
@@ -774,6 +1053,63 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn effect_identity_is_the_same_from_the_handle_the_lane_and_the_diagnostics() {
+        use crate::DiagnosticEvent;
+
+        let reactor = Reactor::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = reactor.subscribe_diagnostics({
+            let events = Rc::clone(&events);
+            move |event| events.borrow_mut().push(event)
+        });
+
+        let lane = Lane::default();
+        let value = signal_in(&reactor, 1);
+        let effect = reactor.effect_with(lane.scheduler(), {
+            let value = value.clone();
+            move || {
+                let _ = value.get();
+            }
+        });
+
+        // The point of the addition: the id is known before anything has run, so a consumer can
+        // key a retained structure by effect at creation rather than at first run.
+        let id = effect.id();
+        assert_eq!(effect.reactor_id(), reactor.id());
+
+        let queued = lane.0.borrow().first().and_then(|run| run.id());
+        assert_eq!(queued, Some(id), "the lane sees the same node");
+
+        lane.drain(&reactor);
+        assert_eq!(effect.id(), id, "running does not change identity");
+
+        value.set(2);
+        lane.drain(&reactor);
+        effect.dispose();
+        assert_eq!(
+            effect.id(),
+            id,
+            "a disposed effect keeps its id; ids are never reused"
+        );
+
+        // Every effect-shaped event in the stream is attributable to the handle without any
+        // private access, which is the whole point of exposing the id there.
+        let effect_events = events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                DiagnosticEvent::EffectScheduled { effect, .. }
+                | DiagnosticEvent::EffectRunStarted { effect, .. }
+                | DiagnosticEvent::EffectRunFinished { effect, .. }
+                | DiagnosticEvent::EffectDisposed { effect, .. } => Some(*effect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!effect_events.is_empty());
+        assert!(effect_events.iter().all(|reported| *reported == id));
     }
 
     #[test]
@@ -1376,22 +1712,29 @@ mod tests {
         assert_eq!(&*seen.borrow(), &[25, 10]);
     }
 
-    #[cfg(debug_assertions)]
+    /// Not `cfg(debug_assertions)`: the guard is enforced in every build, and a test gated to
+    /// debug is exactly how the release hang survived unnoticed in the first place.
     #[test]
     fn divergent_feedback_loops_panic_instead_of_hanging() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
         let handle_slot = Rc::new(RefCell::new(None::<EffectHandle>));
         let panic_message = Rc::new(RefCell::new(None::<String>));
+        // The creation site is in this file, so `contains("effect.rs")` is satisfied by any
+        // adaptite-internal location too — including the one the message degrades to when
+        // `#[track_caller]` is missing. Pin the line as well as the file.
+        let creation_line = Rc::new(Counter::new(0u32));
 
         queue_macrotask({
             let handle_slot = Rc::clone(&handle_slot);
             let panic_message = Rc::clone(&panic_message);
+            let creation_line = Rc::clone(&creation_line);
             move || {
                 let reactor = Reactor::new();
                 let counter = signal_in(&reactor, 0u64);
 
                 // A counter increment: every run changes the value, so the loop never converges.
+                creation_line.set(line!() + 1);
                 let effect = reactor.effect({
                     let counter = counter.clone();
                     move || {
@@ -1417,9 +1760,10 @@ mod tests {
             message.contains("divergent reactive feedback loop"),
             "panic should describe the divergence, got: {message}"
         );
+        let site = format!("effect.rs:{}:", creation_line.get());
         assert!(
-            message.contains("effect.rs"),
-            "panic should name the effect's creation site, got: {message}"
+            message.contains(&site),
+            "panic should name the effect's creation site ({site}), got: {message}"
         );
     }
 }
