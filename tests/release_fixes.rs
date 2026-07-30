@@ -9,8 +9,14 @@
 //! checkout there is nothing to check, and each test says so and returns. That skip is
 //! narrow on purpose: it triggers on the absence of the *repository*, never on the absence
 //! of the thing under test.
+//!
+//! The shell-helper tests are `#[cfg(unix)]`. The helper is bash, and the only job that runs it
+//! is the Linux drift check, so there is nothing for a Windows runner to protect here — and
+//! shelling out to `bash` from a Windows test asserts the presence of Git Bash rather than
+//! anything about adaptite. The workflow-parsing tests below are not gated and run everywhere.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 fn repo_file(relative: &str) -> Option<PathBuf> {
@@ -45,6 +51,7 @@ macro_rules! repo_file_or_skip {
 // ---------------------------------------------------------------------------------------
 
 /// Feed an index file to the helper and return what it prints, or `Err` with stderr.
+#[cfg(unix)]
 fn latest_stable(script: &Path, index: &str) -> Result<String, String> {
     use std::io::Write as _;
 
@@ -71,12 +78,14 @@ fn latest_stable(script: &Path, index: &str) -> Result<String, String> {
     }
 }
 
+#[cfg(unix)]
 fn index_line(vers: &str, yanked: bool) -> String {
     // Shaped like the real sparse index: one JSON object per line, `vers` and `yanked` among
     // other fields, and no whitespace.
     format!(r#"{{"name":"runite","vers":"{vers}","deps":[],"yanked":{yanked}}}"#)
 }
 
+#[cfg(unix)]
 fn index(entries: &[(&str, bool)]) -> String {
     entries
         .iter()
@@ -91,6 +100,7 @@ fn index(entries: &[(&str, bool)]) -> String {
 /// dependency. crates.io really carries this shape; `time` has 0.1.43 between 0.2.9 and
 /// 0.2.10.
 #[test]
+#[cfg(unix)]
 fn a_patch_backported_to_an_older_minor_is_not_the_latest_version() {
     let script = repo_file_or_skip!(".github/scripts/latest-stable-version.sh");
 
@@ -110,6 +120,7 @@ fn a_patch_backported_to_an_older_minor_is_not_the_latest_version() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_prerelease_published_after_a_stable_release_is_not_the_latest_version() {
     let script = repo_file_or_skip!(".github/scripts/latest-stable-version.sh");
 
@@ -124,6 +135,7 @@ fn a_prerelease_published_after_a_stable_release_is_not_the_latest_version() {
 
 /// Yanked entries stay in the index file forever, so a yanked upload is still the last line.
 #[test]
+#[cfg(unix)]
 fn a_yanked_release_is_not_the_latest_version() {
     let script = repo_file_or_skip!(".github/scripts/latest-stable-version.sh");
 
@@ -138,6 +150,7 @@ fn a_yanked_release_is_not_the_latest_version() {
 
 /// Lexicographic sorting would say 0.9.0 > 0.10.0.
 #[test]
+#[cfg(unix)]
 fn versions_are_ordered_numerically_not_lexicographically() {
     let script = repo_file_or_skip!(".github/scripts/latest-stable-version.sh");
 
@@ -151,6 +164,7 @@ fn versions_are_ordered_numerically_not_lexicographically() {
 
 /// Failing loudly beats printing an empty string that the caller then compares against.
 #[test]
+#[cfg(unix)]
 fn an_index_with_no_stable_release_is_an_error_not_an_empty_answer() {
     let script = repo_file_or_skip!(".github/scripts/latest-stable-version.sh");
 
