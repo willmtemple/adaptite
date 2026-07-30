@@ -86,14 +86,12 @@ impl Drop for EnterGuard {
     fn drop(&mut self) {
         // `try_with`, never `with`/`replace`: a host that parks its reactor handle in a
         // thread-local — the shape `Reactor::current`'s own warning recommends — releases this
-        // guard from a thread-local destructor, and destructors run in reverse registration
-        // order, so these two slots are routinely destroyed first. `LocalKey::replace` *panics*
-        // once its value is gone, and a panic escaping a `Drop` during thread shutdown is a
-        // non-unwinding abort: the process dies with SIGABRT on the way out of `main`.
-        //
-        // Failing to restore a default nobody can look up again costs nothing. Aborting costs
-        // everything. Same trade, and the same reasoning, as `scope::with_owner_entry` and
-        // `ownership::with_counters`.
+        // guard from a thread-local destructor, and destructors run in reverse registration order,
+        // so these two slots are routinely destroyed first. `LocalKey::replace` *panics* then, and
+        // a panic escaping a `Drop` during thread shutdown is a non-unwinding abort: the process
+        // dies with SIGABRT on the way out of `main`. Failing to restore a default nobody can look
+        // up again costs nothing; aborting costs everything. Same trade as
+        // `scope::with_owner_entry` and `ownership::with_counters`.
         let _ = CURRENT_REACTOR
             .try_with(|slot| slot.replace(core::mem::take(&mut self.previous_default)));
         let _ = ANCHORED_REACTOR.try_with(|slot| slot.replace(self.previous_anchor.take()));
@@ -441,31 +439,18 @@ impl Reactor {
         let reactor = Self::new();
         // `try_with` for both slots. `try_current` above returns `None` once `CURRENT_REACTOR` is
         // destroyed, so thread-local teardown funnels straight into this branch: hardening only
-        // the read would relocate the abort here rather than remove it.
-        //
-        // The `Err` case changes more than bookkeeping, so it is worth being explicit about what
-        // it means. The reactor itself is fine — it is an `Rc` graph with no thread-local state,
-        // and the caller can use it normally. What cannot happen is *caching* it as the thread
-        // default, because the cache no longer exists. That costs nothing: the thread is being
-        // torn down, so nothing will ever look the default up again.
+        // the read would relocate the abort here rather than remove it. The `Err` case changes
+        // more than bookkeeping, so: the reactor is fine either way — an `Rc` graph with no
+        // thread-local state — and only *caching* it as the thread default becomes impossible,
+        // which costs nothing on a thread that will never look the default up again. The warning
+        // is suppressed there too, since it would be pure noise.
         let installed = CURRENT_REACTOR
             .try_with(|slot| slot.replace(Rc::downgrade(&reactor.inner)))
             .is_ok();
-        // Unreadable means unknowable; `false` suppresses the split-graph warning, which would be
-        // pure noise on a thread that is going away and cannot create anything that outlives it.
         let had_default = HAS_HAD_DEFAULT
             .try_with(|flag| flag.replace(true))
             .unwrap_or(false);
-        if !installed {
-            tracing::debug!(
-                target: trace_targets::GRAPH,
-                event = "current_reactor_uninstallable",
-                reactor_id = reactor.inner.id.get(),
-                "this thread's default-reactor slot is already destroyed, so the reactor returned \
-                 here was not installed as the thread default; it is fully usable, but ambient \
-                 constructors called later during teardown will each get a fresh one"
-            );
-        } else if had_default {
+        if installed && had_default {
             // This thread has had a default before and does not have one now, so whatever owned
             // it is out of scope. Nothing is broken *yet* — but nodes created from here on are on
             // a different graph than the ones created before, and the two can never interact:
@@ -508,13 +493,10 @@ impl Reactor {
     /// ```
     pub fn try_current() -> Option<Self> {
         // `try_with`: this is reachable from a `Drop`, and therefore from a thread-local
-        // destructor, by which point `CURRENT_REACTOR` may already have been destroyed. `with`
-        // panics there, and a panic on the `Drop` path during thread shutdown aborts the process.
-        //
-        // `None` is the honest answer rather than a swallowed error: once the slot is gone the
-        // thread has no reachable default and never will again, which is exactly what `None`
-        // means to every caller. The alternative — reporting a reactor from a destroyed slot —
-        // is not available at any price.
+        // destructor, by which point `CURRENT_REACTOR` may already have been destroyed, where
+        // `with` panics and the panic aborts. `None` is the honest answer rather than a swallowed
+        // error: once the slot is gone the thread has no reachable default and never will again,
+        // which is exactly what `None` means to every caller.
         CURRENT_REACTOR
             .try_with(|r| r.borrow().upgrade())
             .ok()
@@ -535,11 +517,11 @@ impl Reactor {
     /// order restores an older default and is a bug, though not an unsound one.
     ///
     /// **The guard must be bound.** `reactor.enter();` in statement position, or
-    /// `let _ = reactor.enter();`, drops the guard at the end of that statement and installs
-    /// nothing — every ambient constructor afterwards lands on a *different* graph, reads and
-    /// writes work perfectly, and nothing ever re-renders. `#[must_use]` catches the first form;
-    /// nothing can catch the second, because `let _ =` is how one deliberately discards a
-    /// `must_use` value. Bind it: `let _guard = reactor.enter();`.
+    /// `let _ = reactor.enter();`, drops it at the end of that statement and installs nothing —
+    /// every ambient constructor afterwards lands on a *different* graph, reads and writes work
+    /// perfectly, and nothing ever re-renders. `#[must_use]` catches the first form; nothing can
+    /// catch the second, since `let _ =` is how one deliberately discards a `must_use` value.
+    /// Bind it: `let _guard = reactor.enter();`.
     ///
     /// # Examples
     ///
@@ -627,10 +609,10 @@ impl Reactor {
         // and any of them may be the first to read a stale memo.
         //
         // `try_with` on both slots, here and in the guard below: an effect or memo can be driven
-        // from a cleanup, so `run_in_context` is reachable from a `Drop` and therefore from a
-        // thread-local destructor. `with` panics once the slot is destroyed, and the guard's
-        // matching panic would arrive during unwinding, which aborts. `None` for the saved value
-        // means "there was nothing to save", and the guard then restores nothing.
+        // from a cleanup, so this is reachable from a `Drop` and therefore from a thread-local
+        // destructor. `with` panics once the slot is destroyed, and the guard's matching panic
+        // would arrive during unwinding, which aborts. `None` means nothing was saved, and the
+        // guard then restores nothing.
         let previous_untracked = UNTRACKED_DEPTH.try_with(|depth| depth.replace(0)).ok();
         #[cfg(debug_assertions)]
         let previous_running = RUNNING_REACTOR
@@ -933,15 +915,13 @@ impl Reactor {
             }
         }
 
-        // The pool is a pool, not a leak: the dormant path above returns its buffer before its
-        // early return, and this path has to as well. Dropping it here instead emptied the pool
-        // permanently the first time anything subscribed, so every later mark step fell through
-        // `take_node_buffer`'s `unwrap_or_default()` and allocated a fresh `Vec` — one per node
-        // per propagation step, i.e. the exact cost 129968d removed, reintroduced by nothing more
-        // than having a diagnostic subscription installed.
-        //
-        // Safe after the recursion: `deliver_mark` re-enters `mark_dependents`, which pops a
-        // *different* buffer, because this one is not in the pool while it is owned here.
+        // The dormant path above returns its buffer before its early return, and this path has to
+        // as well. Dropping it here instead emptied the pool permanently the first time anything
+        // subscribed, so every later mark step fell through `take_node_buffer`'s
+        // `unwrap_or_default()` and allocated — one `Vec` per node per propagation step, the exact
+        // cost 129968d removed, reintroduced by having a subscription installed. Safe after the
+        // recursion: `deliver_mark` re-enters `mark_dependents`, which pops a *different* buffer,
+        // because this one is not in the pool while it is owned here.
         self.give_node_buffer(dependents);
     }
 
@@ -1028,6 +1008,19 @@ impl Reactor {
     ///
     /// Idempotent: a node that is already gone is a silent no-op, and the
     /// [`NodeDisposed`](DiagnosticEvent::NodeDisposed) event is delivered exactly once.
+    ///
+    /// # Warning: this does not consult the handle that owns the node
+    ///
+    /// This is the low-level teardown a primitive's `Drop` calls once its last handle is gone,
+    /// not the way to dispose a [`crate::Signal`], [`crate::Memo`], [`crate::Thunk`],
+    /// [`crate::Event`] or [`crate::EffectHandle`]. Since 0.3 publishes `id()` on all of them,
+    /// `reactor.dispose(handle.id())` compiles warning-free and leaves a **zombie**: the handle
+    /// stays usable and reads and writes still succeed, but the node has no edges, observers or
+    /// metadata, so nothing downstream updates again — a memo frozen at its last value, an effect
+    /// that never runs, [`node_kind`](Self::node_kind) reporting `None`, and no later query able
+    /// to tell that apart from a node that never existed. Nothing panics and no counter drifts;
+    /// only the reactivity is gone, and only a live subscription (which sees `NodeDisposed`)
+    /// records it. Reach for this only when you allocated the id yourself.
     pub fn dispose(&self, node: NodeId) {
         tracing::debug!(
             target: trace_targets::GRAPH,
@@ -1172,9 +1165,9 @@ impl Reactor {
     /// A custom [`crate::EffectScheduler`] decides *when* its effects run, so adaptite cannot see
     /// where one drain ends and the next begins. Wrapping a drain in `external_flush` supplies
     /// that boundary: every [`crate::EffectRun`] executed inside `f` shares one flush epoch, so
-    /// the debug divergence guard — which counts an effect's runs within a flush — keeps working
-    /// across the drain, and diagnostic consumers see one `FlushStarted`/`FlushFinished` pair
-    /// rather than one per effect.
+    /// the divergence guard — which counts an effect's runs within one logical *drain*, and which
+    /// is enforced in every build — keeps working across the drain, and diagnostic consumers see
+    /// one `FlushStarted`/`FlushFinished` pair rather than one per effect.
     ///
     /// Without it, each externally scheduled run opens and closes its own single-run flush. That
     /// is correct but blind: an effect that re-schedules itself into the same drain forever is
@@ -1338,10 +1331,9 @@ impl Reactor {
     /// nested inside it. Used by the divergence guard, which must not be resettable by a
     /// re-entrant `flush_now`.
     ///
-    /// The guard is debug-only, so this has no caller in an optimized build. The *field* is still
-    /// maintained there — one `Cell` write per outermost flush — because making the flush paths
-    /// differ between profiles would be a far worse trade than that increment.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    /// The guard is enforced in every build — a runaway loop in a release build is a frozen
+    /// application with no output — so this has a caller in an optimized build too. It used to be
+    /// debug-only, which is what the removed `allow(dead_code)` was for.
     pub(crate) fn drain_epoch(&self) -> u64 {
         self.inner.drain_epoch.get()
     }
@@ -1400,11 +1392,10 @@ impl Reactor {
             .count()
     }
 
-    /// Number of scratch buffers parked in the node-id pool.
-    ///
-    /// The pool is the whole mechanism behind "propagation does not allocate", and the only way
-    /// to observe it without a counting allocator is to ask. A path that takes a buffer and never
-    /// gives it back drains the pool to zero and then allocates forever.
+    /// Number of scratch buffers parked in the node-id pool — the whole mechanism behind
+    /// "propagation does not allocate", and the only way to observe it without a counting
+    /// allocator. A path that takes a buffer and never gives it back drains the pool to zero and
+    /// then allocates forever.
     #[cfg(test)]
     pub(crate) fn node_scratch_pool_len(&self) -> usize {
         self.inner.node_scratch.borrow().len()
@@ -1596,6 +1587,20 @@ impl Reactor {
         });
     }
 
+    /// Registers the observation hooks for `node`, retained until the node is disposed.
+    ///
+    /// The registry holds the closures **strongly** for the node's whole lifetime; only
+    /// `unregister_observation_hooks`, reached from disposal, drops them. A hook that captures the
+    /// `Source` it belongs to therefore closes
+    /// `ReactorInner -> observation_hooks -> on_watch -> Source -> Reactor -> ReactorInner` and
+    /// retains the whole reactor for the process lifetime — invisible to every 0.3 gauge, since
+    /// `OwnershipStats` counts no owner frame for a `Source` and `GraphStats` is reachable only
+    /// through the very handle that leaked. It is easy to reach by accident: the node does not
+    /// exist when the hooks are supplied, so the natural shape is an `Rc<RefCell<Option<Source>>>`
+    /// slot filled afterwards. Capturing a `Weak` of that slot breaks the cycle at no cost, and is
+    /// what `source_with_hooks` documents. When testing this, note that a queued-but-undelivered
+    /// hook job holds its own `Rc<ObservationHooks>`: a check made without flushing after the last
+    /// observer leaves reports a leak that is not there.
     pub(crate) fn register_observation_hooks(
         &self,
         node: NodeId,
@@ -1742,18 +1747,15 @@ impl ReactorInner {
         }
     }
 
-    /// Emits a closing span event from a `Drop`, where a panicking subscriber must not be
-    /// allowed to abort the process.
+    /// Emits a closing span event from a `Drop`, where a panicking subscriber must not abort.
     ///
-    /// The pairing contract is explicit that the closing half is delivered on the unwind path
-    /// too — a consumer timing a flush needs the close whether or not the flush succeeded — so
-    /// this cannot simply fall silent while `panicking()`. What it must not do is let the
-    /// subscriber's own panic escape into an unwind that is already in progress: that is a
-    /// non-unwinding panic, and it aborts. One panicking effect plus one panicking subscriber
-    /// otherwise took the process down instead of producing two reportable bugs.
-    ///
-    /// Same trade, and the same precedent, as `OwnerFrame::reset`: while unwinding, the second
-    /// failure is logged and discarded so the first one still reaches the caller.
+    /// The pairing contract is explicit that the close is delivered on the unwind path too — a
+    /// consumer timing a flush needs it whether or not the flush succeeded — so this cannot fall
+    /// silent while `panicking()`. What it must not do is let the subscriber's own panic escape
+    /// into an unwind already in progress: that is a non-unwinding panic, and it aborts. One
+    /// panicking effect plus one panicking subscriber otherwise took the process down instead of
+    /// producing two reportable bugs. Same precedent as `OwnerFrame::reset`: while unwinding the
+    /// second failure is logged and discarded so the first still reaches the caller.
     fn emit_from_drop(&self, event: DiagnosticEvent) {
         if !self.diagnostics_active.get() {
             return;
@@ -1843,11 +1845,11 @@ impl ReactorInner {
         if self.diagnostics_active.get() {
             let remaining_jobs = self.pending_jobs.borrow().len();
             // `None` means this subscriber was not here when the flush opened, so there is no
-            // pair to close. Emitting anyway — which is what `unwrap_or_default()` did — handed
-            // a mid-flush subscriber a `FlushFinished` with all-zero stats and no `FlushStarted`
-            // before it, breaking the documented duration recipe on the very first event it ever
-            // received. Staying quiet makes setup match teardown, where dropping the last
-            // subscription mid-flush already yields an unpaired *open* and nothing more.
+            // pair to close. Emitting anyway — what `unwrap_or_default()` did — handed a
+            // mid-flush subscriber a `FlushFinished` with all-zero stats and no `FlushStarted`
+            // before it, breaking the documented duration recipe on the first event it ever saw.
+            // Staying quiet makes setup match teardown, where dropping the last subscription
+            // mid-flush already yields an unpaired *open* and nothing more.
             let Some(stats) = self
                 .flushes
                 .close_flush(remaining_jobs, self.counters.queued_effects())

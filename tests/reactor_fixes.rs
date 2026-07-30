@@ -260,3 +260,136 @@ fn a_subscriber_that_panics_on_flush_finished_does_not_abort_an_unwinding_flush(
         },
     );
 }
+
+#[test]
+fn write_origin_names_the_consumer_line_that_triggered_the_write() {
+    // `InvalidationCause::write_origin` is what makes a propagated write attributable to the
+    // consumer's source line, and it is the headline of the 0.3 diagnostics contract. Nothing
+    // asserted it: `Reactor::trigger` is its only producer, and the suite's one `write_origin`
+    // assertion reads `WriteSuppressed`, whose origin is captured in `Signal::set` and never
+    // reaches `trigger` at all. Removing `#[track_caller]` from `trigger` left the suite green.
+    let reactor = Reactor::new();
+    let source = reactor.source();
+    let observed: Rc<RefCell<Vec<(&'static str, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let _subscription = reactor.subscribe_diagnostics({
+        let observed = Rc::clone(&observed);
+        move |event| {
+            if let DiagnosticEvent::ReactiveWrite { cause, .. } = event {
+                observed
+                    .borrow_mut()
+                    .push((cause.write_origin.file(), cause.write_origin.line()));
+            }
+        }
+    });
+
+    // A reader, so the write has somewhere to propagate.
+    let view = reactor.thunk({
+        let reactor = reactor.clone();
+        let source = source.clone();
+        move || {
+            reactor.observe(source.id());
+            1_u32
+        }
+    });
+    assert_eq!(view.get(), 1);
+
+    let line = line!() + 1;
+    source.trigger();
+
+    assert_eq!(
+        *observed.borrow(),
+        [(file!(), line)],
+        "the write must be attributed to the caller's line, not to a line inside adaptite"
+    );
+}
+
+#[test]
+fn a_subscriber_may_schedule_work_while_a_consumer_drain_is_opening() {
+    // The mirror of `tests/reentrancy.rs`'s coverage of the `flush_now` path. Both `FlushStarted`
+    // emit sites bind the pending-job count before emitting, because written inline it is a
+    // temporary whose borrow lives across the subscriber call — and scheduling reactor work from
+    // `FlushStarted` is an entirely reasonable thing to do. Only the `flush_now` site was tested,
+    // while `external_flush` is the documented host-integration boundary.
+    let reactor = Reactor::new();
+    let ran = Rc::new(std::cell::Cell::new(0_u32));
+    let armed = std::cell::Cell::new(true);
+
+    let _subscription = reactor.subscribe_diagnostics({
+        let reactor = reactor.clone();
+        let ran = Rc::clone(&ran);
+        move |event| {
+            if matches!(event, DiagnosticEvent::FlushStarted { .. }) && armed.replace(false) {
+                reactor.schedule({
+                    let ran = Rc::clone(&ran);
+                    move || ran.set(ran.get() + 1)
+                });
+            }
+        }
+    });
+
+    reactor.external_flush(|| {});
+    reactor.flush_now();
+    assert_eq!(
+        ran.get(),
+        1,
+        "the job the subscriber scheduled must have run"
+    );
+}
+
+#[test]
+fn an_observation_hook_that_captures_its_source_weakly_releases_the_reactor() {
+    // `ReactorInner` holds observation hooks strongly for the node's whole lifetime, so a hook
+    // that captures the `Source` it belongs to retains the entire reactor for the process
+    // lifetime — a leak none of 0.3's gauges can see. The escape needs no API from adaptite: the
+    // consumer keeps the slot and the hook captures a `Weak` of it. This pins that the escape
+    // works, and the flush-after-the-last-observer-leaves step it needs.
+    struct Sentinel(Rc<std::cell::Cell<bool>>);
+
+    impl Drop for Sentinel {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    let released = Rc::new(std::cell::Cell::new(false));
+    {
+        let reactor = Reactor::new();
+        let slot: Rc<RefCell<Option<adaptite::Source>>> = Rc::new(RefCell::new(None));
+        let weak = Rc::downgrade(&slot);
+        let sentinel = Sentinel(Rc::clone(&released));
+
+        let node = reactor.source_with_hooks(
+            move || {
+                // Captures the sentinel and only a `Weak` handle on the slot.
+                let _ = &sentinel;
+                let _ = weak.upgrade();
+            },
+            || {},
+        );
+        *slot.borrow_mut() = Some(node.clone());
+
+        let reader = reactor.thunk({
+            let reactor = reactor.clone();
+            let node = node.clone();
+            move || {
+                reactor.observe(node.id());
+                1_u32
+            }
+        });
+        assert_eq!(reader.get(), 1);
+        reactor.flush_now();
+
+        drop(reader);
+        // The deferred unwatch job holds its own `Rc<ObservationHooks>` until it runs.
+        reactor.flush_now();
+        drop(node);
+        drop(slot);
+        reactor.flush_now();
+    }
+
+    assert!(
+        released.get(),
+        "a hook capturing a `Weak` slot must not retain the reactor"
+    );
+}
