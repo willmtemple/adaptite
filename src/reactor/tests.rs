@@ -332,14 +332,19 @@ fn a_computation_that_first_runs_untracked_still_records_its_dependencies() {
 }
 
 #[test]
-fn re_entering_a_running_computation_is_refused_in_every_build() {
+fn a_computation_that_reads_itself_is_refused_by_the_cycle_detector_in_every_build() {
     use crate::{memo_in, signal_in};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     // Re-entry cannot be tracked coherently: the inner run clears the dependency set the outer
-    // run is still recording. This was a `debug_assert`, so release builds fell through and the
-    // node emerged with whatever subset of its inputs the inner run happened to re-read — silent
-    // and shape-dependent. The `insert` it checks already ran in release, so refusing is free.
+    // run is still recording.
+    //
+    // This test used to be named for the `assert!` in `run_in_context` and to accept either
+    // message, which hid the fact that it never reached that assert. On the *read* path — the one
+    // a consumer takes — the refusal comes from the cycle detector, which `refresh_node` and
+    // `try_observe` both consult before `run_in_context` is entered, and which panics
+    // unconditionally in every profile. That is the mechanism behind the release note, so this
+    // asserts on it exactly. The backstop assert has its own test below.
     let reactor = Reactor::new();
     let source = signal_in(&reactor, 1_u64);
     let reader: Rc<RefCell<Option<crate::Memo<u64>>>> = Rc::new(RefCell::new(None));
@@ -366,11 +371,86 @@ fn re_entering_a_running_computation_is_refused_in_every_build() {
         .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
         .unwrap_or_default();
     assert!(
-        message.contains("re-entered itself") || message.contains("cycle"),
+        message.contains("reactive cycle detected"),
         "the refusal should explain itself, got: {message}"
     );
 
     *reader.borrow_mut() = None;
+}
+
+#[test]
+fn re_entering_run_in_context_directly_is_refused_in_every_build() {
+    // The backstop the test above does *not* reach. `run_in_context` is public, so a consumer
+    // building a custom primitive can re-enter a tracking scope without going through a read,
+    // which is the one route the cycle detector does not stand in front of. Without the assert
+    // the inner entry falls through to `clear_observer_dependencies` and wipes the dependency set
+    // the outer run is still recording, and the node emerges with whatever subset of its inputs
+    // it happens to re-read afterwards — silent, and shape-dependent.
+    //
+    // This was a `debug_assert`, so release builds fell through; the `insert` it checks already
+    // ran in release, which is what makes refusing in every build free. Nothing pinned that, and
+    // the whole assert could be deleted with the suite green.
+    let reactor = Reactor::new();
+    let node = reactor.allocate_node(NodeKind::Source);
+
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        reactor.run_in_context(node, || reactor.run_in_context(node, || {}));
+    }))
+    .expect_err("re-entering a running computation must be refused");
+
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    assert!(
+        message.contains("re-entered itself"),
+        "the refusal should name the re-entry, got: {message}"
+    );
+}
+
+#[test]
+fn propagation_returns_its_scratch_buffer_while_a_subscription_is_installed() {
+    use crate::{memo_in, signal_in};
+
+    // 0.3's headline performance claim is that a write no longer allocates as it propagates, and
+    // the mechanism is the scratch pool. `mark_dependents` returned its buffer on the dormant
+    // path and dropped it on the diagnostics-active path, so the pool emptied permanently the
+    // first time anything subscribed and every later mark step allocated a fresh `Vec` — one per
+    // node per propagation step. Nothing in the suite could see it: the benches never subscribe.
+    let reactor = Reactor::new();
+    let head = signal_in(&reactor, 0_u64);
+    let mut tail = memo_in(&reactor, {
+        let head = head.clone();
+        move || head.get() + 1
+    });
+    for _ in 0..3 {
+        tail = memo_in(&reactor, {
+            let previous = tail.clone();
+            move || previous.get() + 1
+        });
+    }
+    assert_eq!(tail.get(), 4, "a depth-4 chain, so propagation recurses");
+
+    let _subscription = reactor.subscribe_diagnostics(|_| {});
+
+    // One warm write to bring the pool to its steady state. Nothing is read afterwards: memos are
+    // lazy, so this exercises mark propagation and nothing else.
+    head.set(1);
+    let pooled = reactor.node_scratch_pool_len();
+    assert!(
+        pooled > 0,
+        "propagation must hand its scratch buffers back to the pool, not drop them"
+    );
+
+    for _ in 0..10 {
+        head.set(head.get() + 1);
+        assert_eq!(
+            reactor.node_scratch_pool_len(),
+            pooled,
+            "a subscribed propagation must be pool-neutral, exactly like a dormant one"
+        );
+    }
 }
 
 #[test]
