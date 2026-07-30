@@ -195,9 +195,18 @@ happens, the event does not get added.
 - Dropping the last subscription stops delivery immediately and resets the partly-accumulated
   `FlushStats`, so a later subscriber never inherits totals from a window it could not observe.
 
-Both are tested: `every_event_stops_when_the_last_subscription_drops` matches every variant
-exhaustively — `#[non_exhaustive]` binds downstream crates, not adaptite itself, so **adding a
-variant fails to compile until it is covered there**.
+The third bullet is what the suite tests, in two parts.
+`every_event_stops_when_the_last_subscription_drops` produces every variant, drops the
+subscription, and asserts that a second run of the same workload delivers nothing; it matches
+every variant exhaustively — `#[non_exhaustive]` binds downstream crates, not adaptite itself, so
+**adding a variant fails to compile until it is covered there**.
+`flush_totals_do_not_survive_an_unsubscribed_window` accumulates into the pending `FlushStats`
+while subscribed, drops that subscription, and asserts a later subscriber sees only its own
+totals.
+
+The first two bullets are properties of the code path rather than assertions: nothing in the
+suite counts allocations, and the dormant path is defended by the benchmark A/B described under
+[Cost](#cost-and-how-to-keep-it-honest) — which is what caught the `Drop`-guard trap twice.
 
 ### Pairing and panic semantics
 
@@ -371,14 +380,23 @@ builds, without parsing, and with semver behind it.
 ## Reference
 
 - Events and payloads: [`DiagnosticEvent`], [`InvalidationCause`], [`InvalidationLevel`],
-  [`ComputeOutcome`], [`NodeKind`]
+  [`ComputeOutcome`], [`NodeKind`] (and `NodeKind::all`, which enumerates the six kinds)
+- Reading an event generically, without destructuring a `#[non_exhaustive]` variant:
+  `DiagnosticEvent::reactor`, `DiagnosticEvent::node`, `DiagnosticEvent::node_origin`,
+  `DiagnosticEvent::flush_epoch`
 - Aggregates: [`GraphStats`], [`FlushStats`], [`OwnershipStats`]
 - Queries: `Reactor::graph_stats`, `Reactor::graph_snapshot`, `Reactor::observer_count`,
   `Reactor::dependency_count`, `Reactor::dependencies_of`, `Reactor::observers_of`,
-  `Reactor::node_origin`, `Reactor::node_kind`, `Reactor::node_version`, `Reactor::is_observed`
-- Snapshot types: [`GraphSnapshot`], [`GraphNode`], [`GraphEdge`], [`NodeState`]
+  `Reactor::node_origin`, `Reactor::node_kind`, `Reactor::node_state`, `Reactor::node_version`,
+  `Reactor::is_observed`. All but `graph_snapshot`, `dependencies_of` and `observers_of` are
+  `O(1)` and allocation-free — `node_state` in particular answers a per-node staleness question
+  without the walk `graph_snapshot` performs.
+- Snapshot types: [`GraphSnapshot`] (plus `GraphSnapshot::node` and `GraphSnapshot::stale`),
+  [`GraphNode`], [`GraphEdge`], [`NodeState`], [`RecordedDependency`] (the per-edge element
+  `Reactor::dependencies_of` returns: the dependency's node id and the version observed when the
+  edge was recorded)
 - Ownership: `ownership_stats`, `audit_ownership`, `debug_assert_ownership_consistent`,
-  [`OwnershipDrift`]
+  [`OwnershipAudit`], [`OwnershipDrift`], [`OwnershipGauge`]
 
 [`DiagnosticEvent`]: https://docs.rs/adaptite/latest/adaptite/enum.DiagnosticEvent.html
 [`InvalidationCause`]: https://docs.rs/adaptite/latest/adaptite/struct.InvalidationCause.html
@@ -391,6 +409,9 @@ builds, without parsing, and with semver behind it.
 [`GraphNode`]: https://docs.rs/adaptite/latest/adaptite/struct.GraphNode.html
 [`GraphEdge`]: https://docs.rs/adaptite/latest/adaptite/struct.GraphEdge.html
 [`NodeState`]: https://docs.rs/adaptite/latest/adaptite/enum.NodeState.html
+[`RecordedDependency`]: https://docs.rs/adaptite/latest/adaptite/struct.RecordedDependency.html
 [`OwnershipStats`]: https://docs.rs/adaptite/latest/adaptite/struct.OwnershipStats.html
+[`OwnershipAudit`]: https://docs.rs/adaptite/latest/adaptite/enum.OwnershipAudit.html
 [`OwnershipDrift`]: https://docs.rs/adaptite/latest/adaptite/struct.OwnershipDrift.html
+[`OwnershipGauge`]: https://docs.rs/adaptite/latest/adaptite/enum.OwnershipGauge.html
 [`scope`]: https://docs.rs/adaptite/latest/adaptite/fn.scope.html
