@@ -114,11 +114,21 @@ impl Reactor {
         self.effect(move || {
             let new = gated.get();
             crate::untrack(|| {
-                // The borrow must not span the handler. A handler that writes the watched source
-                // and flushes re-enters this effect, and holding it across the call turns that
-                // into a `BorrowMutError` in release (debug hits the reactor's re-entrancy
-                // assert first, so the two profiles disagreed). Writing back afterwards still
-                // means a panicking handler leaves `previous` at the last value it handled.
+                // The borrow does not span the handler, and the write-back happens afterwards so a
+                // panicking handler leaves `previous` at the last value it actually handled.
+                //
+                // Belt-and-braces as of 0.3, and worth saying so rather than leaving a defence
+                // whose threat has moved: a handler that writes the watched source and flushes can
+                // no longer re-enter this effect at all. `run_scheduled_inner` defers a run
+                // requested while this one is in progress, and `run_in_context` asserts — in
+                // *every* build now, not only debug — that an observer cannot re-enter itself.
+                // Measured both ways: holding the borrow across the handler keeps the whole suite
+                // green in both profiles, and with the deferral also removed the re-entrancy
+                // assert fires before the inner run ever reaches this line. So there is no test
+                // that can distinguish the two shapes today; this one is kept because it costs one
+                // clone of a value the API already requires to be `Clone`, and it stops being
+                // decoration the moment `watch` can be given a scheduler that runs the effect
+                // inline, or either guard is relaxed.
                 let prior = previous.borrow().clone();
                 handler(&new, prior.as_ref());
                 *previous.borrow_mut() = Some(new);
@@ -178,9 +188,17 @@ mod tests {
     #[test]
     fn watch_source_is_equality_gated_and_handler_is_untracked() {
         let runs = Rc::new(RefCell::new(0usize));
+        // Record inside the macrotask, assert outside it. runite wraps each scheduled task in
+        // `catch_unwind`, so an `assert!` that fires inside this closure is swallowed and `run()`
+        // returns normally — the test would report `ok` however wrong the counts were. Measured:
+        // with the first assertion below rewritten to expect 4242, this test still passed. The
+        // recorded log doubles as the completion sentinel, because a closure that panicked early
+        // or never ran leaves it short.
+        let observed = Rc::new(RefCell::new(Vec::new()));
 
         queue_macrotask({
             let runs = Rc::clone(&runs);
+            let observed = Rc::clone(&observed);
             move || {
                 let reactor = Reactor::new();
                 let numerator = signal_in(&reactor, 4i32);
@@ -203,27 +221,41 @@ mod tests {
                     },
                 );
 
+                let record = |stage: &'static str| {
+                    observed.borrow_mut().push((stage, *runs.borrow()));
+                };
+
                 reactor.flush_now();
-                assert_eq!(*runs.borrow(), 1, "immediate first invocation");
+                record("first invocation");
 
                 // Source recomputes but its value (parity) is unchanged: no invocation.
                 numerator.set(6);
                 reactor.flush_now();
-                assert_eq!(*runs.borrow(), 1);
+                record("source recomputed to an equal value");
 
                 // The handler read this, but did not subscribe to it: no invocation.
                 side_input.set(99);
                 reactor.flush_now();
-                assert_eq!(*runs.borrow(), 1);
+                record("handler's untracked read was written");
 
                 numerator.set(7);
                 reactor.flush_now();
-                assert_eq!(*runs.borrow(), 2);
+                record("parity changed");
 
                 handle.leak();
             }
         });
 
         run();
+
+        assert_eq!(
+            &*observed.borrow(),
+            &[
+                ("first invocation", 1),
+                ("source recomputed to an equal value", 1),
+                ("handler's untracked read was written", 1),
+                ("parity changed", 2),
+            ]
+        );
     }
 }
