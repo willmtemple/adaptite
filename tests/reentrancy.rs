@@ -134,7 +134,10 @@ fn a_thunk_that_recomputes_while_borrowed_names_itself() {
         .downcast_ref::<String>()
         .expect("the diagnosis is formatted, so the payload is a String");
     assert!(
-        message.contains("thunk created at") && message.contains("tests/reentrancy.rs"),
+        // `file!()` rather than a literal path: `Location::file` renders in the host's own
+        // form, so a hard-coded `tests/reentrancy.rs` fails on Windows against the identical
+        // and entirely correct `tests\reentrancy.rs`.
+        message.contains("thunk created at") && message.contains(file!()),
         "the message should name the thunk and its origin, got: {message}"
     );
     assert!(
@@ -168,7 +171,8 @@ fn a_memo_that_recomputes_while_borrowed_names_itself() {
         .downcast_ref::<String>()
         .expect("the diagnosis is formatted, so the payload is a String");
     assert!(
-        message.contains("memo created at") && message.contains("tests/reentrancy.rs"),
+        // See the note in the thunk test above: `file!()`, not a literal path.
+        message.contains("memo created at") && message.contains(file!()),
         "the message should name the memo and its origin, got: {message}"
     );
 }
