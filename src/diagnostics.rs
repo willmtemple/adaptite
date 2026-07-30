@@ -34,9 +34,12 @@ impl core::fmt::Display for ReactorId {
 /// [`Memo`](NodeKind::Memo).
 ///
 /// Composite primitives contribute no kind of their *own*, but they do contribute nodes: a
-/// [`crate::Resource`] allocates three signals and an effect, and [`crate::watch`] a memo and an
-/// effect, each counted individually under the kind it was allocated as. Read this as "what
-/// adaptite was asked to allocate", not as a claim about what the consumer built with it.
+/// [`crate::Resource`] allocates five — three signals (value, loading, refetch tick), the memo
+/// that gates refetching on the fetch input actually changing, and the effect that drives the
+/// fetch — and [`crate::watch`] two, a memo and an effect. Each is counted individually under
+/// the kind it was allocated as, so a consumer budgeting by composite must budget five per
+/// resource and will see memos it did not write. Read this as "what adaptite was asked to
+/// allocate", not as a claim about what the consumer built with it.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NodeKind {
@@ -500,10 +503,32 @@ impl DiagnosticEvent {
         }
     }
 
-    /// Returns the flush this event belongs to, when it carries one.
+    /// Returns the flush this event belongs to, when it belongs to one.
     ///
-    /// `None` on events that can occur outside any flush and do not record which one was most
-    /// recent — node creation and disposal, writes, and invalidation.
+    /// `None` on the events that are not a flush's work: node creation and disposal, writes
+    /// (including suppressed ones), and the invalidation a write propagates. A write and the
+    /// marks it delivers ordinarily happen *outside* any flush — the flush that drains them has
+    /// not opened yet — so there is no flush they belong to. That matches how the aggregate
+    /// attributes the same work: [`FlushStats`] hands out-of-flush work to the flush that
+    /// *drains* it, which is never the epoch that was current when the write happened.
+    ///
+    /// [`ComputedInvalidated`](Self::ComputedInvalidated) is the one `None` variant that does
+    /// carry a `flush_epoch` field, because a mark can also be delivered from inside a flush and
+    /// the field says which one was open. It is deliberately not reported here: read it by
+    /// matching the variant, and read
+    /// [its field doc](Self::ComputedInvalidated::flush_epoch) first, because outside a flush the
+    /// field holds the most recently *opened* flush, which by then has closed — the flush before
+    /// the write, not the one that will drain it — so bucketing by it would file the mark under
+    /// a flush that had already finished when the write happened.
+    ///
+    /// The same caveat is why a returned epoch is a weaker guarantee than it looks: every
+    /// variant records the epoch of the most recently opened flush, so an event that genuinely
+    /// occurred outside a flush — a stale memo pulled directly by a consumer, say, which reports
+    /// [`ComputedRecomputeStarted`](Self::ComputedRecomputeStarted) — reports the last flush to
+    /// have opened rather than one that contains it. A consumer that needs certainty brackets on
+    /// the [`FlushStarted`](Self::FlushStarted)/[`FlushFinished`](Self::FlushFinished) pair, or
+    /// checks [`GraphStats::flush_depth`](crate::GraphStats::flush_depth), instead of trusting
+    /// the number alone.
     pub fn flush_epoch(&self) -> Option<u64> {
         match self {
             Self::ComputedVerified { flush_epoch, .. }
@@ -810,7 +835,9 @@ mod tests {
 
     #[test]
     fn the_generic_accessors_agree_with_every_variant_they_cover() {
-        use crate::{NodeKind, thunk_in};
+        use core::panic::Location;
+
+        use crate::{NodeId, thunk_in};
 
         // These exist so a consumer does not need a match arm per variant to read a field every
         // variant carries. They were added without a test, which is precisely the shape that
@@ -846,31 +873,132 @@ mod tests {
             // Present on every variant without exception.
             assert_eq!(event.reactor(), reactor.id());
 
-            // `node` must agree with whatever the variant itself carries.
-            match event {
-                DiagnosticEvent::FlushStarted { .. } | DiagnosticEvent::FlushFinished { .. } => {
-                    assert_eq!(event.node(), None, "a flush concerns no single node");
-                    assert_eq!(event.node_origin(), None);
-                }
-                DiagnosticEvent::ReactiveWrite { cause, .. } => {
-                    assert_eq!(event.node(), Some(cause.node));
-                    assert_eq!(event.node_origin(), Some(cause.node_origin));
-                }
+            // Stated per variant against the payload, and matched exhaustively: the catch-all
+            // this replaced asserted only `node().is_some()` for two thirds of the variants, so
+            // a `node_origin()` or `flush_epoch()` arm that returned the wrong thing — or
+            // nothing — passed. `#[non_exhaustive]` does not bind this crate, so a variant added
+            // later fails to compile here until its mapping is written down.
+            #[allow(clippy::type_complexity)]
+            let expected: (
+                Option<NodeId>,
+                Option<&'static Location<'static>>,
+                Option<u64>,
+            ) = match event {
                 DiagnosticEvent::NodeCreated { node, origin, .. }
                 | DiagnosticEvent::NodeDisposed { node, origin, .. } => {
-                    assert_eq!(event.node(), Some(*node));
-                    assert_eq!(event.node_origin(), Some(*origin));
+                    (Some(*node), Some(*origin), None)
                 }
-                _ => assert!(
-                    event.node().is_some(),
-                    "every non-flush event concerns a node: {event:?}"
-                ),
-            }
+                DiagnosticEvent::WriteSuppressed {
+                    node, node_origin, ..
+                } => (Some(*node), Some(*node_origin), None),
+                DiagnosticEvent::ReactiveWrite { cause, .. } => {
+                    (Some(cause.node), Some(cause.node_origin), None)
+                }
+                // The mark a write propagates belongs to no flush, even though it records the
+                // epoch that was open — see `flush_epoch`'s own documentation for why reporting
+                // it would bucket the mark under the flush *before* the one that drains it.
+                DiagnosticEvent::ComputedInvalidated {
+                    node, node_origin, ..
+                } => (Some(*node), Some(*node_origin), None),
+                DiagnosticEvent::ComputedVerified {
+                    node,
+                    node_origin,
+                    flush_epoch,
+                    ..
+                }
+                | DiagnosticEvent::ComputedRecomputeStarted {
+                    node,
+                    node_origin,
+                    flush_epoch,
+                    ..
+                }
+                | DiagnosticEvent::ComputedRecomputeFinished {
+                    node,
+                    node_origin,
+                    flush_epoch,
+                    ..
+                } => (Some(*node), Some(*node_origin), Some(*flush_epoch)),
+                DiagnosticEvent::EffectInvalidated {
+                    effect,
+                    effect_origin,
+                    ..
+                } => (Some(*effect), Some(*effect_origin), None),
+                DiagnosticEvent::EffectScheduled {
+                    effect,
+                    effect_origin,
+                    flush_epoch,
+                    ..
+                }
+                | DiagnosticEvent::EffectRunStarted {
+                    effect,
+                    effect_origin,
+                    flush_epoch,
+                    ..
+                } => (Some(*effect), Some(*effect_origin), Some(*flush_epoch)),
+                DiagnosticEvent::EffectRunFinished {
+                    effect,
+                    flush_epoch,
+                    ..
+                }
+                | DiagnosticEvent::EffectRunSkipped {
+                    effect,
+                    flush_epoch,
+                    ..
+                } => (Some(*effect), None, Some(*flush_epoch)),
+                DiagnosticEvent::EffectDisposed { effect, .. } => (Some(*effect), None, None),
+                DiagnosticEvent::FlushStarted { flush_epoch, .. }
+                | DiagnosticEvent::FlushFinished { flush_epoch, .. } => {
+                    (None, None, Some(*flush_epoch))
+                }
+            };
+            let (node, node_origin, flush_epoch) = expected;
+            assert_eq!(event.node(), node, "node() disagrees with {event:?}");
+            assert_eq!(
+                event.node_origin(),
+                node_origin,
+                "node_origin() disagrees with {event:?}"
+            );
+            assert_eq!(
+                event.flush_epoch(),
+                flush_epoch,
+                "flush_epoch() disagrees with {event:?}"
+            );
 
             // A reported epoch must be a flush that actually happened.
             if let Some(epoch) = event.flush_epoch() {
                 assert!(epoch <= reactor.graph_stats().flush_epoch);
             }
+        }
+
+        // The mapping above is only worth as much as the variants the workload reaches, and the
+        // effect variants are exactly the ones the previous catch-all left unchecked.
+        let reached = |name: &str| {
+            events.iter().any(|event| match event {
+                DiagnosticEvent::EffectInvalidated { .. } => name == "EffectInvalidated",
+                DiagnosticEvent::EffectScheduled { .. } => name == "EffectScheduled",
+                DiagnosticEvent::EffectRunStarted { .. } => name == "EffectRunStarted",
+                DiagnosticEvent::EffectRunFinished { .. } => name == "EffectRunFinished",
+                DiagnosticEvent::EffectDisposed { .. } => name == "EffectDisposed",
+                DiagnosticEvent::ComputedInvalidated { .. } => name == "ComputedInvalidated",
+                DiagnosticEvent::ComputedRecomputeStarted { .. } => {
+                    name == "ComputedRecomputeStarted"
+                }
+                _ => false,
+            })
+        };
+        for name in [
+            "EffectInvalidated",
+            "EffectScheduled",
+            "EffectRunStarted",
+            "EffectRunFinished",
+            "EffectDisposed",
+            "ComputedInvalidated",
+            "ComputedRecomputeStarted",
+        ] {
+            assert!(
+                reached(name),
+                "{name} is absent, so its mapping is untested"
+            );
         }
 
         // The accessors reach the kinds the workload produced, not just one of them.
@@ -889,12 +1017,78 @@ mod tests {
             "and some legitimately do not"
         );
 
-        // Every kind is reachable from `all()`, and ids format as a pair without `.get()`.
-        assert_eq!(NodeKind::all().count(), 6);
+        // Ids format as a pair without `.get()`. What `all()` enumerates is pinned by
+        // `node_kind_all_and_count_track_the_variant_set` rather than by a literal here.
         assert_eq!(
             format!("{}:{}", reactor.id(), source.id()),
             format!("{}:{}", reactor.id().get(), source.id().get())
         );
+    }
+
+    #[test]
+    fn node_kind_all_and_count_track_the_variant_set() {
+        use crate::NodeKind;
+
+        // A roll call the compiler checks. Only `index()` is forced to grow when a kind is added:
+        // `all()` can silently under-report, and `COUNT` sizes the per-kind counter arrays, so a
+        // stale `COUNT` turns the first node of a new kind into an out-of-bounds panic. The
+        // exhaustive match below is what makes adding a kind a compile error here first.
+        let declared = [
+            NodeKind::Source,
+            NodeKind::Signal,
+            NodeKind::Event,
+            NodeKind::Thunk,
+            NodeKind::Memo,
+            NodeKind::Effect,
+        ];
+        for kind in declared {
+            match kind {
+                NodeKind::Source
+                | NodeKind::Signal
+                | NodeKind::Event
+                | NodeKind::Thunk
+                | NodeKind::Memo
+                | NodeKind::Effect => {}
+            }
+        }
+
+        assert_eq!(
+            declared.len(),
+            NodeKind::COUNT,
+            "COUNT drifted from the variant set, and it sizes the per-kind counter arrays"
+        );
+        assert_eq!(
+            NodeKind::all().count(),
+            NodeKind::COUNT,
+            "all() drifted from the variant set: the old assertion compared it against a literal, \
+             so it fired when all() was updated and stayed silent when it was forgotten"
+        );
+
+        // `index()` must be a bijection onto the counter slots, or a kind is either invisible in
+        // `live_nodes_of_kind` or sharing another kind's tally.
+        let mut seen = [false; NodeKind::COUNT];
+        for kind in NodeKind::all() {
+            let index = kind.index();
+            assert!(
+                index < NodeKind::COUNT,
+                "{kind:?} indexes past the counters"
+            );
+            assert!(
+                !seen[index],
+                "{kind:?} shares index {index} with another kind"
+            );
+            seen[index] = true;
+        }
+        assert!(
+            seen.iter().all(|slot| *slot),
+            "all() does not cover every counter slot"
+        );
+        for kind in declared {
+            assert!(
+                NodeKind::all().any(|reported| reported == kind),
+                "{kind:?} is missing from all()"
+            );
+        }
     }
 
     #[test]

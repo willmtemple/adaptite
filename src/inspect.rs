@@ -135,14 +135,25 @@ pub struct GraphSnapshot {
 
 impl GraphSnapshot {
     /// Returns the node with `id`, if it is live.
+    ///
+    /// `O(log n)` on the snapshot as returned, which is ordered by id. [`nodes`](Self::nodes) is
+    /// a public field a consumer may sort or filter in place, though, and the ordering is a
+    /// property of what adaptite hands back rather than an invariant the caller has to preserve
+    /// — so a lookup that misses falls back to a scan rather than reporting a live node as gone.
+    /// `None` therefore always means what it is documented to mean: not in this snapshot. The
+    /// fallback costs `O(n)`, which is why a caller that reorders and then queries repeatedly is
+    /// better off building its own index.
     pub fn node(&self, id: NodeId) -> Option<&GraphNode> {
-        self.nodes
-            .binary_search_by_key(&id, |node| node.id)
-            .ok()
-            .map(|index| &self.nodes[index])
+        if let Ok(index) = self.nodes.binary_search_by_key(&id, |node| node.id) {
+            return Some(&self.nodes[index]);
+        }
+        self.nodes.iter().find(|node| node.id == id)
     }
 
-    /// Returns the nodes that are not [`Clean`](NodeState::Clean).
+    /// Returns the nodes with staleness to report that are not [`Clean`](NodeState::Clean).
+    ///
+    /// Nodes with no [`state`](GraphNode::state) at all — a source, a signal, an event: anything
+    /// with no computation to bring up to date — are not stale and are not returned.
     ///
     /// On a settled graph this is empty. When it is not, and nothing is scheduled, something is
     /// holding staleness nobody will resolve.
@@ -233,6 +244,7 @@ impl Reactor {
     /// let snapshot = reactor.graph_snapshot();
     /// assert_eq!(snapshot.stale().count(), 1);
     /// ```
+    #[must_use = "walking the whole graph and discarding the result inspects nothing"]
     pub fn graph_snapshot(&self) -> GraphSnapshot {
         let meta = self.inner.meta.borrow();
         let dependencies = self.inner.dependencies.borrow();
@@ -429,6 +441,7 @@ impl Reactor {
     /// assert_eq!(stats.observed_nodes, 1, "only the signal has an observer");
     /// assert_eq!(stats.reactor, reactor.id());
     /// ```
+    #[must_use = "this reads counters and asserts nothing; the result is the whole point"]
     pub fn graph_stats(&self) -> GraphStats {
         self.inner.counters.snapshot(
             self.inner.id,
