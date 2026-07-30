@@ -6,7 +6,7 @@
 //! addressable part (here, per key), plus one "structure" source for existence and iteration.
 //! The test suite doubles as the reference implementation pattern.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -88,16 +88,27 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> ReactiveMap<K, V> {
     }
 }
 
+/// The four run counts — key `a`, key `b`, the absent key `c`, the map's shape — observed after
+/// one mutation, labelled with the mutation that preceded them.
+type Phase = (&'static str, [usize; 4]);
+
+/// An assertion inside a `queue_macrotask` closure can never fail a test: runite wraps every
+/// scheduled task in `catch_unwind`, so the panic is swallowed and `run()` returns normally. So the
+/// closures below only *record*; every assertion is made after `run()` has returned, and each test
+/// guards on the recording being complete, so a closure that died halfway fails loudly instead of
+/// passing silently.
 #[test]
 fn observers_depend_on_individual_keys_not_the_whole_map() {
-    let counts = Rc::new(RefCell::new(HashMap::<&str, usize>::new()));
-    let bump = |counts: &Rc<RefCell<HashMap<&str, usize>>>, who: &'static str| {
-        *counts.borrow_mut().entry(who).or_default() += 1;
-    };
+    let phases: Rc<RefCell<Vec<Phase>>> = Rc::new(RefCell::new(Vec::new()));
 
     queue_macrotask({
-        let counts = Rc::clone(&counts);
+        let phases = Rc::clone(&phases);
         move || {
+            let counts = Rc::new(RefCell::new(HashMap::<&str, usize>::new()));
+            let bump = |counts: &Rc<RefCell<HashMap<&str, usize>>>, who: &'static str| {
+                *counts.borrow_mut().entry(who).or_default() += 1;
+            };
+
             let reactor = Reactor::new();
             let map = Rc::new(ReactiveMap::<String, i64>::new(&reactor));
             map.insert("a".into(), 1);
@@ -146,45 +157,67 @@ fn observers_depend_on_individual_keys_not_the_whole_map() {
                     .leak()
             };
 
+            // Records the four counts under `label`. A missing key reads as 0 rather than
+            // panicking, so an observer that never ran shows up as a wrong number in the
+            // comparison after `run()` instead of as a swallowed index panic here.
+            let record = |label: &'static str| {
+                let counts = counts.borrow();
+                let read = |who: &str| counts.get(who).copied().unwrap_or(0);
+                phases
+                    .borrow_mut()
+                    .push((label, [read("a"), read("b"), read("c"), read("len")]));
+            };
+
             reactor.flush_now();
-            let baseline = counts.borrow().clone();
-            assert!(baseline.values().all(|&count| count == 1));
+            record("baseline");
 
             // Updating an existing key: only that key's reader re-runs.
             map.insert("b".into(), 20);
             reactor.flush_now();
-            assert_eq!(counts.borrow()["a"], 1);
-            assert_eq!(counts.borrow()["b"], 2);
-            assert_eq!(counts.borrow()["c"], 1);
-            assert_eq!(counts.borrow()["len"], 1);
+            record("update existing key b");
 
             // Inserting a previously-absent key: its reader AND the shape observer re-run.
             map.insert("c".into(), 3);
             reactor.flush_now();
-            assert_eq!(counts.borrow()["a"], 1);
-            assert_eq!(counts.borrow()["b"], 2);
-            assert_eq!(counts.borrow()["c"], 2);
-            assert_eq!(counts.borrow()["len"], 2);
+            record("insert absent key c");
 
             // Removing a key: its reader and the shape observer re-run.
             map.remove(&"a".into());
             reactor.flush_now();
-            assert_eq!(counts.borrow()["a"], 2);
-            assert_eq!(counts.borrow()["b"], 2);
-            assert_eq!(counts.borrow()["c"], 2);
-            assert_eq!(counts.borrow()["len"], 3);
+            record("remove key a");
         }
     });
 
     run();
+
+    let phases = phases.borrow();
+    assert!(
+        !phases.is_empty(),
+        "the macrotask recorded nothing: it panicked before the first observation, and runite \
+         swallowed the panic"
+    );
+    assert_eq!(
+        &phases[..],
+        &[
+            //                        a  b  c  len
+            ("baseline", [1, 1, 1, 1]),
+            ("update existing key b", [1, 2, 1, 1]),
+            ("insert absent key c", [1, 2, 2, 2]),
+            ("remove key a", [2, 2, 2, 3]),
+        ],
+        "each mutation must re-run exactly the observers whose footprint it touches"
+    );
 }
 
 #[test]
 fn per_key_sources_are_garbage_collected_once_unobserved() {
-    let final_sources = Rc::new(Cell::new(usize::MAX));
+    // Same rule as above: record inside the macrotask, assert after `run()`. The two counts this
+    // test used to check inside the closure could only ever surface as the final count being
+    // absent, which named the wrong thing.
+    let counts: Rc<RefCell<Vec<(&'static str, usize)>>> = Rc::new(RefCell::new(Vec::new()));
 
     queue_macrotask({
-        let final_sources = Rc::clone(&final_sources);
+        let counts = Rc::clone(&counts);
         move || {
             let reactor = Reactor::new();
             let map = Rc::new(ReactiveMap::<u32, u32>::new(&reactor));
@@ -209,23 +242,43 @@ fn per_key_sources_are_garbage_collected_once_unobserved() {
             });
             reactor.flush_now();
 
-            assert_eq!(map.source_count(), 100);
+            let record =
+                |label: &'static str, count: usize| counts.borrow_mut().push((label, count));
+
+            record("after the first flush", map.source_count());
             map.collect_garbage();
-            assert_eq!(map.source_count(), 100, "all keys are still observed");
+            record(
+                "after collecting while every key is observed",
+                map.source_count(),
+            );
 
             // Disposing the broad reader leaves only key 0 observed.
             broad.dispose();
             map.collect_garbage();
-            final_sources.set(map.source_count());
+            record(
+                "after collecting with only key 0 observed",
+                map.source_count(),
+            );
 
             narrow.leak();
         }
     });
 
     run();
+
+    let counts = counts.borrow();
+    assert!(
+        !counts.is_empty(),
+        "the macrotask recorded nothing: it panicked before the first count, and runite swallowed \
+         the panic"
+    );
     assert_eq!(
-        final_sources.get(),
-        1,
-        "sources without observers must be collectable via is_observed"
+        &counts[..],
+        &[
+            ("after the first flush", 100),
+            ("after collecting while every key is observed", 100),
+            ("after collecting with only key 0 observed", 1),
+        ],
+        "sources without observers must be collectable via is_observed, and observed ones must not"
     );
 }
