@@ -1,14 +1,31 @@
 name: Release
 
 # Publishes to crates.io when a GitHub Release is published. The release's tag
-# must be `v<version>` and match the crate version. Create the release from a
-# commit whose CI run is fully green.
+# must be `v<version>` and match the crate version.
+#
+# `validate` deliberately re-runs the whole PR gate rather than trusting that the tagged
+# commit has a green CI run behind it. Nothing in GitHub enforces that a release is cut from
+# a commit CI ever saw -- a tag can point at any object -- so a validate job weaker than
+# ci.yml means the tag can publish something the branch would have failed. It drifted that
+# way once: release.yml went untouched from before 0.2.0 while 0.3 added release-profile
+# clippy, release-profile tests, benchmark smoke and the MSRV job to ci.yml, and a
+# release-only regression (a `cfg`-gated binding that is dead only when `debug_assertions`
+# is off) passed every step this job used to run.
+#
+# The rule for editing this file: every blocking step in ci.yml has a counterpart here.
+# ci.yml's advisory steps (the runite drift check, cop, minimal versions) do not -- they are
+# non-blocking there because they depend on the network or on external tooling, and a
+# non-blocking step in a release gate is just noise.
 on:
   release:
     types: [published]
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Lets mise's github backend fetch its release artifacts and verify attestations without
+  # hitting unauthenticated GitHub API rate limits. Mirrors ci.yml.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   validate:
@@ -22,7 +39,7 @@ jobs:
       # toolchain (no rustfmt/clippy) on a fresh runner; install the components
       # explicitly, mirroring ci.yml.
       - name: Ensure rust components
-        run: mise exec -- bash -c 'rustup toolchain install "$RUSTUP_TOOLCHAIN" -c rustfmt -c clippy --no-self-update'
+        run: mise exec -- bash -c 'rustup toolchain install "$RUSTUP_TOOLCHAIN" -c rustfmt -c clippy -c llvm-tools --no-self-update'
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
       - name: Verify tag matches the crate version
@@ -38,15 +55,72 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Intra-doc links break silently -- `cargo build` and `cargo test` both pass -- and the
+      # rendered result is what docs.rs serves for the version being published.
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Debug-only code paths (the divergence guard, the ownership audit registry) leave their
+      # helpers unused in an optimized build, so `cfg` mistakes are invisible to the debug lint
+      # above. This is the step that catches a release-only regression before it is published.
+      - name: Clippy (release profile)
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # Not redundant with the step above: the divergence guard, the ownership audit registry
+      # and the cross-reactor assert are all `debug_assertions`-gated, so this runs genuinely
+      # different code. A test asserting debug-only behaviour shipped broken here once.
+      - name: Test (release profile)
+        run: cargo test --release --workspace
+      # Every example runs to completion. The examples ship in the .crate, so a broken one is
+      # published, and this exercises the reactive graph end-to-end on the real runtime.
+      - name: Smoke-run examples
+        run: mise run examples
+      # The benchmarks are the evidence behind the diagnostics cost contract
+      # (docs/diagnostics.md). Timings are *not* asserted; see mise's `bench-smoke` task.
+      - name: Smoke-run benchmarks
+        run: mise run bench-smoke
       - name: Package dry-run
         run: cargo publish --dry-run
+
+  # `rust-version` in Cargo.toml is a promise to downstream users and it is about to be
+  # published. Separate job so it runs in parallel with validate rather than serialising a
+  # second toolchain install behind it; `publish` waits on both.
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Block scalar, so YAML does no escaping of its own: the quoting needed to pull a
+      # double-quoted TOML value apart does not survive a plain scalar.
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          version=$(grep '^rust-version' Cargo.toml | cut -d'"' -f2)
+          if [ -z "$version" ]; then
+            echo "could not read rust-version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "declared MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install it
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal --no-self-update
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+      # Build and test rather than clippy: lint output legitimately differs between toolchains,
+      # and what downstream cares about is whether the crate compiles and behaves.
+      - name: Build
+        run: cargo +${{ steps.msrv.outputs.version }} build --workspace --all-targets --locked
+      - name: Test
+        run: cargo +${{ steps.msrv.outputs.version }} test --workspace --locked
 
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: validate
+    needs: [validate, msrv]
     environment: release
     permissions:
       contents: read
