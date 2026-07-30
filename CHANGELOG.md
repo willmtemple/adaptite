@@ -337,8 +337,20 @@ the two changes that need action. Adaptite now requires `runite = "0.3"`.
 
 ### Changed
 
-- **A drain with nothing to drain is no longer a flush.** `flush_now` runs the job queue
-  directly but cannot unqueue the microtask it already handed to the runtime, so that microtask
+- **A subscription installed while a flush is already open no longer receives that flush's
+  `FlushFinished`.** It never received the matching `FlushStarted` — it did not exist yet — so the
+  contract that the two are always paired was false in exactly this window, and what arrived was
+  an all-zero `FlushStats` for work the subscriber could not have observed. A consumer that
+  subscribes from inside an effect, a cleanup, or a diagnostic callback will see one fewer event
+  than before; the event it loses carried no information. Pairing now holds unconditionally.
+- **A cleanup that moves one of its own effect's dependencies on every teardown now runs until
+  the divergence guard fires**, where it used to terminate. The termination was an artifact of the
+  re-entrancy bug fixed above: the inline re-entrant run found the cleanup list already taken by
+  the outer teardown and silently skipped a whole generation of cleanups, which made a genuinely
+  non-convergent loop look like it settled. Every run now gets its teardown, so the loop is
+  revealed for what it is and the guard is right to name it. Convergent cleanups — an idempotent
+  write that the source's equality check suppresses on the second pass — settle in one extra run,
+  as they always did.
   arrived later with an empty queue — and every such arrival opened an epoch, emitted a
   `FlushStarted`/`FlushFinished` pair, and reported an all-zero `FlushStats`. **The signature of
   an idle application is now no flushes at all**, rather than a stream of empty ones; code that

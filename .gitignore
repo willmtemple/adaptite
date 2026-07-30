@@ -1,1 +1,5 @@
 target/
+
+# Agent worktrees. `git worktree add` puts a real checkout here, so a stray `git add -A`
+# will otherwise commit eight nested repositories.
+.claude/

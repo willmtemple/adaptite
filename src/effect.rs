@@ -187,7 +187,6 @@ impl EffectRun {
         // divergence guard does not accumulate unrelated runs into whichever epoch the reactor's
         // last microtask flush happened to leave behind.
         let reactor = effect.reactor.clone();
-        reactor.begin_flush();
 
         struct Guard<'a>(&'a Reactor);
 
@@ -197,7 +196,15 @@ impl EffectRun {
             }
         }
 
+        // Armed *before* the flush is opened, for the same reason as `Reactor::external_flush`:
+        // `begin_flush` increments `flush_depth` first and calls consumer code — the
+        // `FlushStarted` subscriber — last. Constructing the guard afterwards meant a panic
+        // escaping that subscriber stranded `flush_depth` at 1 for the rest of the process, and
+        // a stranded depth freezes `drain_epoch`, so the divergence guard then panicked on the
+        // 101st ordinary run of whatever innocent effect came next. Arming first costs nothing:
+        // the guard's only job is the matching decrement, and `end_flush` saturates.
         let _guard = Guard(&reactor);
+        reactor.begin_flush();
         effect.run_scheduled();
     }
 
@@ -959,6 +966,60 @@ impl Drop for EffectInner {
 
 #[cfg(test)]
 mod tests {
+    /// `EffectRun::run` opens its own flush when it runs outside one, and `begin_flush` calls
+    /// consumer code (the `FlushStarted` subscriber) as its last act. The guard that closes the
+    /// flush used to be constructed *after* that call returned, so a panic escaping the
+    /// subscriber stranded `flush_depth` at 1 for the rest of the process — freezing
+    /// `drain_epoch` and eventually making the divergence guard accuse an innocent effect. This
+    /// is the custom-scheduler twin of the `external_flush` case, and it survived the fix to
+    /// that one because the two live in different files.
+    #[test]
+    fn a_panicking_flush_started_subscriber_does_not_strand_a_scheduled_run() {
+        let reactor = Reactor::new();
+        let pending: std::rc::Rc<std::cell::RefCell<Vec<crate::EffectRun>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let signal = reactor.signal(0_u32);
+        let handle = reactor.effect_with(
+            {
+                let pending = std::rc::Rc::clone(&pending);
+                move |run: crate::EffectRun| pending.borrow_mut().push(run)
+            },
+            {
+                let signal = signal.clone();
+                move || {
+                    let _ = signal.get();
+                }
+            },
+        );
+        // Execute the creation run so the effect actually records its dependency on `signal`.
+        for run in pending.borrow_mut().drain(..).collect::<Vec<_>>() {
+            run.run();
+        }
+
+        // Queue the run BEFORE subscribing, so the only `FlushStarted` the subscriber ever sees
+        // is the one `EffectRun::run` opens for itself.
+        signal.set(1);
+        reactor.flush_now();
+        let queued: Vec<_> = pending.borrow_mut().drain(..).collect();
+        assert_eq!(queued.len(), 1, "the scheduler received the ready run");
+
+        let boom = std::cell::Cell::new(true);
+        let sub = reactor.subscribe_diagnostics(move |event| {
+            if matches!(event, crate::DiagnosticEvent::FlushStarted { .. }) && boom.replace(false) {
+                panic!("subscriber panicked");
+            }
+        });
+        for run in queued {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.run()));
+        }
+        drop(sub);
+        assert!(
+            !reactor.in_flush(),
+            "flush_depth was stranded at 1 by the panic"
+        );
+        let _ = handle;
+    }
+
     use std::cell::{Cell as Counter, RefCell};
     use std::rc::Rc;
 
