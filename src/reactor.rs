@@ -932,6 +932,17 @@ impl Reactor {
                 });
             }
         }
+
+        // The pool is a pool, not a leak: the dormant path above returns its buffer before its
+        // early return, and this path has to as well. Dropping it here instead emptied the pool
+        // permanently the first time anything subscribed, so every later mark step fell through
+        // `take_node_buffer`'s `unwrap_or_default()` and allocated a fresh `Vec` — one per node
+        // per propagation step, i.e. the exact cost 129968d removed, reintroduced by nothing more
+        // than having a diagnostic subscription installed.
+        //
+        // Safe after the recursion: `deliver_mark` re-enters `mark_dependents`, which pops a
+        // *different* buffer, because this one is not in the pool while it is owned here.
+        self.give_node_buffer(dependents);
     }
 
     /// Delivers one mark, dropping the observer's registration if it is gone. Returns whether a
@@ -1223,8 +1234,6 @@ impl Reactor {
     /// # effect.dispose();
     /// ```
     pub fn external_flush<T>(&self, f: impl FnOnce() -> T) -> T {
-        self.inner.begin_flush();
-
         struct Guard<'a>(&'a ReactorInner);
 
         impl Drop for Guard<'_> {
@@ -1233,7 +1242,16 @@ impl Reactor {
             }
         }
 
+        // Armed *before* the flush is opened, not after. `begin_flush` increments `flush_depth`
+        // as its first statement and then calls consumer code — the `FlushStarted` subscriber —
+        // as its last. Constructing the guard afterwards meant a panic escaping that subscriber
+        // stranded `flush_depth` at 1 for the rest of the process: `flush_jobs` only advances
+        // `drain_epoch` while the depth is zero, so the logical drain froze, and the divergence
+        // guard (enforced in every build) then panicked on the 101st ordinary run of whatever
+        // innocent effect happened to be next. Arming first costs nothing — the guard's only job
+        // is the matching decrement, and `end_flush` saturates.
         let _guard = Guard(&self.inner);
+        self.inner.begin_flush();
         f()
     }
 
@@ -1380,6 +1398,16 @@ impl Reactor {
             .values()
             .filter(|observers| !observers.is_empty())
             .count()
+    }
+
+    /// Number of scratch buffers parked in the node-id pool.
+    ///
+    /// The pool is the whole mechanism behind "propagation does not allocate", and the only way
+    /// to observe it without a counting allocator is to ask. A path that takes a buffer and never
+    /// gives it back drains the pool to zero and then allocates forever.
+    #[cfg(test)]
+    pub(crate) fn node_scratch_pool_len(&self) -> usize {
+        self.inner.node_scratch.borrow().len()
     }
 
     #[cfg(test)]
@@ -1714,6 +1742,37 @@ impl ReactorInner {
         }
     }
 
+    /// Emits a closing span event from a `Drop`, where a panicking subscriber must not be
+    /// allowed to abort the process.
+    ///
+    /// The pairing contract is explicit that the closing half is delivered on the unwind path
+    /// too — a consumer timing a flush needs the close whether or not the flush succeeded — so
+    /// this cannot simply fall silent while `panicking()`. What it must not do is let the
+    /// subscriber's own panic escape into an unwind that is already in progress: that is a
+    /// non-unwinding panic, and it aborts. One panicking effect plus one panicking subscriber
+    /// otherwise took the process down instead of producing two reportable bugs.
+    ///
+    /// Same trade, and the same precedent, as `OwnerFrame::reset`: while unwinding, the second
+    /// failure is logged and discarded so the first one still reaches the caller.
+    fn emit_from_drop(&self, event: DiagnosticEvent) {
+        if !self.diagnostics_active.get() {
+            return;
+        }
+        if !std::thread::panicking() {
+            self.emit(event);
+            return;
+        }
+        let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.emit(event)));
+        if delivered.is_err() {
+            tracing::error!(
+                target: trace_targets::GRAPH,
+                event = "diagnostic_subscriber_panic_during_unwind",
+                "a diagnostic subscriber panicked while the thread was already unwinding; the \
+                 event was dropped so the original panic could propagate instead of aborting"
+            );
+        }
+    }
+
     fn emit(&self, event: DiagnosticEvent) {
         if !self.diagnostics_active.get() {
             return;
@@ -1783,11 +1842,19 @@ impl ReactorInner {
 
         if self.diagnostics_active.get() {
             let remaining_jobs = self.pending_jobs.borrow().len();
-            let stats = self
+            // `None` means this subscriber was not here when the flush opened, so there is no
+            // pair to close. Emitting anyway — which is what `unwrap_or_default()` did — handed
+            // a mid-flush subscriber a `FlushFinished` with all-zero stats and no `FlushStarted`
+            // before it, breaking the documented duration recipe on the very first event it ever
+            // received. Staying quiet makes setup match teardown, where dropping the last
+            // subscription mid-flush already yields an unpaired *open* and nothing more.
+            let Some(stats) = self
                 .flushes
                 .close_flush(remaining_jobs, self.counters.queued_effects())
-                .unwrap_or_default();
-            self.emit(DiagnosticEvent::FlushFinished {
+            else {
+                return;
+            };
+            self.emit_from_drop(DiagnosticEvent::FlushFinished {
                 reactor: self.id,
                 // The pinned epoch, not the live one: a re-entrant `flush_now` inside this flush
                 // has already moved `flush_epoch` on, so reading it here would close the inner
@@ -1878,17 +1945,20 @@ impl ReactorInner {
                     .set(self.inner.flush_depth.get().saturating_sub(1));
                 if self.inner.diagnostics_active.get() {
                     let remaining_jobs = self.inner.pending_jobs.borrow().len();
-                    let stats = self
+                    // `None` when this subscriber arrived after the flush opened: there is no
+                    // pair to close, so there is no close to report. See `end_flush`.
+                    if let Some(stats) = self
                         .inner
                         .flushes
                         .close_flush(remaining_jobs, self.inner.counters.queued_effects())
-                        .unwrap_or_default();
-                    self.inner.emit(DiagnosticEvent::FlushFinished {
-                        reactor: self.inner.id,
-                        flush_epoch: self.epoch,
-                        remaining_jobs,
-                        stats,
-                    });
+                    {
+                        self.inner.emit_from_drop(DiagnosticEvent::FlushFinished {
+                            reactor: self.inner.id,
+                            flush_epoch: self.epoch,
+                            remaining_jobs,
+                            stats,
+                        });
+                    }
                 }
                 self.inner.flush_scheduled.set(false);
                 if !self.inner.pending_jobs.borrow().is_empty() {

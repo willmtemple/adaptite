@@ -374,6 +374,50 @@ fn re_entering_a_running_computation_is_refused_in_every_build() {
 }
 
 #[test]
+fn propagation_returns_its_scratch_buffer_while_a_subscription_is_installed() {
+    use crate::{memo_in, signal_in};
+
+    // 0.3's headline performance claim is that a write no longer allocates as it propagates, and
+    // the mechanism is the scratch pool. `mark_dependents` returned its buffer on the dormant
+    // path and dropped it on the diagnostics-active path, so the pool emptied permanently the
+    // first time anything subscribed and every later mark step allocated a fresh `Vec` — one per
+    // node per propagation step. Nothing in the suite could see it: the benches never subscribe.
+    let reactor = Reactor::new();
+    let head = signal_in(&reactor, 0_u64);
+    let mut tail = memo_in(&reactor, {
+        let head = head.clone();
+        move || head.get() + 1
+    });
+    for _ in 0..3 {
+        tail = memo_in(&reactor, {
+            let previous = tail.clone();
+            move || previous.get() + 1
+        });
+    }
+    assert_eq!(tail.get(), 4, "a depth-4 chain, so propagation recurses");
+
+    let _subscription = reactor.subscribe_diagnostics(|_| {});
+
+    // One warm write to bring the pool to its steady state. Nothing is read afterwards: memos are
+    // lazy, so this exercises mark propagation and nothing else.
+    head.set(1);
+    let pooled = reactor.node_scratch_pool_len();
+    assert!(
+        pooled > 0,
+        "propagation must hand its scratch buffers back to the pool, not drop them"
+    );
+
+    for _ in 0..10 {
+        head.set(head.get() + 1);
+        assert_eq!(
+            reactor.node_scratch_pool_len(),
+            pooled,
+            "a subscribed propagation must be pool-neutral, exactly like a dormant one"
+        );
+    }
+}
+
+#[test]
 fn cycle_detection_panics_with_path_and_origins() {
     let reactor = Reactor::new();
     let a = reactor.allocate_node(NodeKind::Source);
