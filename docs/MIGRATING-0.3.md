@@ -10,8 +10,14 @@ that it should not be. The full contract is in
 adaptite = "0.3"
 ```
 
-Two changes need action. Everything else is additive, and two behaviour changes
-are worth knowing about even though they need no edit.
+Two changes need action. Everything else is additive, and four behaviour changes
+are worth knowing about even though none of them needs a source edit:
+
+- [a settled graph no longer flushes](#behaviour-change-a-settled-graph-no-longer-flushes)
+- [a divergent loop now panics in release](#behaviour-change-a-divergent-loop-now-panics-in-release)
+  — the one that can change what a *shipped* application does
+- [teardown is total](#behaviour-change-teardown-is-total)
+- [the ambient-reactor warning fires more often](#behaviour-change-the-ambient-reactor-warning-fires-more-often)
 
 ## Required: `DiagnosticEvent` variant patterns need `..`
 
@@ -32,6 +38,16 @@ more. Paying for it once here is the point.
 
 The compiler finds every site. If you only ever matched with `..`, there is
 nothing to do.
+
+Some of those sites are better deleted than repaired. An arm that destructures a
+variant only to read the fields every event has now has an accessor:
+`DiagnosticEvent::reactor()`, `node()`, `node_origin()` and `flush_epoch()` are
+new in 0.3 and cover the whole enum, so a `match` written to pull the reactor and
+node out of sixteen variants collapses to two calls. The accessors are also the
+supported way to read those fields generically: `#[non_exhaustive]` is exactly
+what stops you writing that `match` yourself in a downstream crate. `reactor()`
+is total; `node()`, `node_origin()` and `flush_epoch()` return `Option`, and each
+one's rustdoc says which events it answers for.
 
 ## Required: runite 0.3
 
@@ -172,6 +188,18 @@ assert_eq!(after.live_nodes, before.live_nodes, "nothing was retained");
 `Reactor::graph_snapshot()` is the walking counterpart: every node with its kind,
 origin, version and staleness, plus every edge, sorted so two snapshots diff
 directly. For a human or an inspector, not for a per-frame check.
+`GraphSnapshot::node(id)` looks one node up in a snapshot you already took
+(binary search over the sorted nodes) rather than scanning the `nodes` vector.
+
+If the question is about **one** node, do not take a snapshot at all:
+`Reactor::node_state(id)` answers "how stale is this?" in `O(1)` with no
+allocation and no walk, which is what a per-frame assertion wants.
+`Reactor::node_kind`, `node_origin`, `node_version`, `observer_count` and
+`dependency_count` are the same shape.
+
+`NodeKind::all()` enumerates the six kinds, so a report that breaks
+`GraphStats::live_nodes_of_kind` down per kind is a loop rather than a hand-kept
+list that goes stale when a kind is added.
 
 ### Ask what a flush cost
 

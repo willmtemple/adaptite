@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-30
+
+This release is about making the reactive graph explain itself: what caused a render, what a
+flush cost, what the graph is holding, and what it is retaining that it should not be. The
+diagnostics contract is stated once, in full, in
+[`docs/diagnostics.md`](docs/diagnostics.md); [`MIGRATING-0.3.md`](docs/MIGRATING-0.3.md) covers
+the two changes that need action. Adaptite now requires `runite = "0.3"`.
+
 ### Added
 
 - Public graph queries on `Reactor`: `observer_count`, `observers_of`,
@@ -60,9 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued/coalesced/run/skipped/disposed/pending, computed nodes
   verified/recomputed/changed/suppressed, edges added and removed, and the job queue depth
   at both ends. `FlushStats::is_empty()` is the assertion an idle application wants: a
-  settled graph does not flush at all (see the `Changed` entry below), and an `external_flush`
-  over one reports an empty `FlushStats` — either way "idle is idle" stops being a CPU
-  percentage that varies between runs of the same build.
+  settled graph does not flush at all (see **A drain with nothing to drain is no longer a
+  flush**, under `Changed`), and an `external_flush` over one reports an empty `FlushStats` —
+  either way "idle is idle" stops being a CPU percentage that varies between runs of the same
+  build.
   Work is attributed to **the next flush that closes**, exactly once. An inner flush's
   totals are not rolled up into the enclosing one, so summing a capture double-counts
   nothing; and work performed outside any flush — the writes that scheduled it — is handed
@@ -160,6 +169,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `is_disposed` when liveness matters. `reactor_id` completes the
   `(ReactorId, NodeId)` pair that every diagnostic payload is scoped by.
 
+- Generic accessors on `DiagnosticEvent`: `reactor()`, `node()`, `node_origin()` and
+  `flush_epoch()`. Both the enum *and* every variant are `#[non_exhaustive]` (see `Breaking`),
+  which is exactly what stops a downstream crate destructuring a field that every variant
+  happens to carry — without these, reading the reactor off an event means one match arm per
+  variant, re-audited every release. Adaptite can match exhaustively because
+  `#[non_exhaustive]` does not bind the defining crate, so the accessors stay correct as
+  variants are added. `reactor()` is total; the other three return `Option`, and each one's
+  rustdoc says which events it answers for. `node_origin()` is worth preferring over
+  `Reactor::node_origin` in a trace sink, because that query answers only for *live* nodes and a
+  sink processing events after the fact is exactly the case where the node is already gone.
+- `NodeKind::all()` enumerates the six kinds, so a per-kind breakdown of
+  `GraphStats::live_nodes_of_kind` is a loop rather than a hand-kept list that silently goes
+  stale when a kind is added.
+- `Reactor::node_state(node)` reports how stale one node is — the `O(1)`, allocation-free
+  counterpart to walking `graph_snapshot()` and finding the node in it. `GraphSnapshot::node(id)`
+  is the lookup for a snapshot you already took (binary search over the sorted nodes).
+- `OwnershipStats::is_empty()` — nothing retained: no live owners, no pending cleanup
+  registrations, no owned children. The assertion a teardown test wants.
+- `ReactorId` implements `Display`, matching `NodeId`'s formatting, so the `(reactor, node)`
+  pair every diagnostic is scoped by can be printed without reaching for `get()` on one half.
+- Three type names worth knowing because they appear in the signatures above:
+  `RecordedDependency` (what `dependencies_of` returns per edge — the dependency's node id and
+  the version observed when the edge was recorded), and `OwnershipAudit` / `OwnershipGauge`
+  (what `audit_ownership()` returns, and which gauge a reported drift is about).
+
 - `examples/idle_audit.rs` shows how to prove an application is idle rather than inferring
   it from a CPU percentage: subscribe, mark the point at which start-up has settled, and read
   the flushes. It also pins the difference between `Signal::set`, which compares and
@@ -168,8 +202,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written every tick". Deliberately small enough to copy into an application: what counts as
   "settled" is an application's policy, not a reactive graph's.
 - [`docs/MIGRATING-0.3.md`](docs/MIGRATING-0.3.md) covers the two changes that need action
-  (variant patterns needing `..`, and runite 0.3) and the three behaviour changes that need
-  none but are worth knowing: a settled graph no longer flushes, teardown is total, and the
+  (variant patterns needing `..`, and runite 0.3) and the four behaviour changes that need no
+  source edit but are worth knowing: a settled graph no longer flushes, **a divergent feedback
+  loop now panics in release builds instead of hanging**, teardown is total, and the
   ambient-reactor warning fires in more cases.
 - [`docs/diagnostics.md`](docs/diagnostics.md) states the whole contract in one place:
   identity and id-reuse rules, the callback contract, dormancy, pairing and panic
@@ -302,6 +337,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A drain with nothing to drain is no longer a flush.** `flush_now` runs the job queue
+  directly but cannot unqueue the microtask it already handed to the runtime, so that microtask
+  arrived later with an empty queue — and every such arrival opened an epoch, emitted a
+  `FlushStarted`/`FlushFinished` pair, and reported an all-zero `FlushStats`. **The signature of
+  an idle application is now no flushes at all**, rather than a stream of empty ones; code that
+  asserted on flush counts sees different numbers. `external_flush` is unchanged — a boundary
+  the consumer declared is reported whether or not the drain found work, and that is where an
+  empty `FlushStats` still appears. One corollary: work performed outside a flush is carried by
+  the next flush that actually runs, so work never followed by a flush is never reported —
+  disposing an effect and then stopping accumulates a disposal no flush arrives to carry. Making
+  a flush happen because diagnostics are subscribed would break the rule that subscribing never
+  changes behaviour, so this is the honest trade. Pinned by
+  `tests/flush_stats.rs::a_settled_graph_reports_an_empty_flush`.
 - **Depends on `runite = "0.3"`.** Adaptite tracks one runite minor at a time and cuts a
   release for each, because it is coupled to runite's *scheduler semantics* and must resolve
   the same runite the application does. None of runite's five breaking changes touch adaptite:
@@ -549,7 +597,9 @@ Initial release.
   creation site; debug builds panic (instead of hanging) on divergent effect
   feedback loops and detect cross-reactor reads.
 
-[Unreleased]: https://github.com/willmtemple/adaptite/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/willmtemple/adaptite/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/willmtemple/adaptite/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/willmtemple/adaptite/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/willmtemple/adaptite/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/willmtemple/adaptite/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/willmtemple/adaptite/releases/tag/v0.1.0

@@ -122,9 +122,10 @@ assert_eq!(*painted.borrow(), [1]);
 
 Draining inside `Reactor::external_flush` reports the whole drain to diagnostic
 consumers as a single flush rather than one per effect. A run executed outside
-any flush opens one of its own. (The debug divergence guard counts per *drain*
-rather than per flush, so it stays meaningful across nested flushes either way.) `EffectRun::run` must happen on the reactor's
-thread — verification and the effect body always do.
+any flush opens one of its own. (The divergence guard counts per *drain* rather
+than per flush, so it stays meaningful across nested flushes either way.)
+`EffectRun::run` must happen on the reactor's thread — verification and the
+effect body always do.
 
 Discarding an `EffectRun` instead of running it is legal: the effect keeps its
 dirty mark and is scheduled again on its next invalidation, so a lane may drop
@@ -135,10 +136,12 @@ work for a subtree that is no longer visible without stranding it.
 An effect may write state it depends on, as long as the loop converges — for
 example clamping a value, normalizing input, or syncing two representations.
 Convergence is reached when the rewritten value is equal to the existing one
-and the write is suppressed. A loop that never converges is a bug: in debug
-builds, an effect that runs more than 100 times in a single *drain* — the
-outermost flush and everything nested inside it — panics with the effect's
-creation site instead of hanging the event loop.
+and the write is suppressed. A loop that never converges is a bug: an effect
+that runs more than 100 times in a single *drain* — the outermost flush and
+everything nested inside it — panics with the effect's creation site instead of
+hanging the event loop. **This guard is enforced in every build, release
+included** (it was debug-only before 0.3, so a release build hung instead);
+convergent feedback settles far below the limit and is unaffected.
 
 Synchronous read cycles (a thunk whose computation reads itself, directly or
 transitively) have no convergent interpretation and always panic, reporting
@@ -480,7 +483,8 @@ live owner tree.
 
 The full contract — identity, pairing and panic semantics, flush attribution,
 which counters are always maintained, and what it costs — is in
-[`docs/diagnostics.md`](docs/diagnostics.md).
+[`docs/diagnostics.md`](https://github.com/willmtemple/adaptite/blob/main/docs/diagnostics.md)
+(also shipped inside the crate, and in the repository next to this file).
 
 ## License
 
