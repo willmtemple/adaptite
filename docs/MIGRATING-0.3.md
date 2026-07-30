@@ -52,6 +52,27 @@ it: **a microtask queued during a turn runs before the next macrotask.** That is
 why consecutive writes within one task coalesce into a single effect run. It is
 verified by tests in runite and will not be relaxed silently.
 
+Two runite 0.3 changes are worth an audit even though adaptite absorbs them for
+you.
+
+**runite now emits `tracing` events in release builds.** In 0.2 its steady-state
+trace sites were `#[cfg(debug_assertions)]`, so a release binary emitted nothing
+per-turn or per-task. They are unconditional now. If your release build installs
+a subscriber that accepts everything, it will start receiving runite's events —
+and a filter that answers "sometimes" rather than a definite no makes hot sites
+pay per emission. Filter runite's targets off explicitly if you are not
+collecting them. This does not change adaptite: its own diagnostics are the
+`DiagnosticEvent` stream, which is dormant until something subscribes.
+
+**`runite::current_turn()` is the join key between adaptite's records and the
+runtime's,** and adaptite deliberately does not call it — see
+[`diagnostics.md`](diagnostics.md#synchronous-delivery-is-a-feature-not-an-implementation-detail).
+Because diagnostic callbacks run synchronously at the moment the work happens,
+you stamp each event yourself and get finer attribution than adaptite could bake
+in. Note where the turn boundary actually falls: a write from a **spawned task**
+shares a turn with the flush that drains it, while a write from a **macrotask**
+does not. Both are pinned by `tests/runtime_join.rs`.
+
 ## Behaviour change: a settled graph no longer flushes
 
 `flush_now` runs the job queue directly but cannot unqueue the microtask already

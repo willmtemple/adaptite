@@ -148,14 +148,32 @@ Because a callback runs on the reactor thread at the moment the work happens, a 
 attribute events to whatever ambient context it has — including context adaptite knows nothing
 about. The motivating case is joining adaptite's records to the runtime's: a `ReactiveWrite`
 callback runs *during* the write and a `FlushFinished` callback runs *during* the flush, so a
-consumer that stamps each event with the runtime's current turn identifier gets per-event turn
-attribution without adaptite holding a runtime type in its API.
+consumer that stamps each event with `runite::current_turn()` gets per-event turn attribution
+without adaptite holding a runtime type in its API.
 
-This matters more than it looks, because a `FlushStats` routinely spans **two** runtime turns. A
-write made from a task and the flush that drains it are in different turns — the flush runs on the
-microtask checkpoint after the writing task finished — and adaptite deliberately folds the write
-into the flush's totals so cause and effect stay in one record. Stamping the aggregate with a
-single turn id would therefore be wrong in a way that looks right.
+```rust,ignore
+reactor.subscribe_diagnostics(move |event| {
+    sink.push(Record { turn: runite::current_turn(), event });
+});
+```
+
+This matters more than it looks, because a `FlushStats` **can** span two runtime turns, and which
+writes do so is not the obvious answer. The boundary is the microtask checkpoint, and it falls in
+one place only:
+
+| Where the write happens | Write and flush |
+| --- | --- |
+| A spawned task | **The same turn.** A task is polled inside the microtask checkpoint, and the checkpoint drains to quiescence, so the flush the write queues runs before that same turn closes. |
+| A macrotask, or any callback the runtime invokes after the checkpoint | **Different turns.** The checkpoint has already drained, so the queued flush waits for the next turn to open. |
+| A synchronous `flush_now` | The same turn as its caller, wherever that is. |
+
+Adaptite deliberately folds the write into the flush's totals so cause and effect stay in one
+record. In the macrotask row that record therefore straddles a turn boundary, and stamping the
+aggregate with a single turn id would be wrong in a way that looks right.
+
+Both rows are pinned by `tests/runtime_join.rs`, because they are properties of runite's
+scheduling rather than of adaptite's, and a change to them would otherwise make this section
+quietly false rather than loudly wrong.
 
 The division to hold onto:
 

@@ -325,9 +325,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "runite"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcc5838e00f848b2a5744c5175b7e8ec8c0acc5f7145ae275c49a94faeeb68cd"
+checksum = "6b2567ae1df87487ccdeda1e2139feb9479e0040ea137bc643dfb20ec73629ce"
 dependencies = [
  "libc",
  "runite-proc-macros",
@@ -337,9 +337,9 @@ dependencies = [
 
 [[package]]
 name = "runite-proc-macros"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7cd726738010812a0377fda6aeaced615e363c8dc49365966c68e6bb282b5b9"
+checksum = "0b7a961b33a148a78c7c05bb197e18f33adca2e4b295fcfcc9a9fc7020662071"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -37,7 +37,7 @@ exclude = [
 # resolve the same runite the application does, or reactive work lands on a
 # microtask queue nobody drains. Track one runite minor at a time and cut an
 # adaptite release for each; see `mise run runite-current` for the drift check.
-runite = "0.2"
+runite = "0.3"
 tracing = { version = "0.1", default-features = false }
 hashbrown = "0.17"
 

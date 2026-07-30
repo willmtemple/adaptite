@@ -302,6 +302,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Depends on `runite = "0.3"`.** Adaptite tracks one runite minor at a time and cuts a
+  release for each, because it is coupled to runite's *scheduler semantics* and must resolve
+  the same runite the application does. None of runite's five breaking changes touch adaptite:
+  its entire runite surface is `queue_microtask` and `spawn`, and no runite type appears in
+  adaptite's public API, so the bump forced no source change. The guarantee adaptite's batching
+  rests on — a microtask queued during a turn runs before the next macrotask — is now verified
+  by tests in runite rather than merely believed, and a cooperative-scheduling budget that
+  could have split a flush in half was considered and declined upstream. Closes #26.
+- **Corrected: which writes span a runtime turn.** `docs/diagnostics.md` told consumers to
+  stamp diagnostic *events* with the runtime's turn id rather than the per-flush aggregate,
+  and justified it with "a write made from a task and the flush that drains it are in
+  different turns". The advice was right; the justification was backwards, and runite 0.3's
+  `current_turn()` made it measurable for the first time. A spawned task is polled *inside*
+  the microtask checkpoint, which drains to quiescence, so a task's write and its flush share
+  one turn. It is a **macrotask** write — running after the checkpoint has already drained —
+  whose flush lands in the next turn. `tests/runtime_join.rs` pins both, because these are
+  properties of runite's scheduling that nothing in adaptite's own suite would notice changing.
 - **Teardown is total.** `OwnerFrame::reset` documented that a panicking cleanup does not
   strand its siblings; it did. A panic abandoned the teardown loop, the remaining cleanups
   were dropped rather than run, and because cleanups ran before children were taken, **the
