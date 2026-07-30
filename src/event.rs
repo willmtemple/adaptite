@@ -337,10 +337,10 @@ impl<T> Drop for EventInner<T> {
 
 impl Subscription {
     #[track_caller]
-    fn new(cancel: impl Fn() + 'static) -> Self {
+    fn new(cancel: impl FnOnce() + 'static) -> Self {
         let inner = Rc::new(SubscriptionInner {
             active: Cell::new(true),
-            cancel: Box::new(cancel),
+            cancel: RefCell::new(Some(Box::new(cancel))),
         });
         // If an owner (an enclosing effect run or scope) is active, it keeps this subscription
         // alive and cancels it. Crucially, for `on` this ties the queue-feeding direct
@@ -362,9 +362,15 @@ impl Subscription {
         self.inner.active.get()
     }
 
-    /// Consumes the subscription and leaks it, keeping the subscriber active for the remainder
-    /// of the program. You CANNOT recover a `Subscription` after calling this method, so be sure
-    /// to call it on a subscription you will never need to cancel.
+    /// Consumes the handle without cancelling the subscription, letting an unowned subscriber
+    /// stay active for the remainder of the program.
+    ///
+    /// This forfeits only the handle's lifetime management: a subscription created inside an
+    /// owner (an effect's run, or a [`crate::scope`]) is still cancelled with that owner — `leak`
+    /// is not a way to detach from it, and calling it there costs an allocation without buying
+    /// any lifetime. The same carve-out as [`crate::EffectHandle::leak`]. You CANNOT recover a
+    /// `Subscription` after calling this method, so be sure to call it on a subscription you will
+    /// never need to cancel.
     pub fn leak(self) {
         core::mem::forget(self);
     }
@@ -395,12 +401,25 @@ struct EventInner<T> {
 
 struct SubscriptionInner {
     active: Cell<bool>,
-    cancel: Box<dyn Fn() + 'static>,
+    /// Runs once, and is released as it runs.
+    ///
+    /// `FnOnce` in an `Option` rather than a `Fn`, because what this closure captures is not
+    /// incidental: for [`Event::subscribe`] it is an `Rc<EventInner>`, and for [`Reactor::on`] it
+    /// is the draining [`crate::EffectHandle`] and the consumer's handler as well. Keeping it
+    /// after cancellation means a `Subscription` the consumer has explicitly cancelled — and
+    /// which reports `is_active() == false` — still pins its event's graph node and the whole
+    /// handler environment, for as long as any handle is held. `DiagnosticSubscription` in
+    /// `crate::diagnostics` has always had this shape; this is the same reasoning.
+    cancel: RefCell<Option<Box<dyn FnOnce() + 'static>>>,
 }
 
 impl OwnedDisposable for SubscriptionInner {
     fn dispose_owned(&self) {
         self.unsubscribe();
+    }
+
+    fn is_disposed_owned(&self) -> bool {
+        !self.active.get()
     }
 }
 
@@ -415,7 +434,13 @@ impl SubscriptionInner {
             event = "unsubscribe",
             "cancelling subscription"
         );
-        (self.cancel)();
+        // Taken before it is called, not after: the borrow must not be held while consumer code
+        // runs (cancelling `on` disposes an effect, which runs cleanups), and a closure that
+        // panics must still be released rather than left to pin its event forever.
+        let cancel = self.cancel.borrow_mut().take();
+        if let Some(cancel) = cancel {
+            cancel();
+        }
     }
 }
 
