@@ -93,6 +93,26 @@ jobs:
       - name: Smoke-run benchmarks
         run: mise run bench-smoke
 
+  # A dependency floor in Cargo.toml is a promise too, and normal resolution always takes the
+  # *maximum*, so a floor can name versions the crate cannot build against and every other job
+  # stays green. `tracing = "0.1"` was exactly that for the whole of 0.2. Advisory: it needs
+  # nightly (an unstable `-Z` flag) and the network, neither of which should red a PR. See the
+  # `min-versions` task in mise.toml for why it is scoped to `--lib`.
+  min-versions:
+    name: Dependency floors (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install toolchain via mise
+        uses: jdx/mise-action@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: min-versions
+      - name: Build every direct dependency at its declared floor
+        run: mise run min-versions
+
   # `rust-version` in Cargo.toml is a promise to downstream users, and nothing else in this
   # workflow checks it — the pinned toolchain tracks stable. Without this the MSRV can be broken
   # by a language feature nobody noticed using, and the first report comes from a user.
