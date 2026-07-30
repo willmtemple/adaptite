@@ -1,6 +1,6 @@
 [package]
 name = "adaptite"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Fine-grained reactivity (signals, thunks, memos, effects, events) for the runite runtime"
