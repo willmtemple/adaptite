@@ -103,12 +103,14 @@ impl OwnershipStats {
     /// Returns `true` when nothing is retained: no live owners, registrations or children.
     ///
     /// The assertion a teardown test wants — that a workload gave everything back.
+    #[must_use = "this answers a question, it does not assert it; wrap it in `assert!`"]
     pub fn is_empty(&self) -> bool {
         self.live_owners == 0 && self.cleanup_registrations == 0 && self.owned_children == 0
     }
 }
 
 /// Returns what this thread's owner tree is holding. See [`OwnershipStats`].
+#[must_use = "this only reads the gauges; in statement position it checks nothing"]
 pub fn ownership_stats() -> OwnershipStats {
     OWNERSHIP.try_with(Counters::snapshot).unwrap_or_default()
 }
@@ -319,6 +321,8 @@ pub enum OwnershipAudit {
 ///
 /// Prunes dead registry entries as it goes, so calling it repeatedly is cheap and the registry
 /// does not grow without bound across a long test.
+#[must_use = "the audit reports, it does not assert: `audit_ownership();` checks nothing. Use \
+              `debug_assert_ownership_consistent()` for the assertion form"]
 pub fn audit_ownership() -> OwnershipAudit {
     #[cfg(not(debug_assertions))]
     return OwnershipAudit::Unavailable;

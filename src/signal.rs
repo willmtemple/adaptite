@@ -133,6 +133,11 @@ impl<T: 'static> Signal<T> {
     }
 
     /// Runs `f` with a shared reference to the current value without recording a dependency.
+    ///
+    /// # Panics
+    ///
+    /// A shared borrow is held while `f` runs, exactly as in [`with`](Signal::with): writing this
+    /// same signal (`set`, `replace`, or `update`) from inside `f` panics with a borrow error.
     pub fn with_peek<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let value = self.inner.value.borrow();
         f(&value)
@@ -154,6 +159,14 @@ impl<T: 'static> Signal<T> {
 
     /// Replaces the current value and marks dependents stale, even when the new value equals
     /// the old one (compare [`set`](Signal::set)).
+    ///
+    /// # Panics
+    ///
+    /// The value is swapped through a mutable borrow, so writing this same signal from inside a
+    /// closure that already holds one — [`with`](Signal::with), [`with_peek`](Signal::with_peek)
+    /// or [`update`](Signal::update) on *this* signal — panics with a borrow error. The panic is
+    /// std's bare `RefCell already borrowed`, but `#[track_caller]` attributes it to this call
+    /// site, so the offending write is named by line in every build.
     #[track_caller]
     pub fn replace(&self, value: T) -> T {
         let previous = self.inner.value.replace(value);
@@ -212,11 +225,30 @@ impl<T: PartialEq + 'static> Signal<T> {
     ///
     /// The equality check runs untracked, so a `PartialEq` implementation that reads reactive
     /// state records no dependencies for the currently running observer.
+    ///
+    /// # Panics
+    ///
+    /// A write borrows the value twice over: the equality check takes a shared borrow, and a write
+    /// that survives it takes a mutable one. So writing this same signal from inside a closure that
+    /// already holds a borrow — [`with`](Signal::with), [`with_peek`](Signal::with_peek) or
+    /// [`update`](Signal::update) on *this* signal — panics with a borrow error, as does a
+    /// `PartialEq` implementation that writes the very signal it was asked to compare. The panic is
+    /// std's bare `RefCell already borrowed`, but `#[track_caller]` attributes it to this call
+    /// site, so the offending write is named by line in every build.
     #[track_caller]
     pub fn set(&self, value: T) -> Option<T> {
         // Compare under a shared borrow, without tracking: a `PartialEq` impl that reads
         // reactive state must neither conflict with this signal's own borrow nor record
         // dependencies for whatever observer is performing the write.
+        //
+        // A collision here is deliberately *not* routed through a named diagnosis the way
+        // `Thunk`/`Memo` are (`report_value_busy`). That reporter earns its keep because a computed
+        // node collides inside adaptite — `recompute_inner`, reached by an innocent-looking read —
+        // and panics at a location the consumer never chose. Every `Signal` write path is
+        // `#[track_caller]`, so std's own borrow panic already names the offending
+        // `set`/`replace`/`update` line, in release as well as debug (measured). A `#[cold]`
+        // reporter would have to re-thread `Location::caller()` just to hold that ground, and would
+        // buy a longer sentence on the hottest write path. Documented instead; see `# Panics`.
         let unchanged = {
             let current = self.inner.value.borrow();
             crate::untrack(|| *current == value)
