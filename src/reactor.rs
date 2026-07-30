@@ -84,8 +84,19 @@ impl fmt::Debug for EnterGuard {
 
 impl Drop for EnterGuard {
     fn drop(&mut self) {
-        CURRENT_REACTOR.replace(core::mem::take(&mut self.previous_default));
-        ANCHORED_REACTOR.replace(self.previous_anchor.take());
+        // `try_with`, never `with`/`replace`: a host that parks its reactor handle in a
+        // thread-local — the shape `Reactor::current`'s own warning recommends — releases this
+        // guard from a thread-local destructor, and destructors run in reverse registration
+        // order, so these two slots are routinely destroyed first. `LocalKey::replace` *panics*
+        // once its value is gone, and a panic escaping a `Drop` during thread shutdown is a
+        // non-unwinding abort: the process dies with SIGABRT on the way out of `main`.
+        //
+        // Failing to restore a default nobody can look up again costs nothing. Aborting costs
+        // everything. Same trade, and the same reasoning, as `scope::with_owner_entry` and
+        // `ownership::with_counters`.
+        let _ = CURRENT_REACTOR
+            .try_with(|slot| slot.replace(core::mem::take(&mut self.previous_default)));
+        let _ = ANCHORED_REACTOR.try_with(|slot| slot.replace(self.previous_anchor.take()));
         tracing::debug!(
             target: trace_targets::GRAPH,
             event = "reactor_exit",
@@ -128,22 +139,38 @@ impl Drop for EnterGuard {
 /// assert_eq!(display.get(), "hits: 3");
 /// ```
 pub fn untrack<T>(f: impl FnOnce() -> T) -> T {
-    UNTRACKED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    // `try_with` throughout: the crate runs consumer callbacks untracked — cleanups among them —
+    // so this is reachable from a `Drop` and therefore from a thread-local destructor. `with`
+    // panics once `UNTRACKED_DEPTH` is destroyed, and the panic from the `Drop` guard below would
+    // arrive while already unwinding, which aborts. An increment that never happened must not be
+    // decremented, so the guard records whether it took effect.
+    let entered = UNTRACKED_DEPTH
+        .try_with(|depth| depth.set(depth.get() + 1))
+        .is_ok();
 
-    struct Guard;
+    struct Guard {
+        entered: bool,
+    }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            UNTRACKED_DEPTH.with(|depth| depth.set(depth.get() - 1));
+            if !self.entered {
+                return;
+            }
+            let _ = UNTRACKED_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
         }
     }
 
-    let _guard = Guard;
+    let _guard = Guard { entered };
     f()
 }
 
 fn is_untracked() -> bool {
-    UNTRACKED_DEPTH.with(|depth| depth.get() > 0)
+    // A destroyed slot reads as "tracking", which is the conservative answer: it records an edge
+    // rather than silently dropping one. Nothing observes either outcome during teardown.
+    UNTRACKED_DEPTH
+        .try_with(|depth| depth.get() > 0)
+        .unwrap_or(false)
 }
 
 /// How stale an observer has become after an upstream write.
@@ -412,9 +439,33 @@ impl Reactor {
         }
 
         let reactor = Self::new();
-        CURRENT_REACTOR.replace(Rc::downgrade(&reactor.inner));
-        let had_default = HAS_HAD_DEFAULT.replace(true);
-        if had_default {
+        // `try_with` for both slots. `try_current` above returns `None` once `CURRENT_REACTOR` is
+        // destroyed, so thread-local teardown funnels straight into this branch: hardening only
+        // the read would relocate the abort here rather than remove it.
+        //
+        // The `Err` case changes more than bookkeeping, so it is worth being explicit about what
+        // it means. The reactor itself is fine — it is an `Rc` graph with no thread-local state,
+        // and the caller can use it normally. What cannot happen is *caching* it as the thread
+        // default, because the cache no longer exists. That costs nothing: the thread is being
+        // torn down, so nothing will ever look the default up again.
+        let installed = CURRENT_REACTOR
+            .try_with(|slot| slot.replace(Rc::downgrade(&reactor.inner)))
+            .is_ok();
+        // Unreadable means unknowable; `false` suppresses the split-graph warning, which would be
+        // pure noise on a thread that is going away and cannot create anything that outlives it.
+        let had_default = HAS_HAD_DEFAULT
+            .try_with(|flag| flag.replace(true))
+            .unwrap_or(false);
+        if !installed {
+            tracing::debug!(
+                target: trace_targets::GRAPH,
+                event = "current_reactor_uninstallable",
+                reactor_id = reactor.inner.id.get(),
+                "this thread's default-reactor slot is already destroyed, so the reactor returned \
+                 here was not installed as the thread default; it is fully usable, but ambient \
+                 constructors called later during teardown will each get a fresh one"
+            );
+        } else if had_default {
             // This thread has had a default before and does not have one now, so whatever owned
             // it is out of scope. Nothing is broken *yet* — but nodes created from here on are on
             // a different graph than the ones created before, and the two can never interact:
@@ -456,8 +507,18 @@ impl Reactor {
     /// assert_eq!(current.id(), reactor.id());
     /// ```
     pub fn try_current() -> Option<Self> {
+        // `try_with`: this is reachable from a `Drop`, and therefore from a thread-local
+        // destructor, by which point `CURRENT_REACTOR` may already have been destroyed. `with`
+        // panics there, and a panic on the `Drop` path during thread shutdown aborts the process.
+        //
+        // `None` is the honest answer rather than a swallowed error: once the slot is gone the
+        // thread has no reachable default and never will again, which is exactly what `None`
+        // means to every caller. The alternative — reporting a reactor from a destroyed slot —
+        // is not available at any price.
         CURRENT_REACTOR
-            .with(|r| r.borrow().upgrade())
+            .try_with(|r| r.borrow().upgrade())
+            .ok()
+            .flatten()
             .map(|inner| Self { inner })
     }
 
@@ -472,6 +533,13 @@ impl Reactor {
     /// Entering nests. Dropping the guard restores whatever default was installed before it,
     /// including none. Guards must be dropped in reverse order of creation; dropping them out of
     /// order restores an older default and is a bug, though not an unsound one.
+    ///
+    /// **The guard must be bound.** `reactor.enter();` in statement position, or
+    /// `let _ = reactor.enter();`, drops the guard at the end of that statement and installs
+    /// nothing — every ambient constructor afterwards lands on a *different* graph, reads and
+    /// writes work perfectly, and nothing ever re-renders. `#[must_use]` catches the first form;
+    /// nothing can catch the second, because `let _ =` is how one deliberately discards a
+    /// `must_use` value. Bind it: `let _guard = reactor.enter();`.
     ///
     /// # Examples
     ///
@@ -488,13 +556,23 @@ impl Reactor {
     ///
     /// drop(guard);
     /// ```
+    #[must_use = "the reactor is the thread default only while the guard is held; \
+                  `reactor.enter();` in statement position installs nothing"]
     pub fn enter(&self) -> EnterGuard {
-        let previous_default = CURRENT_REACTOR.replace(Rc::downgrade(&self.inner));
-        let previous_anchor = ANCHORED_REACTOR.replace(Some(Rc::clone(&self.inner)));
+        // `try_with` for the same reason `EnterGuard::drop` uses it: a host may enter a reactor
+        // from teardown code running in a thread-local destructor. An entry that could not be
+        // recorded leaves the guard with nothing to restore, which is what `Weak::new()`/`None`
+        // already mean, so the guard needs no extra state to stay correct.
+        let previous_default = CURRENT_REACTOR
+            .try_with(|slot| slot.replace(Rc::downgrade(&self.inner)))
+            .unwrap_or_default();
+        let previous_anchor = ANCHORED_REACTOR
+            .try_with(|slot| slot.replace(Some(Rc::clone(&self.inner))))
+            .unwrap_or_default();
         // Entering counts as the thread having had a default, so that ambient state created after
         // the guard drops is reported. Without this the warning only covers a default that
         // expired, and misses the far more common case of one that is simply not held right now.
-        HAS_HAD_DEFAULT.set(true);
+        let _ = HAS_HAD_DEFAULT.try_with(|flag| flag.set(true));
         tracing::debug!(
             target: trace_targets::GRAPH,
             event = "reactor_enter",
@@ -547,16 +625,23 @@ impl Reactor {
         // reachable from ordinary code, because the crate itself runs consumer callbacks
         // untracked — `watch` and `Event` handlers, cleanups, comparators, `Resource` fetches —
         // and any of them may be the first to read a stale memo.
-        let previous_untracked = UNTRACKED_DEPTH.with(|depth| depth.replace(0));
+        //
+        // `try_with` on both slots, here and in the guard below: an effect or memo can be driven
+        // from a cleanup, so `run_in_context` is reachable from a `Drop` and therefore from a
+        // thread-local destructor. `with` panics once the slot is destroyed, and the guard's
+        // matching panic would arrive during unwinding, which aborts. `None` for the saved value
+        // means "there was nothing to save", and the guard then restores nothing.
+        let previous_untracked = UNTRACKED_DEPTH.try_with(|depth| depth.replace(0)).ok();
         #[cfg(debug_assertions)]
-        let previous_running =
-            RUNNING_REACTOR.with(|running| running.replace(Rc::as_ptr(&self.inner).cast::<()>()));
+        let previous_running = RUNNING_REACTOR
+            .try_with(|running| running.replace(Rc::as_ptr(&self.inner).cast::<()>()))
+            .ok();
 
         struct Guard<'a> {
             inner: &'a ReactorInner,
-            previous_untracked: u32,
+            previous_untracked: Option<u32>,
             #[cfg(debug_assertions)]
-            previous_running: *const (),
+            previous_running: Option<*const ()>,
         }
 
         impl Drop for Guard<'_> {
@@ -567,9 +652,13 @@ impl Reactor {
                     let removed = self.inner.active_computations.borrow_mut().remove(&node);
                     debug_assert!(removed, "observer should have been active");
                 }
-                UNTRACKED_DEPTH.with(|depth| depth.set(self.previous_untracked));
+                if let Some(previous) = self.previous_untracked {
+                    let _ = UNTRACKED_DEPTH.try_with(|depth| depth.set(previous));
+                }
                 #[cfg(debug_assertions)]
-                RUNNING_REACTOR.with(|running| running.set(self.previous_running));
+                if let Some(previous) = self.previous_running {
+                    let _ = RUNNING_REACTOR.try_with(|running| running.set(previous));
+                }
             }
         }
 
@@ -1330,7 +1419,10 @@ impl Reactor {
 
     #[cfg(debug_assertions)]
     fn assert_running_reactor(&self) {
-        RUNNING_REACTOR.with(|running| {
+        // `try_with`: reads are reachable from a cleanup, hence from a thread-local destructor.
+        // With the slot destroyed there is no running computation to be inconsistent with, so
+        // skipping the check is both safe and the only option.
+        let _ = RUNNING_REACTOR.try_with(|running| {
             let running = running.get();
             if !running.is_null() && running != Rc::as_ptr(&self.inner).cast::<()>() {
                 panic!(
