@@ -49,12 +49,30 @@ type ErrorHandler = Rc<dyn Fn(ErrorInfo)>;
 /// A reactive resource that an owner can dispose when it is itself disposed or re-run.
 pub(crate) trait OwnedDisposable {
     fn dispose_owned(&self);
+
+    /// Whether this child has already been disposed by some other route — its own handle, or an
+    /// inner owner — so that holding it no longer accomplishes anything.
+    ///
+    /// An owner that neither re-runs nor is disposed never calls [`OwnerFrame::reset`], so
+    /// without this its `children` list is append-only: an application root re-entered with
+    /// [`Owner::run_in`] once per frame accumulates every child ever created under it, and a
+    /// disposed effect drags its whole captured environment along. See
+    /// [`OwnerFrame::release_disposed_children`].
+    ///
+    /// Defaults to `false`, which means "never released early" — always safe, and the behaviour
+    /// every child had before this existed.
+    fn is_disposed_owned(&self) -> bool {
+        false
+    }
 }
 
 /// Ownership bookkeeping for a reactive owner (an effect or a scope): the children created
 /// during its execution and the cleanups registered against it.
 pub(crate) struct OwnerFrame {
     children: RefCell<Vec<Rc<dyn OwnedDisposable>>>,
+    /// `children.len()` immediately after the last sweep, which is the threshold the next one
+    /// waits for. See [`OwnerFrame::release_disposed_children`].
+    swept_at: Cell<usize>,
     cleanups: RefCell<Vec<Box<dyn FnOnce()>>>,
     disposed: Cell<bool>,
     /// Counts this frame by existing. See [`crate::ownership`]: the live-owner gauge is this
@@ -76,6 +94,7 @@ impl OwnerFrame {
         // live-owner gauge, and a reader should be able to see where the count comes from.
         let frame = Rc::new(Self {
             children: RefCell::new(Vec::new()),
+            swept_at: Cell::new(0),
             cleanups: RefCell::new(Vec::new()),
             disposed: Cell::new(false),
             _tally: OwnerTally::new(),
@@ -119,8 +138,48 @@ impl OwnerFrame {
             child.dispose_owned();
             return;
         }
+        // Deliberately bound to the end of this function: dropping a released child runs its
+        // `Drop`, and for an effect that means dropping the closure and everything it captured —
+        // arbitrary consumer code, which may itself adopt into this very frame. Nothing here is
+        // borrowed by the time `_released` falls out of scope.
+        let _released = self.release_disposed_children();
         self.children.borrow_mut().push(child);
         ownership::child_adopted();
+    }
+
+    /// Drops the children that have already been disposed by some other route, returning them so
+    /// the caller decides when their destructors run.
+    ///
+    /// `reset` is the only other thing that empties `children`, and an owner that neither re-runs
+    /// nor is disposed never calls it — which is exactly the shape [`Owner`] documents for an
+    /// application root or a component frame re-entered with [`Owner::run_in`]. Without this,
+    /// individually disposing a child leaves the owner holding it forever: linear, unbounded
+    /// growth in which each unit is a whole captured environment. It is visible in
+    /// [`crate::OwnershipStats::owned_children`], which is what that gauge is for, but a gauge is
+    /// not a fix.
+    ///
+    /// Sweeping only once the list has doubled since the last sweep keeps this amortised `O(1)`
+    /// per adoption and the retained set `O(live children)` — the same bargain, for the same
+    /// reason, as the audit registry in [`crate::ownership::register`]. A sweep on every adoption
+    /// would instead be `O(n²)` for a wide component tree, which is the common case and the one
+    /// that has nothing wrong with it.
+    ///
+    /// Relative order is preserved, so the survivors still tear down in reverse registration
+    /// order.
+    fn release_disposed_children(&self) -> Vec<Rc<dyn OwnedDisposable>> {
+        let mut children = self.children.borrow_mut();
+        if children.len() < 8 || children.len() < self.swept_at.get().saturating_mul(2) {
+            return Vec::new();
+        }
+        // `is_disposed_owned` reads a `Cell` on every implementor and runs no consumer code, so
+        // holding the borrow across the scan is safe; the destructors are what must wait.
+        let released = children
+            .extract_if(.., |child| child.is_disposed_owned())
+            .collect::<Vec<_>>();
+        self.swept_at.set(children.len());
+        drop(children);
+        ownership::children_taken(released.len());
+        released
     }
 
     /// Registers a cleanup to run before the owner next re-runs or when it is disposed. If the
@@ -176,6 +235,7 @@ impl OwnerFrame {
         let mut children = core::mem::take(&mut *self.children.borrow_mut());
         ownership::cleanups_taken(cleanups.len());
         ownership::children_taken(children.len());
+        self.swept_at.set(0);
 
         let mut first_panic: Option<Box<dyn Any + Send>> = None;
         crate::untrack(|| {
@@ -499,7 +559,21 @@ pub fn unowned<T>(f: impl FnOnce() -> T) -> T {
 ///
 /// # Panics
 ///
-/// Panics when called outside a reactive owner, since the cleanup could never run.
+/// Panics when there is no innermost owner to register against, since the cleanup could never
+/// run. That is one condition, but it is reached two ways, and the second is not obvious:
+///
+/// - **No owner at all** — called outside any effect run or scope, or directly inside
+///   [`unowned`].
+/// - **During teardown** — called from inside a cleanup, or from inside the disposal of a child.
+///   Teardown installs an owner *barrier* rather than merely running with no owner: the frame
+///   being torn down has already taken its cleanup list, and an enclosing owner that happens to
+///   be on the stack (a host calling `flush_now` from inside a [`scope`] puts one there) is
+///   deliberately shadowed, because attaching to it would silently outlive the effect the
+///   cleanup belongs to. Register the cleanup from the effect body or scope being torn down, or
+///   open a [`scope`] inside the cleanup if you need resources released after it.
+///
+/// The two cases report themselves with different messages. The second is newly reported in 0.3;
+/// before the barrier it silently attached the cleanup to whatever owner enclosed the flush.
 ///
 /// # Examples
 ///
@@ -865,8 +939,13 @@ impl ScopeHandle {
         self.inner.frame.is_disposed()
     }
 
-    /// Consumes the handle and leaks it, keeping the scope alive for the remainder of the
-    /// program. You CANNOT recover a `ScopeHandle` after calling this method.
+    /// Consumes the handle without disposing the scope, letting an unowned scope live for the
+    /// remainder of the program.
+    ///
+    /// This forfeits only the handle's lifetime management: a scope created inside an owner (an
+    /// effect's run, or an enclosing [`scope`]) is still disposed with that owner — `leak` is not
+    /// a way to detach from it. The same carve-out as [`crate::EffectHandle::leak`]. You CANNOT
+    /// recover a `ScopeHandle` after calling this method.
     pub fn leak(self) {
         core::mem::forget(self);
     }
@@ -895,6 +974,10 @@ struct ScopeInner {
 impl OwnedDisposable for ScopeInner {
     fn dispose_owned(&self) {
         self.frame.dispose();
+    }
+
+    fn is_disposed_owned(&self) -> bool {
+        self.frame.is_disposed()
     }
 }
 

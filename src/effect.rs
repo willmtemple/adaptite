@@ -844,6 +844,14 @@ impl OwnedDisposable for EffectInner {
     fn dispose_owned(&self) {
         self.dispose();
     }
+
+    /// An effect disposed through its own handle is still held by its owner until the owner says
+    /// otherwise, and `dispose` does not drop `effect` — the closure and everything it captured
+    /// live as long as this `EffectInner` does. Reporting disposal lets a long-lived owner
+    /// release it. See `OwnerFrame::release_disposed_children`.
+    fn is_disposed_owned(&self) -> bool {
+        self.disposed.get()
+    }
 }
 
 impl ObserverHook for EffectInner {
